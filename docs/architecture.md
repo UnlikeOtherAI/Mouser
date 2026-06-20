@@ -4,7 +4,7 @@ How Mouser is structured, per the goals in [brief.md](brief.md): a local-first,
 fault-tolerant, peer-to-peer workspace shared across macOS, Windows, and Linux,
 with a mobile companion.
 
-> **v2** incorporates [design-review.md](design-review.md). Round 1 fixes are tagged `(R1: Fn)`.
+> **v2** incorporates the Round 1 + Round 2 reviews ([design-review.md](design-review.md)).
 > The byte-level contract is [communication-interface.md](communication-interface.md).
 
 ---
@@ -16,10 +16,10 @@ with a mobile companion.
    cosmetic coordinator label, not input/state — see §4.5.)
 2. **Local network only.** No cloud dependency for any core feature.
 3. **Near-zero input latency.** Target ≤ 5 ms wired / ≤ 15 ms good Wi-Fi, motion-to-injection.
-4. **Consistent cross-platform UI.** Same information architecture and layout on macOS/Win/Linux
-   (R1: F47 — native-feeling, accessible controls, not pixel-cloned native widgets).
+4. **Consistent cross-platform UI.** Same information architecture and layout on macOS/Win/Linux —
+   native-feeling, accessible controls, not pixel-cloned native widgets.
 5. **Interoperability across independently-built binaries** — guaranteed by the wire spec.
-6. **Honesty about platform limits** (R1: F12, F13): "zero *network* config" + a one-time OS
+6. **Honesty about platform limits**: "zero *network* config" + a one-time OS
    permission grant; Linux/Wayland support is compositor-dependent (capability matrix in tech-stack §4).
 
 ---
@@ -53,16 +53,16 @@ The UI is a separate process, never in the input path.
 
 ---
 
-## 3. Process model (R1: F11)
+## 3. Process model
 
 Three artifacts per machine:
 - **`mouser-engine`** — the headless daemon. Discovery, cluster state, input capture/injection,
   transport. Autostarts on login, runs with no UI, and **is the unit that joins the cluster**.
   It owns its own lifecycle (launchd/agent on macOS, per-user service on Windows, systemd-user
-  on Linux). Tauri is **not** the daemon (R1: F11).
+  on Linux). Tauri is **not** the daemon.
 - **`mouser-ui`** — the Tauri tray/menu-bar + settings client, connecting to the local engine
   over UDS (macOS/Linux) / named pipe (Windows). The IPC is access-controlled (0600 / SO_PEERCRED
-  / pipe ACL, R1: F44).
+  / pipe ACL).
 - **optional privileged helper** — only where elevated input injection is explicitly enabled
   (Windows `uiAccess`, Linux `/dev/uinput` via udev/polkit). Off by default.
 
@@ -72,31 +72,31 @@ Three artifacts per machine:
 
 ### 4.1 Discovery
 mDNS/DNS-SD advertise+browse (spec §4). Advisory only; trust is established separately. Operational
-fallback when multicast is blocked (VLAN/VPN/firewall): manual add by host or pair code (R1).
+fallback when multicast is blocked (VLAN/VPN/firewall): manual add by host or pair code.
 
-### 4.2 Device identity (R1: F8)
+### 4.2 Device identity
 Permanent Ed25519 keypair; **`device_id = SHA-256(SubjectPublicKeyInfo)`** (full 32 bytes). The TLS
 leaf key **is** the identity key, so its cert SPKI hashes to the same `device_id`; every connection
 verifies `SHA-256(presented_cert_SPKI) == device_id` before trust. Trust is keyed on `device_id`
-alone — never name/address (R1: F36).
+alone — never name/address.
 
-### 4.3 Transport (R1: F5)
+### 4.3 Transport
 **Two QUIC connections per peer**: an *interactive* connection (control stream + motion datagrams)
 and a *bulk* connection (files/images/snapshots, rate-limited). This is the central latency fix —
 bulk transfer can no longer share the interactive congestion window. Detail in §6.
 
-### 4.4 Cluster state — replicated config only (R1: F3, F39)
+### 4.4 Cluster state — replicated config only
 Pinned **automerge** CRDT, format-versioned. Holds **shared non-security config only**: per-monitor
 layout (+ monotonic `layout_rev`), device list, aliases, input prefs (Appendix A of the spec).
 **Permissions and the trusted list are NOT in the CRDT** — they are a local, non-replicated policy
 store (§10, a deliberate departure from the brief, for enforcement authority). **Liveness,
 presence, and input ownership are NOT in the CRDT** — ownership is the epoch token (§4.6); presence
 is ephemeral gossip. Concurrent layout edits converge, then a **deterministic post-merge
-normalization** re-derives the edge-adjacency map identically on every engine (R1: F18). Sync uses
-delta gossip + periodic `StateRequest` anti-entropy (R1: F14). History is compacted/snapshotted to
+normalization** re-derives the edge-adjacency map identically on every engine. Sync uses
+delta gossip + periodic `StateRequest` anti-entropy. History is compacted/snapshotted to
 bound `StateSnapshot` size.
 
-### 4.5 Leadership (coordinator) (R1: F7, F19, F20)
+### 4.5 Leadership (coordinator)
 The coordinator **serializes nothing in the steady state** — state is the CRDT, admission is local
 approval, ownership is the epoch token. It is a presented "who's in charge" label plus an optional
 unattended-admission fallback; an all-ineligible cluster (e.g. two laptops) works with no coordinator.
@@ -104,17 +104,15 @@ Election is lease-based on **local-monotonic TTL** (never cross-machine wall-clo
 **term** rules (higher term wins; equal term → lowest `device_id`), giving deterministic resolution
 and defined partition-heal. (Spec §7.10.)
 
-### 4.6 Input ownership & focus (R1: F6, F21, F30)
+### 4.6 Input ownership & focus
 Exactly one device owns input, modeled as a **single token with a monotonic `owner_epoch`**. Only the
 current owner mints `epoch+1`; receivers accept only strictly-higher epochs (ties → lower `device_id`);
 transfers require an ack. Ownership changes via:
 - **edge crossing** (per the normalized per-monitor layout),
 - **explicit hotkey / UI selection**, and
-- **local reclaim** — using a machine's *own* hardware reclaims ownership (R1: F21, replaces the
-  incoherent v1 "click a remote window").
+- **local reclaim** — using a machine's *own* hardware reclaims ownership.
 A **global panic hotkey** unconditionally reclaims local ownership regardless of cluster state, and a
-handoff that isn't acked within a timeout snaps back (R1: F30 — covers a target that is asleep/hung/
-on a secure desktop). On owner heartbeat-timeout the physically-attached device reclaims.
+handoff that isn't acked within a timeout snaps back. On owner heartbeat-timeout the physically-attached device reclaims.
 
 ### 4.7 Clipboard, file transfer, notifications
 Clipboard (text on interactive, images/files on bulk; hash-dedup + loop prevention), drag-drop file
@@ -135,7 +133,7 @@ Windows Disconnected; the user can also hit the panic hotkey.
 
 ---
 
-## 6. Networking planes — latency design (R1: F5, F22)
+## 6. Networking planes — latency design
 
 **Two QUIC connections per peer.** The *interactive* connection carries the reliable control stream
 (ownership/focus, keys/buttons/scroll, small CRDT deltas, liveness) and the **motion datagram plane**
@@ -144,12 +142,12 @@ Windows Disconnected; the user can also hit the panic hotkey.
 Why two and not one: QUIC streams avoid head-of-line blocking but **share one congestion controller +
 pacer**, and DATAGRAM frames are congestion-controlled (RFC 9221 §5). On a single connection a large
 transfer fills the window and motion datagrams get paced behind it or dropped (the v1 "a transfer never
-blocks input" claim was wrong — R1: F5). Separating connections isolates the interactive congestion domain.
+blocks input" claim was wrong). Separating connections isolates the interactive congestion domain.
 
 Motion is **event-driven** (send per input event; coalesce-keep-newest only under send-buffer pressure;
 ~1000 Hz cap), carrying **integer logical pixels + `display_id`** in the target display's coordinate
-space (R1: F10, F22). Loss self-heals (absolute). Connection migration handles same-subnet roams; full
-reconnect uses identity-pinned mDNS rediscovery (migration is help, not a guarantee — R1: F49).
+space. Loss self-heals (absolute). Connection migration handles same-subnet roams; full
+reconnect uses identity-pinned mDNS rediscovery (migration is help, not a guarantee).
 
 ---
 
@@ -162,11 +160,11 @@ peer (CRDT makes the source irrelevant to correctness).
 
 ---
 
-## 8. Cross-platform UI (R1: F47, F46)
+## 8. Cross-platform UI
 
 Tauri v2 + a single React/TS frontend gives **consistent layout** across macOS/Win/Linux. Controls are
 custom-styled but must meet **WCAG 2.2 AA**, expose correct accessibility roles, and support keyboard-only
-operation including the layout canvas (arrow-key nudging) — accessibility is a quality gate (R1: F46).
+operation including the layout canvas (arrow-key nudging) — accessibility is a quality gate.
 The engine stays in Rust; the Tauri UI links **`mouser-ipc` (typed DTOs)**, not `mouser-core`, and
 never embeds the engine or owns the daemon lifecycle (§3).
 
@@ -177,25 +175,25 @@ never embeds the engine or owns the daemon lifecycle (§3).
 A protocol peer (capability `remote_control_only`, coordinator-ineligible) reusing `mouser-core` via
 uniffi (Swift/Kotlin). Portrait: touchpad on top → motion datagrams; native keyboard below → HID
 `KeyEvent`s on the control stream. Quick device selection issues an `OwnershipTransfer` (UiSelect). A
-persistent "Controlling: <device>" banner + haptics on tap/edge (R1).
+persistent "Controlling: <device>" banner + haptics on tap/edge.
 
 ---
 
-## 10. Security posture (R1: F8, F9, F25, F26, F31)
+## 10. Security posture
 
 - **Explicit trust**, key-pinned: approval prompt shows the cert-derived id + a **mandatory** 6-digit
   SAS compared on both screens (defeats first-contact MITM). Identity proof is signed over the TLS
   exporter (channel-bound).
 - **Authority is local**: per-device permissions and the trusted list live in a **local, non-replicated
-  store** (never in the replicated CRDT), authored only by a device about its peers (R1: F31).
+  store** (never in the replicated CRDT), authored only by a device about its peers.
   Capabilities are advisory; the local permission is authoritative. Enforced on receipt on both planes,
   before any platform adapter.
 - **Trusted-peer abuse mitigations**: per-peer input rate-limit/burst cap, "remote input only when
   unlocked" (default on), visible active-owner indicator + optional first-input confirm, peer-initiated
-  ownership is a request not a grab (R1: F26).
+  ownership is a request not a grab.
 - **DoS**: QUIC Retry/address validation, per-IP rate limits, device-list caps, size caps + fuzzed
-  panic-free decoders (R1: F27, F28).
-- **Pairing friction** (R1: F29): trust is per-pair and locally authored — it is **not** auto-propagated
+  panic-free decoders.
+- **Pairing friction**: trust is per-pair and locally authored — it is **not** auto-propagated
   on the wire as cluster state. A first pairing pins identities so later connections are automatic;
   Mouser surfaces a single guided flow for approving a new device on the machines it will pair with,
   rather than replicating trust (which would violate local authority, §10/§9 of the spec).
