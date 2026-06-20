@@ -126,7 +126,7 @@ transfer (bulk, sanitized paths, quarantine dir), debounced notifications (spec 
 
 Cursor crosses the Mac's right edge into the Windows PC:
 1. Mac (current owner) detects the edge per the normalized layout, mints `owner_epoch+1`, sends
-   `OwnershipTransfer{to:win, owner_epoch, layout_version}` and awaits `OwnershipAck`.
+   `OwnershipTransfer{to:win, owner_epoch, layout_rev}` and awaits `OwnershipAck`.
 2. On ack, Mac stops local injection, warps its cursor off the edge, and streams `PointerMotion`
    datagrams on the **interactive** connection; keys/buttons/scroll go reliable, replay-checked.
 3. Both broadcast `FocusState{owner, owner_epoch}`; clipboard/keyboard routing follow.
@@ -195,5 +195,7 @@ persistent "Controlling: <device>" banner + haptics on tap/edge (R1).
   ownership is a request not a grab (R1: F26).
 - **DoS**: QUIC Retry/address validation, per-IP rate limits, device-list caps, size caps + fuzzed
   panic-free decoders (R1: F27, F28).
-- **Cluster trust onboarding** (R1: F29): a device approved into the cluster once propagates as a trusted
-  entry (with the local-authority caveat), avoiding N² approvals; per-pair pinning still applies.
+- **Pairing friction** (R1: F29): trust is per-pair and locally authored — it is **not** auto-propagated
+  on the wire as cluster state. A first pairing pins identities so later connections are automatic;
+  Mouser surfaces a single guided flow for approving a new device on the machines it will pair with,
+  rather than replicating trust (which would violate local authority, §10/§9 of the spec).

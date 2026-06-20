@@ -27,12 +27,20 @@ This profile is mandatory; `mouser-protocol` ships **golden vectors** as the con
   (serde default). Decoders **MUST ignore unknown keys** and treat absent optional keys as
   `None`/default. Field names are the lowercase identifiers shown in §7.
 - **Enums** are **C-like** (no payload) and encode as their **unsigned integer discriminant**
-  (via `serde_repr`), per Appendix C — **never** as the variant-name string. Decoders MUST map
-  an unrecognized discriminant to the enum's `Unknown` sentinel rather than erroring.
+  (Appendix C) — **never** the variant-name string. Implementations MUST use a custom integer
+  (de)serializer (serde `try_from = "u16"` / hand-written `Deserialize`) that maps an unrecognized
+  discriminant to the enum's `Unknown` sentinel rather than erroring. Do **not** use `serde_repr` —
+  its derive errors on unknown values, which would break the §2 forward-compat guarantee.
 - **Sets** (e.g. `set<Capability>`) encode as a CBOR **array of integer discriminants, ascending,
-  no duplicates**.
+  no duplicates**; an **unrecognized member is dropped** from the set (not kept as `Unknown`), so
+  set-member enums need no `Unknown` sentinel.
 - `bytes` → CBOR byte string; `bytes32` → 32-byte byte string. Integers are unsigned unless the
   field type says `i32`/`i64`. Multi-byte scalars in the postcard datagram are little-endian.
+- **Golden vectors**: `mouser-protocol` produces canonical encoded vectors (including an
+  unknown-discriminant case proving the map-to-`Unknown` rule) as its **first deliverable**; until
+  then §0.1 + Appendix C are the binding contract. Worked example — `Ping{ id: 7 }` (type `0x05`)
+  frames as `09 00 00 00 | 05 00 | 00 00 | A1 62 69 64 07`, where `len=9` (LE) covers type+flags+payload
+  and the CBOR payload `A1 62 69 64 07` decodes as map{ "id": 7 }.
 
 ### 0.2 Control-stream framing (R1: F2)
 Every control message is `len: u32 (LE) | type: u16 (LE) | flags: u16 (LE) | payload[len-4]`,
@@ -94,10 +102,12 @@ permissions); low input latency (motion on a dedicated datagram plane).
 1. **QUIC handshakes** (interactive + bulk), ALPN + TLS 1.3; cert pinning per §3.
 2. **`Hello`** on the interactive control stream (§7.1), carrying `channel_sig` (step 4).
 3. **First contact (pairing):** the receiver shows the **cert-derived** `device_id`/fingerprint
-   (not TXT data) and a **mandatory** 6-digit SAS shown identically on both ends:
-   `SAS = base10_6( HKDF-SHA256( ikm = tls_exporter(label="mouser-sas-v1", context = sort(idA)||sort(idB), length=32) ) )`,
-   where `context` is the two 32-byte `device_id`s concatenated in ascending byte order. The user
-   compares both screens and approves. SAS is not optional.
+   (not TXT data) and a **mandatory** 6-digit SAS computed identically on both ends. Let
+   `ctx = min(idA,idB) || max(idA,idB)` (the two 32-byte `device_id`s ordered ascending by byte value),
+   `k = tls_exporter(label="mouser-sas-v1", context = ctx, length = 32)`,
+   `digest = HKDF-SHA256(salt = "mouser-sas-v1", ikm = k, info = "sas", L = 4)`; then
+   `SAS = ( be_u32(digest) mod 1_000_000 )` rendered as **6 zero-padded decimal digits**. The user
+   compares the two screens and approves. SAS is not optional (R1: F9).
 4. **Identity proof:** `channel_sig = Ed25519_sign( identity_key,
    tls_exporter(label="mouser-channel-v1", context = device_id_of_signer, length=64) )` on the
    **interactive** connection (TLS 1.3 exporter, RFC 8446 §7.5 / RFC 5705) — binds the proof to this
@@ -110,7 +120,7 @@ permissions); low input latency (motion on a dedicated datagram plane).
 `HelloAck.status ∈ {Accepted, Rejected, Pending}`; first contact returns `Pending` (timeout 120 s),
 then a `PairingResult`. **Before trust is established a peer may complete the handshake, exchange
 `Hello`, and run pairing (SAS) only** — it exchanges no input, state, clipboard, or files until it
-is in the trusted list (R1: pairing-wording fix).
+is in the trusted list (R1: F9).
 
 ---
 
@@ -122,8 +132,8 @@ is in the trusted list (R1: pairing-wording fix).
 - **Motion datagram plane** — QUIC DATAGRAM (RFC 9221), `PointerMotion` only (§7.6). If the path's
   `max_datagram_frame_size` is insufficient, motion degrades onto the control stream with coalescing (R1: F41).
 
-### 6.2 Bulk connection (R1: F5, bulk-auth fix)
-Separate QUIC connection authenticated by `BulkHello` (§5.5) and bound to the interactive `session_id`.
+### 6.2 Bulk connection (R1: F5)
+Separate QUIC connection authenticated by `BulkHello` (§5 step 5) and bound to the interactive `session_id`.
 Each file transfer or large clipboard payload uses **one dedicated bidirectional stream per
 `transfer_id`/`hash`**, framed per §0.2. App-level bandwidth cap (default 50 % of estimated path
 capacity; hard-yields to interactive RTT spikes) so bulk never starves motion.
@@ -146,8 +156,10 @@ CBOR map keys (§0.1).
 [07] Heartbeat   { seq: u64 }                // interval 1s; Disconnected after 3 misses
 [08] Goodbye     { reason: GoodbyeReason }   // owner Goodbye triggers handoff first
 ```
+`session_id` is a random per-connection identifier used only to bind the bulk connection to the
+interactive one (§5 step 5); it is unrelated to input ownership (which is keyed on `owner_epoch`, §7.4).
 
-### 7.2 Cluster state — CRDT replication (R1: F3, F14, F39, trust-store fix)
+### 7.2 Cluster state — CRDT replication (R1: F3, F14, F39, F31)
 Pinned CRDT **automerge**, `fmt = 1`.
 ```
 [10] StateDelta   { fmt: u16, change: bytes, dep_heads: [bytes32] }
@@ -157,7 +169,7 @@ Pinned CRDT **automerge**, `fmt = 1`.
 ```
 - The replicated CRDT holds **shared, non-security config only**: `devices`, per-monitor `layout`
   (+ a monotonic `layout_rev`), `aliases`, `input_prefs` (Appendix A).
-- **Permissions and the trusted list are NOT in the CRDT** (R1: trust-authority fix) — they are a
+- **Permissions and the trusted list are NOT in the CRDT** (R1: F31) — they are a
   **local, non-replicated policy store** authored only by the local user about peers (§9). This is a
   deliberate departure from the brief's "permissions replicate": enforcement authority must be local.
 - `StateDelta` whose `dep_heads` are unmet is buffered until parents arrive. Anti-entropy: send
@@ -171,7 +183,7 @@ Pinned CRDT **automerge**, `fmt = 1`.
 ```
 Layout changes travel only as `StateDelta` (v1 `LayoutUpdate` removed).
 
-### 7.4 Ownership, focus & capability (R1: F6, F17, capability-state fix)
+### 7.4 Ownership, focus & capability (R1: F6, F17, F24)
 ```
 [30] OwnershipTransfer { to: bytes32, owner_epoch: u64, layout_rev: u64, reason: TransferReason }
 [31] OwnershipAck      { owner_epoch: u64, accepted: bool, reason?: str }
@@ -185,32 +197,34 @@ Layout changes travel only as `StateDelta` (v1 `LayoutUpdate` removed).
 - `LocalReclaim`: a device whose **own** local hardware is used reclaims ownership (replaces v1
   "WindowClick"). On owner heartbeat-timeout the physically-attached device reclaims with `epoch+1`.
 - **`layout_rev`** is a monotonic counter stored in the CRDT (LWW by `(layout_rev, editor device_id)`),
-  bumped on each layout change (R1: layout_version fix — automerge heads are not a `u64`). A receiver
+  bumped on each layout change (R1: F17 — automerge heads are not a `u64`). A receiver
   whose local `layout_rev` < `OwnershipTransfer.layout_rev` pulls via `StateRequest` before applying.
 - **`CapabilityState`** is broadcast when input capture/injection becomes (un)available — secure
   desktop, lock screen, missing permission, unsupported compositor (R1: F24). On a block the engine
   returns ownership to the source and sets `FocusKind.InputBlocked`.
 
-### 7.5 Input — reliable (control stream) (R1: F4, F25, scroll-units fix)
+### 7.5 Input — reliable (control stream) (R1: F4, F25)
 ```
-[40] KeyEvent     { usage: u16, down: bool, mods: u16, session: u32, ctr: u64 }
-[41] PointerButton{ button: u8, down: bool, session: u32, ctr: u64 }
-[42] Scroll       { dx: i32, dy: i32, unit: ScrollUnit, session: u32, ctr: u64 }
+[40] KeyEvent     { usage: u16, down: bool, mods: u16, owner_epoch: u64, ctr: u64 }
+[41] PointerButton{ button: u8, down: bool, owner_epoch: u64, ctr: u64 }
+[42] Scroll       { dx: i32, dy: i32, unit: ScrollUnit, owner_epoch: u64, ctr: u64 }
 ```
 - `usage` = USB HID Usage Page 0x07 (Appendix B); physical-key semantics. `mods` bitmask Appendix B.
   `button`: 0=left,1=right,2=middle,3=back,4=forward.
 - `Scroll.unit` (Appendix C): `Detent120` = `dx/dy` in 1/120-of-a-wheel-notch units (legacy wheel);
   `LogicalPixel` = high-resolution/trackpad pixels. Receiver converts to the platform's native unit.
-- **Anti-replay**: `session` = ownership session id; `ctr` = per-session monotonic; reject non-increasing.
+- **Anti-replay**: `owner_epoch` = the current ownership epoch (§7.4) under which the event is sent;
+  `ctr` = a monotonic counter reset whenever `owner_epoch` changes. Receivers reject events whose
+  `owner_epoch` is not the current one, or whose `(owner_epoch, ctr)` is not strictly increasing.
 
 ### 7.6 Pointer motion — lossy datagram (R1: F10, F15, F16)
 ```
 PointerMotion (datagram, postcard, 1-byte tag 0x01):
-  { session: u32, seq: u32, display_id: u32, x: i32, y: i32 }
+  { owner_epoch: u64, seq: u32, display_id: u32, x: i32, y: i32 }
 ```
 - `x,y` = integer logical pixels in the target **display's** space (`display_id`, Appendix A); origin
-  top-left, y-down; receiver clamps. `session` resets `last_seq` on change; `seq` compared wraparound-safe
-  (RFC 1982). No `ts`. Unknown tag → drop. Apply only if `(session,seq)` newer.
+  top-left, y-down; receiver clamps. A change in `owner_epoch` resets `last_seq`; `seq` is compared
+  wraparound-safe (RFC 1982). No `ts`. Unknown tag → drop. Apply only if `(owner_epoch, seq)` is newer.
 - Authorized only from a trusted peer with `mouse` permission that is the current owner; path-validated
   after migration.
 
@@ -303,7 +317,7 @@ size caps (§0.3) + panic-free fuzzed decoders.
 
 ---
 
-## Appendix A — CRDT document schema (normative) (R1: F3, F18; trust-store fix)
+## Appendix A — CRDT document schema (normative) (R1: F3, F18, F31)
 Automerge root keys (**permissions and trusted list are intentionally absent** — local store, §9):
 - `layout_rev: u64` — monotonic layout revision (LWW by `(layout_rev, editor device_id)`).
 - `devices: Map<device_id_hex, { name: str, os: str, alias?: str }>`
@@ -322,11 +336,12 @@ Each platform adapter ships a bidirectional table: macOS HID↔CGKeyCode; Window
 HID↔evdev `KEY_*`. `mods` bitmask: bit0 LCtrl,1 LShift,2 LAlt,3 LMeta,4 RCtrl,5 RShift,6 RAlt,7 RMeta.
 `Meta` = Cmd/Win/Super, remapped per target OS (optional Cmd↔Ctrl swap preference).
 
-## Appendix C — Wire enums (normative) (R1: F1, F2 enum fix)
-All encode as the unsigned integer below (`serde_repr`); decoders map unknown values to `Unknown`.
+## Appendix C — Wire enums (normative) (R1: F1)
+All encode as the unsigned integer below via a custom integer (de)serializer (**not** `serde_repr`);
+decoders map an unknown value to `Unknown`. For `set<>` members an unknown value is dropped (§0.1).
 - `Os`: macos=0, windows=1, linux=2, ios=3, android=4, Unknown=255
 - `Capability`: keyboard=0, mouse=1, clipboard=2, file_transfer=3, webcam=4, audio=5,
-  coordinator_eligible=6, remote_control_only=7
+  coordinator_eligible=6, remote_control_only=7 — set member; unknown discriminants dropped (§0.1), no `Unknown` sentinel
 - `Role`: eligible=0, ineligible=1, Unknown=255
 - `AckStatus`: accepted=0, rejected=1, pending=2, Unknown=255
 - `GoodbyeReason`: shutdown=0, sleep=1, user_quit=2, network_leave=3, Unknown=255

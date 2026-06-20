@@ -43,8 +43,9 @@ No MQTT/broker (SPOF). Migration claim framed as NAT-rebind help, not guaranteed
 
 `bincode` is **removed** (Codex flagged 3.0.0 as a non-functional/placeholder release; we need only
 one control codec + postcard). The normative CBOR profile — definite-length maps with string field
-keys, integer enum discriminants via `serde_repr`, sets as ascending integer arrays — plus golden
-conformance vectors live in the wire spec (§0.1, Appendix C). Automerge holds **bounded config only**
+keys, integer enum discriminants via a custom (de)serializer mapping unknown→`Unknown` (**not**
+`serde_repr`), sets as ascending integer arrays — lives in the wire spec (§0.1, Appendix C); golden
+conformance vectors are the first deliverable of `mouser-protocol`. Automerge holds **bounded config only**
 (permissions/trusted are a local store, not in the CRDT); liveness/presence stay ephemeral, with
 snapshot/compaction to bound history (R1: F39).
 
