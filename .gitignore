@@ -1,0 +1,32 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# Node / frontend
+node_modules
+dist
+.vite
+*.tsbuildinfo
+.pnpm-store
+
+# Tauri
+src-tauri/target
+src-tauri/gen
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Worktrees (mandated location, kept out of history)
+.worktrees/
+
+# Misc
+*.log
+.env
+.env.local
