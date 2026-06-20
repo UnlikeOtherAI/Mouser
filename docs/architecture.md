@@ -72,12 +72,13 @@ Three artifacts per machine:
 
 ### 4.1 Discovery
 mDNS/DNS-SD advertise+browse (spec §4). Advisory only; trust is established separately. Operational
-fallback when multicast is blocked (VLAN/VPN/firewall): manual add by host or pair code (R1: F-L10).
+fallback when multicast is blocked (VLAN/VPN/firewall): manual add by host or pair code (R1).
 
 ### 4.2 Device identity (R1: F8)
-Permanent Ed25519 keypair; `device_id = SHA-256(pubkey)` (full 32 bytes). The TLS leaf key **is**
-the identity key, so every connection verifies `SHA-256(cert) == device_id` before trust. Trust is
-keyed on `device_id` alone — never name/address (R1: F36).
+Permanent Ed25519 keypair; **`device_id = SHA-256(SubjectPublicKeyInfo)`** (full 32 bytes). The TLS
+leaf key **is** the identity key, so its cert SPKI hashes to the same `device_id`; every connection
+verifies `SHA-256(presented_cert_SPKI) == device_id` before trust. Trust is keyed on `device_id`
+alone — never name/address (R1: F36).
 
 ### 4.3 Transport (R1: F5)
 **Two QUIC connections per peer**: an *interactive* connection (control stream + motion datagrams)
@@ -85,8 +86,10 @@ and a *bulk* connection (files/images/snapshots, rate-limited). This is the cent
 bulk transfer can no longer share the interactive congestion window. Detail in §6.
 
 ### 4.4 Cluster state — replicated config only (R1: F3, F39)
-Pinned **automerge** CRDT, format-versioned. Holds **persistent config only**: per-monitor layout,
-aliases, input prefs, per-device permissions, trusted list (Appendix A of the spec). **Liveness,
+Pinned **automerge** CRDT, format-versioned. Holds **shared non-security config only**: per-monitor
+layout (+ monotonic `layout_rev`), device list, aliases, input prefs (Appendix A of the spec).
+**Permissions and the trusted list are NOT in the CRDT** — they are a local, non-replicated policy
+store (§10, a deliberate departure from the brief, for enforcement authority). **Liveness,
 presence, and input ownership are NOT in the CRDT** — ownership is the epoch token (§4.6); presence
 is ephemeral gossip. Concurrent layout edits converge, then a **deterministic post-merge
 normalization** re-derives the edge-adjacency map identically on every engine (R1: F18). Sync uses
@@ -164,7 +167,8 @@ peer (CRDT makes the source irrelevant to correctness).
 Tauri v2 + a single React/TS frontend gives **consistent layout** across macOS/Win/Linux. Controls are
 custom-styled but must meet **WCAG 2.2 AA**, expose correct accessibility roles, and support keyboard-only
 operation including the layout canvas (arrow-key nudging) — accessibility is a quality gate (R1: F46).
-The engine stays in Rust; Tauri's backend links the core but does **not** own the daemon lifecycle (§3).
+The engine stays in Rust; the Tauri UI links **`mouser-ipc` (typed DTOs)**, not `mouser-core`, and
+never embeds the engine or owns the daemon lifecycle (§3).
 
 ---
 
@@ -173,7 +177,7 @@ The engine stays in Rust; Tauri's backend links the core but does **not** own th
 A protocol peer (capability `remote_control_only`, coordinator-ineligible) reusing `mouser-core` via
 uniffi (Swift/Kotlin). Portrait: touchpad on top → motion datagrams; native keyboard below → HID
 `KeyEvent`s on the control stream. Quick device selection issues an `OwnershipTransfer` (UiSelect). A
-persistent "Controlling: <device>" banner + haptics on tap/edge (R1: F-H4).
+persistent "Controlling: <device>" banner + haptics on tap/edge (R1).
 
 ---
 
@@ -182,9 +186,10 @@ persistent "Controlling: <device>" banner + haptics on tap/edge (R1: F-H4).
 - **Explicit trust**, key-pinned: approval prompt shows the cert-derived id + a **mandatory** 6-digit
   SAS compared on both screens (defeats first-contact MITM). Identity proof is signed over the TLS
   exporter (channel-bound).
-- **Authority is local**: per-device permissions and the trusted list are local policy, authored only by
-  a device about its peers — never peer-writable CRDT (R1: F31). Capabilities are advisory; the local
-  permission is authoritative. Enforced on receipt on both planes, before any platform adapter.
+- **Authority is local**: per-device permissions and the trusted list live in a **local, non-replicated
+  store** (never in the replicated CRDT), authored only by a device about its peers (R1: F31).
+  Capabilities are advisory; the local permission is authoritative. Enforced on receipt on both planes,
+  before any platform adapter.
 - **Trusted-peer abuse mitigations**: per-peer input rate-limit/burst cap, "remote input only when
   unlocked" (default on), visible active-owner indicator + optional first-input confirm, peer-initiated
   ownership is a request not a grab (R1: F26).

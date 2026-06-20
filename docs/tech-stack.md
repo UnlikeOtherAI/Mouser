@@ -27,7 +27,7 @@ Homebrew rust only ships the host std). Pin a stable channel via `rust-toolchain
 | Identity | **`ed25519-dalek` 2.2.x** | stable, not RC (R1: F48); TLS leaf key = identity key (R1: F8) |
 | Cert pinning | custom `rustls` `ServerCertVerifier`/`ClientCertVerifier` | verify `SHA-256(cert SPKI)==device_id` (supported; R1: F8) |
 | Pairing | **self-signed TLS + identity-pin + mandatory SAS over the TLS exporter (RFC 5705) + TOFU** | one concrete flow; **not** SPAKE2/Noise (the `spake2` crate is `0.5.0-pre.0`) (R1: F9) |
-| Discovery | **`mdns-sd`** | primary; manual/pair-code fallback when multicast blocked (R1: F-L10) |
+| Discovery | **`mdns-sd`** | primary; manual/pair-code fallback when multicast blocked (R1) |
 
 No MQTT/broker (SPOF). Migration claim framed as NAT-rebind help, not guaranteed roam survival (R1: F49).
 
@@ -42,8 +42,11 @@ No MQTT/broker (SPOF). Migration claim framed as NAT-rebind help, not guaranteed
 | Replicated state | **`automerge`** (pinned, format-versioned) | **not** "automerge or yrs" — one CRDT is part of the wire contract (R1: F3) |
 
 `bincode` is **removed** (Codex flagged 3.0.0 as a non-functional/placeholder release; we need only
-one control codec + postcard). Automerge holds **bounded config only**; liveness/presence stay ephemeral,
-with snapshot/compaction to bound history (R1: F39).
+one control codec + postcard). The normative CBOR profile — definite-length maps with string field
+keys, integer enum discriminants via `serde_repr`, sets as ascending integer arrays — plus golden
+conformance vectors live in the wire spec (§0.1, Appendix C). Automerge holds **bounded config only**
+(permissions/trusted are a local store, not in the CRDT); liveness/presence stay ephemeral, with
+snapshot/compaction to bound history (R1: F39).
 
 ---
 
@@ -57,7 +60,7 @@ Reached only through core traits (`InputCapture`, `InputInjection`). **"Linux" i
 | macOS | CGEventTap capture + CGEvent/warp inject | `core-graphics`, `core-foundation` | needs **Accessibility + Input Monitoring** (TCC); **Secure Event Input** can suppress capture in password fields; lock screen = local only |
 | Windows | WH_*_LL hooks / Raw Input + `SendInput` | `windows` (windows-rs) | **UIPI**: a normal process can't inject into elevated apps; **UAC secure desktop / lock** block it → optional signed `uiAccess` helper, off by default |
 | Linux X11 | XTEST | `x11rb` (xtest feature) | works; supported tier |
-| Linux Wayland | libei + portal | **`reis`** (libei; *there is no `libei` crate*), **`ashpd`** (xdg `RemoteDesktop`/`InputCapture`) | compositor-dependent; capture is barrier-triggered and may be filtered/paused on lock; **supported only on verified compositors** |
+| Linux Wayland | libei + portal | **`reis`** (libei; *there is no `libei` crate*), **`ashpd`** (xdg `RemoteDesktop`/`InputCapture`) | compositor-dependent; capture is barrier-triggered, may be filtered/paused on lock; **initial targets GNOME/Mutter + KDE/KWin**; others fall back to uinput helper or X11 |
 | Linux fallback | uinput ioctl | **`input-linux`** / direct evdev (the `uinput` crate is stale, 2018) | privileged (`/dev/uinput` via udev/polkit); not zero-config |
 
 When input is blocked (secure desktop, lock, missing permission, unsupported compositor), the engine
@@ -85,8 +88,12 @@ bootstrapper on Windows. Alternatives (Slint pixel-identical/pure-Rust, Flutter,
 ## 6. Mobile companion
 
 iOS Swift/SwiftUI, Android Kotlin/Compose, sharing `mouser-core` via **uniffi** (pre-1.0 → expose a narrow
-**`mouser-ffi`** facade: connect, pair, send motion, send key, observe state — not raw core internals, R1: F-X11).
-Portrait: touchpad (motion datagrams) above, native keyboard (HID key events) below.
+**`mouser-ffi`** facade: connect, pair, send motion, send key, observe state — not raw core internals; R1).
+The companion is **outbound-only** (it dials engines, never accepts inbound) and **coordinator-ineligible**,
+so it needs no listener. iOS requires the **Local Network entitlement** + `NSLocalNetworkUsageDescription`
+and a `NSBonjourServices` entry for `_mouser._udp`; input is **foreground-only** (background suspends the
+radio). uniffi async surfaces as a callback interface. Portrait: touchpad (motion datagrams) above, native
+keyboard (HID key events) below.
 
 ---
 
@@ -126,7 +133,7 @@ layers: PR checks → nightly unsigned packaging smoke → protected signed rele
 - Decode paths: `deny(unwrap_used, panic, indexing_slicing)` + **`cargo-fuzz`** corpus on protocol + CRDT-apply (R1: F27).
 - **`mouser-testkit`** built first: fake clock, fake transport (drop/reorder/latency), fake platform adapters,
   ≥3 in-process engines; asserts ownership handoff, CRDT convergence, reconnect, stale-message rejection,
-  and **latency SLO** (≤5 ms wired / ≤15 ms Wi-Fi, R1: F-L3).
+  and **latency SLO** (≤5 ms wired / ≤15 ms Wi-Fi, R1).
 - Real-device acceptance per platform (macOS native, iOS simulator, Linux over SSH).
 - Frontend: ESLint + TS strict + Prettier + **a11y checks** (WCAG 2.2 AA, R1: F46) blocking.
 - 500-line file cap.
