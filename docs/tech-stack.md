@@ -1,179 +1,132 @@
-# Mouser — Tech Stack
+# Mouser — Tech Stack — v2
 
-This document records the chosen languages, frameworks, and libraries, and why.
-It complements [architecture.md](architecture.md) (structure) and
-[communication-interface.md](communication-interface.md) (wire protocol).
+Chosen languages, frameworks, libraries, and why. Complements
+[architecture.md](architecture.md) and [communication-interface.md](communication-interface.md).
+
+> **v2** incorporates [design-review.md](design-review.md); Round 1 fixes tagged `(R1: Fn)`.
+> Crate facts below were verified against crates.io.
 
 ---
 
 ## 1. Core language — Rust
 
-The shared engine is written in **Rust**.
-
-**Why Rust over a shared C++ core:**
-
-1. **Threat model.** The engine runs with the highest effective privilege on the
-   machine (it injects keystrokes and mouse events) and parses data arriving over
-   the network from peer devices. A memory-safety bug in a packet parser is a
-   remote code-execution path on a host that can then control the keyboard. Rust
-   eliminates that entire bug class at compile time. For a greenfield codebase
-   with no legacy C++ to preserve, paying the C++ memory-safety tax is hard to
-   justify.
-2. **Concurrency.** Discovery + per-peer transport + election + state replication
-   is deeply concurrent. Rust's compile-time data-race freedom plus `tokio` is a
-   stronger base than hand-rolled C++ threading for a self-healing system.
-3. **One core, all targets.** `uniffi` generates Swift and Kotlin bindings from
-   the same Rust core for the mobile companion; `cbindgen` exposes a C ABI where
-   needed. C++ → Swift/Kotlin requires hand-written shims and JNI.
-4. **Build & dependencies.** Cargo workspaces + cross-compilation beat CMake
-   across five targets.
-
-C++ would only win if the team were C++-only or if we forked Synergy/Barrier's
-code wholesale (we will reference their protocol/input concepts, not reuse the
-code). The one genuinely C++/ObjC-leaning area — virtual camera/audio plugins —
-is an isolated, separately-loaded module that talks to the core over IPC and does
-not pull the core to C++.
+The engine + core are **Rust**. Rationale unchanged from v1: memory safety for a privileged,
+network-facing input daemon; fearless concurrency; one core for desktop + mobile (uniffi);
+Cargo cross-compilation. Toolchain is **rustup-managed** (R1: needed for iOS/cross targets —
+Homebrew rust only ships the host std). Pin a stable channel via `rust-toolchain.toml`.
 
 ---
 
-## 2. Async runtime & transport
+## 2. Async runtime, transport & crypto
 
 | Concern | Choice | Notes |
 |---------|--------|-------|
-| Async runtime | **tokio** | De-facto standard; pairs with quinn. |
-| Transport | **QUIC via `quinn`** | Reliable streams *and* unreliable datagrams (RFC 9221) on one encrypted connection; connection migration survives Wi-Fi roams. |
-| TLS / crypto | **`rustls`** + **`ring`** | TLS 1.3 for QUIC; certs pinned to device identity. |
-| Pairing handshake | **SPAKE2** or **Noise** (`snow`) | Short-authentication-string confirmation on first contact. |
-| Device identity | **Ed25519** (`ed25519-dalek`) | Permanent keypair; device ID derived from the public key. |
-| Discovery | **mDNS / DNS-SD** (`mdns-sd`) | Continuous advertise + browse on the LAN. |
+| Async runtime | **tokio** | pairs with quinn |
+| Transport | **QUIC via `quinn`** | reliable streams + RFC 9221 datagrams; **two connections per peer** (interactive/bulk, R1: F5) |
+| TLS provider | **`rustls` + `rustls-ring`** | pin stable `0.23.x` + explicit provider feature (R1: F48) |
+| Identity | **`ed25519-dalek` 2.2.x** | stable, not RC (R1: F48); TLS leaf key = identity key (R1: F8) |
+| Cert pinning | custom `rustls` `ServerCertVerifier`/`ClientCertVerifier` | verify `SHA-256(cert SPKI)==device_id` (supported; R1: F8) |
+| Pairing | **self-signed TLS + identity-pin + mandatory SAS over the TLS exporter (RFC 5705) + TOFU** | one concrete flow; **not** SPAKE2/Noise (the `spake2` crate is `0.5.0-pre.0`) (R1: F9) |
+| Discovery | **`mdns-sd`** | primary; manual/pair-code fallback when multicast blocked (R1: F-L10) |
 
-The two-plane design (reliable control plane, lossy input-motion datagrams) is
-specified in [architecture.md §6](architecture.md) and
-[communication-interface.md](communication-interface.md). **No MQTT/broker** — it
-would be a single point of failure.
+No MQTT/broker (SPOF). Migration claim framed as NAT-rebind help, not guaranteed roam survival (R1: F49).
 
 ---
 
-## 3. Serialization & state
+## 3. Serialization & state (R1: F1, F3)
 
 | Concern | Choice | Notes |
 |---------|--------|-------|
-| Wire encoding (hot path) | **`postcard`** (or `bincode`) | Compact, fast, `serde`-based; ideal for tiny motion/input frames. |
-| Wire encoding (control) | `serde` + compact codec | Versioned, forward-compatible message envelope. |
-| Replicated cluster state | **CRDT** — `automerge` (or `yrs`) | Conflict-free; every engine holds a full replica; concurrent layout edits converge. |
+| Control encoding | **CBOR (`ciborium`)** | self-describing → safe unknown-field/version skew; serde-native, no codegen. (Protobuf/`prost` is the alternative for strict multi-language schema governance.) |
+| Datagram encoding | **`postcard`** | fixed-layout `PointerMotion` only |
+| Replicated state | **`automerge`** (pinned, format-versioned) | **not** "automerge or yrs" — one CRDT is part of the wire contract (R1: F3) |
 
-Protocol versioning and capability negotiation are mandatory so independently-
-built binaries interoperate — see the protocol spec.
-
----
-
-## 4. OS input capture & injection
-
-Reached only through core traits (`InputCapture`, `InputInjection`), implemented
-per platform:
-
-| OS | Capture / Injection | Crates |
-|----|--------------------|--------|
-| macOS | CGEventTap, CoreGraphics warp/inject | `core-graphics`, `core-foundation` |
-| Windows | low-level hooks + `SendInput` / Raw Input | `windows` (official Microsoft `windows-rs`) |
-| Linux (Wayland) | `libei` (emulated input) + `uinput` | `input`, `evdev`, libei bindings |
-| Linux (X11) | XTEST / event injection | `x11rb` |
-
-Notes: macOS requires Accessibility + Input Monitoring permissions. Wayland
-input injection is constrained by the compositor (a protocol-level limitation,
-not a language one); `libei`/portals are the forward path, with `uinput` as a
-lower-level fallback.
+`bincode` is **removed** (Codex flagged 3.0.0 as a non-functional/placeholder release; we need only
+one control codec + postcard). Automerge holds **bounded config only**; liveness/presence stay ephemeral,
+with snapshot/compaction to bound history (R1: F39).
 
 ---
 
-## 5. UI shell — identical settings screen across macOS/Win/Linux
+## 4. OS input capture & injection — capability matrix (R1: F13, F24)
 
-**Tauri v2** with a single web frontend:
+Reached only through core traits (`InputCapture`, `InputInjection`). **"Linux" is not one backend** and
+"zero-config" doesn't hold for OS-level input — adapters report a capability state at runtime.
+
+| Platform | Backend | Crates | Reality |
+|----------|---------|--------|---------|
+| macOS | CGEventTap capture + CGEvent/warp inject | `core-graphics`, `core-foundation` | needs **Accessibility + Input Monitoring** (TCC); **Secure Event Input** can suppress capture in password fields; lock screen = local only |
+| Windows | WH_*_LL hooks / Raw Input + `SendInput` | `windows` (windows-rs) | **UIPI**: a normal process can't inject into elevated apps; **UAC secure desktop / lock** block it → optional signed `uiAccess` helper, off by default |
+| Linux X11 | XTEST | `x11rb` (xtest feature) | works; supported tier |
+| Linux Wayland | libei + portal | **`reis`** (libei; *there is no `libei` crate*), **`ashpd`** (xdg `RemoteDesktop`/`InputCapture`) | compositor-dependent; capture is barrier-triggered and may be filtered/paused on lock; **supported only on verified compositors** |
+| Linux fallback | uinput ioctl | **`input-linux`** / direct evdev (the `uinput` crate is stale, 2018) | privileged (`/dev/uinput` via udev/polkit); not zero-config |
+
+When input is blocked (secure desktop, lock, missing permission, unsupported compositor), the engine
+broadcasts that state and **returns ownership to the source** (R1: F12, F24). First-run onboarding deep-links
+to the exact OS settings pane and live-checks grants.
+
+---
+
+## 5. UI shell
 
 | Layer | Choice |
 |-------|--------|
-| Shell | **Tauri v2** (Rust backend = same core; tray + autostart plugins) |
-| Frontend | **React + TypeScript + Vite** |
-| Styling | **Tailwind CSS** + **shadcn/ui**, bundled UI font |
-| Layout canvas | SVG/Canvas drag-arrange of device rectangles |
+| Shell | **Tauri v2** — UI client only; **does not own the daemon** (R1: F11) |
+| Frontend | React + TypeScript + Vite |
+| Styling | Tailwind + custom controls (WCAG 2.2 AA, full keyboard nav incl. layout canvas — R1: F46/F47) |
+| Layout canvas | SVG/Canvas, **per-monitor** rectangles (R1: F10) |
 | Package manager | **pnpm** |
 
-**Why Tauri:** the requirement is an *identically laid-out* settings screen on
-all three desktop OSes. A single web frontend renders the same DOM/CSS
-everywhere; using custom-styled controls (not native form widgets) and a bundled
-font makes the layout identical by construction. Tauri's backend is Rust, so the
-shell links `mouser-core` directly, and bundles are small.
-
-**Alternatives considered:**
-- **Slint** (Rust-native declarative UI) — renders its own pixels, so it is
-  pixel-identical and pure-Rust; viable, but a smaller component/design ecosystem
-  than web for a polished settings UI.
-- **Flutter desktop** — pixel-identical via Skia, but Dart adds a second language
-  and a clunkier bridge to a Rust core.
-- **Native per-OS (SwiftUI / WinUI / GTK)** — best OS-native feel, but directly
-  violates the "identical layout" requirement and triples UI work. Rejected.
-
-Caveat: Tauri uses each platform's system WebView (WKWebView / WebView2 /
-WebKitGTK), so there can be sub-pixel font-rendering differences. For *layout*
-identity (the stated requirement) this is a non-issue; if pixel-perfect rendering
-is ever required, Slint is the fallback. On Windows, bundle the WebView2
-evergreen bootstrapper so target machines need no manual runtime install.
+Goal is consistent **layout/IA**, accessible and native-*feeling* per platform — not pixel-cloned native
+widgets (R1: F47). Tauri uses each OS WebView (WKWebView/WebView2/WebKitGTK); bundle the WebView2 evergreen
+bootstrapper on Windows. Alternatives (Slint pixel-identical/pure-Rust, Flutter, native) recorded as rejected.
 
 ---
 
 ## 6. Mobile companion
 
-| Concern | Choice |
-|---------|--------|
-| iOS | Swift + SwiftUI |
-| Android | Kotlin + Jetpack Compose |
-| Shared logic | `mouser-core` via **uniffi** (generated Swift + Kotlin bindings) |
-| Layout | Portrait: touchpad above, native OS keyboard below |
-
-The companion is a protocol peer (remote-control capability, coordinator-
-ineligible), reusing the one networking/protocol implementation. Tauri v2 mobile
-is a possible alternative shell, but native is preferred for touchpad/keyboard
-feel.
+iOS Swift/SwiftUI, Android Kotlin/Compose, sharing `mouser-core` via **uniffi** (pre-1.0 → expose a narrow
+**`mouser-ffi`** facade: connect, pair, send motion, send key, observe state — not raw core internals, R1: F-X11).
+Portrait: touchpad (motion datagrams) above, native keyboard (HID key events) below.
 
 ---
 
-## 7. Virtual devices (future)
+## 7. Virtual devices (future — separate high-risk subsystem) (R1: F45)
 
-Webcam and audio sharing expose a real device from one machine as a virtual
-device on another. These are native, separately-loaded modules talking to the
-core over local IPC:
+Webcam/audio sharing is **not a small toggle**; it gets its own architecture doc covering signing/notarization,
+min OS versions, lifecycle, crash isolation, and CI signing. Media uses **separate transport/congestion** from
+input (live 1080p contends with motion otherwise) with hardware encode + adaptive bitrate.
 
 | OS | Camera | Audio |
 |----|--------|-------|
-| macOS | CoreMediaIO DAL / Camera Extension | CoreAudio / audio HAL plugin |
-| Windows | Media Foundation virtual camera / DirectShow filter | virtual audio device |
-| Linux | `v4l2loopback` | PipeWire / virtual sink-source |
+| macOS | CoreMediaIO Camera Extension (system-extension signing + notarization) | CoreAudio HAL plugin |
+| Windows | Media Foundation virtual camera | driver-signed virtual audio |
+| Linux | `v4l2loopback` (DKMS / Secure Boot friction) | PipeWire virtual sink/source |
 
 ---
 
-## 8. Build, packaging & CI
+## 8. Workspace, build, packaging & CI (R1: F11, F33)
 
-| Concern | Choice |
-|---------|--------|
-| Workspace | Cargo workspace (`mouser-core`, `platform-*`, `mouser-ffi`, Tauri app) |
-| Frontend build | Vite + pnpm |
-| Installers | Tauri bundler: `.app`/`.dmg` (macOS), `.msi`/`.exe` (Windows, WebView2 evergreen), `.deb`/`.AppImage` (Linux) |
-| Autostart / service | Tauri autostart plugin + OS service registration (launch on login, start minimized, optional all-users install) |
-| CI | GitHub Actions matrix: macOS, Windows, Linux build + test + lint |
+Cargo workspace crates (one responsibility each, ≤500 lines/file):
+`mouser-protocol` (messages, ALPN, codec rules, **golden vectors**, versioning),
+`mouser-core` (identity, trust, permissions, ownership epochs, CRDT schema, election),
+`mouser-net` (quinn 2-connection transport, mDNS), `platform-{mac,win,linux}`,
+`mouser-engine` (daemon binary), `mouser-ipc` (typed UDS/named-pipe),
+`mouser-ffi` (uniffi facade), `mouser-testkit` (fake clock/transport/adapters + N-engine harness),
+`apps/desktop` (Tauri UI).
 
-This is what lets Linux and Windows builds be produced on, and run on, separate
-machines while remaining interoperable — the wire protocol is the contract.
+Packaging: `.app`/`.dmg`, `.msi`/`.exe` (WebView2 evergreen), `.deb`/`.AppImage`. **Signing/notarization is a
+separate workstream** (R1: F33): macOS Developer ID + notarization, Windows code signing (SmartScreen). CI in
+layers: PR checks → nightly unsigned packaging smoke → protected signed release jobs (Apple/Windows secrets).
 
 ---
 
 ## 9. Quality gates
 
-Per project policy, linting is **strict and blocking**:
-
-- **`cargo clippy -- -D warnings`** and **`cargo fmt --check`** must pass; builds
-  do not pass without all lints passing.
-- **`cargo test`** (headless) for the core and protocol; integration harness for
-  multi-engine scenarios.
-- Frontend: ESLint + TypeScript strict mode + Prettier, blocking.
-- Source files kept to a 500-line cap; over the limit is a refactor signal, not a
-  dumping ground.
+- **`cargo clippy -- -D warnings`** + **`cargo fmt --check`** blocking.
+- Decode paths: `deny(unwrap_used, panic, indexing_slicing)` + **`cargo-fuzz`** corpus on protocol + CRDT-apply (R1: F27).
+- **`mouser-testkit`** built first: fake clock, fake transport (drop/reorder/latency), fake platform adapters,
+  ≥3 in-process engines; asserts ownership handoff, CRDT convergence, reconnect, stale-message rejection,
+  and **latency SLO** (≤5 ms wired / ≤15 ms Wi-Fi, R1: F-L3).
+- Real-device acceptance per platform (macOS native, iOS simulator, Linux over SSH).
+- Frontend: ESLint + TS strict + Prettier + **a11y checks** (WCAG 2.2 AA, R1: F46) blocking.
+- 500-line file cap.
