@@ -298,23 +298,24 @@ impl InteractiveConnection {
         Ok(())
     }
 
-    /// Receive and decode the next motion datagram (§7.6).
+    /// Receive the next *valid* motion datagram (§7.6).
     ///
-    /// Drop-and-continue (H8): a corrupt or unknown datagram yields
-    /// `Ok(Datagram::Unknown(..))` (the caller drops it); `Err` is reserved for the
-    /// underlying QUIC read failure (a genuinely dead/closed connection).
+    /// Drop-and-continue (H8): a corrupt datagram or an unknown tag is dropped and the
+    /// next datagram is read, so a single bad UDP packet never surfaces to the caller
+    /// and never tears down the connection. `Err` is reserved for the underlying QUIC
+    /// read failure (a genuinely dead/closed connection).
     pub async fn recv_motion(&self) -> Result<mouser_protocol::Datagram, NetError> {
-        let bytes = self
-            .connection
-            .read_datagram()
-            .await
-            .map_err(|e| NetError::Datagram(e.to_string()))?;
-        match mouser_protocol::decode_datagram(&bytes) {
-            Ok(datagram) => Ok(datagram),
-            // A bad UDP packet is not a dead connection: drop it and keep going.
-            Err(_) => Ok(mouser_protocol::Datagram::Unknown(
-                bytes.first().copied().unwrap_or(0),
-            )),
+        loop {
+            let bytes = self
+                .connection
+                .read_datagram()
+                .await
+                .map_err(|e| NetError::Datagram(e.to_string()))?;
+            match mouser_protocol::decode_datagram(&bytes) {
+                // Unknown tag or undecodable body: a bad packet, not a dead connection.
+                Ok(mouser_protocol::Datagram::Unknown(_)) | Err(_) => continue,
+                Ok(datagram) => return Ok(datagram),
+            }
         }
     }
 
