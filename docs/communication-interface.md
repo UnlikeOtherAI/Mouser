@@ -47,8 +47,10 @@ where `len` counts `type + flags + payload`. On an unknown `type` a decoder cons
 and continues. `flags` is reserved: senders MUST set 0, receivers MUST ignore unknown bits.
 
 ### 0.3 Limits, time, discipline
-- **Size caps**: control message ≤ 256 KiB; `String` ≤ 4 KiB; `bytes` ≤ 64 KiB except
-  `StateSnapshot.full_state` ≤ 8 MiB and `FileChunk.data` ≤ 1 MiB. Reject oversize before allocating.
+- **Size caps (per plane)**: a **control-stream** message ≤ 256 KiB (`String` ≤ 4 KiB, any `bytes`
+  field ≤ 64 KiB). **Bulk-stream** messages may be larger — `FileChunk.data` ≤ 1 MiB,
+  `ClipboardData.data` ≤ 1 MiB per frame (chunk larger payloads like `FileChunk`), `StateSnapshot.full_state`
+  ≤ 8 MiB. Each bulk transfer is framed per §0.2 on its own stream (§6.2). Reject oversize before allocating.
 - **Time**: timestamps are `u64` ms; **no wire field uses another machine's wall clock for
   comparison**. Lease/liveness use local-monotonic durations (§7.10).
 - **Decode** path is panic-free (`deny(unwrap_used, panic, indexing_slicing)`) and fuzzed in CI.
@@ -103,7 +105,7 @@ permissions); low input latency (motion on a dedicated datagram plane).
 3. **First contact (pairing):** the receiver shows the **cert-derived** `device_id`/fingerprint
    (not TXT data) and a **mandatory** 6-digit SAS computed identically on both ends. Let
    `ctx = min(idA,idB) || max(idA,idB)` (the two 32-byte `device_id`s ordered ascending by byte value),
-   `k = tls_exporter(label="mouser-sas-v1", context = ctx, length = 32)`,
+   `k = tls_exporter(label="mouser-sas-v1", context = ctx, length = 32)` on the **interactive** connection,
    `digest = HKDF-SHA256(salt = "mouser-sas-v1", ikm = k, info = "sas", L = 4)`; then
    `SAS = ( be_u32(digest) mod 1_000_000 )` rendered as **6 zero-padded decimal digits**. The user
    compares the two screens and approves. SAS is not optional.
@@ -111,9 +113,11 @@ permissions); low input latency (motion on a dedicated datagram plane).
    tls_exporter(label="mouser-channel-v1", context = device_id_of_signer, length=64) )` on the
    **interactive** connection (TLS 1.3 exporter, RFC 8446 §7.5 / RFC 5705) — binds the proof to this
    session (defeats relay/replay).
-5. **Bulk binding:** the bulk connection sends `BulkHello` (§7.1) carrying the same `device_id`, a
-   `channel_sig` computed with label `"mouser-bulk-v1"` over the bulk connection's exporter, and the
-   interactive `session_id` it binds to. No separate SAS (trust already established).
+5. **Bulk binding:** the bulk connection sends `BulkHello` (§7.1) carrying the same `device_id` and the
+   interactive `session_id` it binds to, with `channel_sig = Ed25519_sign( identity_key,
+   tls_exporter(label="mouser-bulk-v1", context = device_id_of_signer || be8(interactive_session_id),
+   length = 64) )` over the **bulk** connection's exporter — so `interactive_session_id` is part of the
+   signed bytes, binding the two connections. No separate SAS (trust already established).
 6. **Resume:** trusted peers skip the prompt; cert pinning + `channel_sig` still verified.
 
 `HelloAck.status ∈ {Accepted, Rejected, Pending}`; first contact returns `Pending` (timeout 120 s),
@@ -128,7 +132,7 @@ is in the trusted list.
 - **Control stream** — one long-lived high-priority bidi QUIC stream, reliable+ordered, framed per
   §0.2. Carries `Hello`, ownership/focus, key/button/scroll, small CRDT deltas, election, clipboard
   offers/text, capability-state, notifications, liveness.
-- **Motion datagram plane** — QUIC DATAGRAM (RFC 9221), `PointerMotion` only (§7.6). If the path's
+- **Motion datagram plane** — QUIC DATAGRAM (RFC 9221), `PointerMotion`/`PointerMotionRel` only (§7.6). If the path's
   `max_datagram_frame_size` is insufficient, motion degrades onto the control stream with coalescing.
 
 ### 6.2 Bulk connection
@@ -164,7 +168,7 @@ Pinned CRDT **automerge**, `fmt = 1`.
 [10] StateDelta   { fmt: u16, change: bytes, dep_heads: [bytes32] }
 [11] StateRequest { fmt: u16, have_heads: [bytes32] }
 [12] StateChanges { fmt: u16, changes: [bytes] }
-[13] StateSnapshot{ fmt: u16, full_state: bytes }   // bulk connection
+[13] StateSnapshot{ fmt: u16, full_state: bytes }   // bulk connection, own dedicated stream
 ```
 - The replicated CRDT holds **shared, non-security config only**: `devices`, per-monitor `layout`
   (+ a monotonic `layout_rev`), `aliases`, `input_prefs` (Appendix A).
@@ -184,15 +188,21 @@ Layout changes travel only as `StateDelta` (v1 `LayoutUpdate` removed).
 
 ### 7.4 Ownership, focus & capability
 ```
-[30] OwnershipTransfer { to: bytes32, owner_epoch: u64, layout_rev: u64, reason: TransferReason }
+[30] OwnershipTransfer { to: bytes32, owner_epoch: u64, layout_rev: u64, reason: TransferReason } // owner-minted grant
 [31] OwnershipAck      { owner_epoch: u64, accepted: bool, reason?: str }
 [32] FocusState        { owner: bytes32, owner_epoch: u64, state: FocusKind }
 [33] CapabilityState   { device_id: bytes32, capture: CapState, inject: CapState, reason: BlockedReason }
+[34] OwnershipRequest  { from: bytes32, reason: TransferReason }  // non-owner asks the current owner to hand off
 ```
-- Ownership is a **single token with monotonic `owner_epoch`**. Only the current owner mints
-  `epoch+1`; receivers accept only strictly-greater epochs; equal-epoch races → lower `device_id`.
-  Transfer requires `OwnershipAck`. A non-owner requesting ownership (UI/hotkey/local-reclaim) sends
-  `OwnershipTransfer`; the current owner mints the next epoch and acks (no two-owner race).
+- Ownership is a **single token with monotonic `owner_epoch`**, minted **only by the current owner**, so
+  `OwnershipTransfer` is always an owner-minted *grant*. A non-owner that wants ownership (UI / hotkey)
+  sends `OwnershipRequest` to the current owner, which mints `epoch+1` and broadcasts the
+  `OwnershipTransfer`; the target replies `OwnershipAck`. Single-minter means two valid grants for one
+  epoch cannot exist.
+- **Acceptance rule:** accept an `OwnershipTransfer`/`FocusState` iff its `owner_epoch` is **strictly
+  greater** than the locally-known epoch. The lone exception is *simultaneous reclaim* — two devices
+  independently self-mint the same `epoch+1` after an owner heartbeat-timeout (below): there the claim
+  with the **lower `device_id` wins** and the loser adopts the winner's state at that epoch.
 - `LocalReclaim`: a device whose **own** local hardware is used reclaims ownership (replaces v1
   "WindowClick"). On owner heartbeat-timeout the physically-attached device reclaims with `epoch+1`.
 - **`layout_rev`** is a monotonic counter stored in the CRDT (LWW by `(layout_rev, editor device_id)`),
@@ -218,12 +228,19 @@ Layout changes travel only as `StateDelta` (v1 `LayoutUpdate` removed).
 
 ### 7.6 Pointer motion — lossy datagram
 ```
-PointerMotion (datagram, postcard, 1-byte tag 0x01):
+PointerMotion    (datagram, postcard, 1-byte tag 0x01 = absolute):
   { owner_epoch: u64, seq: u32, display_id: u32, x: i32, y: i32 }
+PointerMotionRel (datagram, postcard, 1-byte tag 0x02 = relative):  // pointer-locked / relative targets
+  { owner_epoch: u64, seq: u32, dx_acc: i64, dy_acc: i64 }          // cumulative deltas since session start
 ```
-- `x,y` = integer logical pixels in the target **display's** space (`display_id`, Appendix A); origin
-  top-left, y-down; receiver clamps. A change in `owner_epoch` resets `last_seq`; `seq` is compared
-  wraparound-safe (RFC 1982). No `ts`. Unknown tag → drop. Apply only if `(owner_epoch, seq)` is newer.
+- **Tag 0x01 (absolute, default):** `x,y` = integer logical pixels in the target **display's** space
+  (`display_id`, Appendix A); origin top-left, y-down; receiver clamps. Loss self-heals (absolute).
+- **Tag 0x02 (relative):** used only when the target reports a pointer-locked/relative consumer (games,
+  3D). `dx_acc,dy_acc` are **cumulative** deltas since session start, so a dropped packet costs at most
+  the motion between two surviving samples (still newest-wins, not per-packet deltas). The sender selects
+  the mode from the target's `CapabilityState`/focus; the 1-byte tag is the wire discriminator.
+- Both: a change in `owner_epoch` resets `last_seq`; `seq` compared wraparound-safe (RFC 1982); no `ts`;
+  unknown tag → drop; apply only if `(owner_epoch, seq)` is newer.
 - Authorized only from a trusted peer with `mouse` permission that is the current owner; path-validated
   after migration.
 
@@ -233,10 +250,13 @@ PointerMotion (datagram, postcard, 1-byte tag 0x01):
 [51] ClipboardPull  { hash: bytes32, format: ClipFormat }
 [52] ClipboardData  { hash: bytes32, format: ClipFormat, data: bytes }   // bulk connection if large
 ```
-`hash = SHA-256(format-canonicalized bytes)`; puller verifies received data's hash (drop on mismatch).
-A new Offer supersedes outstanding offers from that origin. Locally-applied clipboard is tagged
-`(origin,hash)` and not re-offered (loop prevention). Gated by mode (off/text-only/full) + permission.
-`ClipFormat` values in Appendix C.
+`hash = SHA-256(canonical(format, bytes))`, where `canonical` per `ClipFormat` is: `utf8_text` = UTF-8
+with CRLF→LF and no trailing NUL; `html` / `rtf` = bytes as-is; `png` = the raw PNG byte stream;
+`uri_list` = UTF-8, LF-separated, no trailing blank line. The puller verifies the received data's hash
+(drop on mismatch). `ClipboardData` rides the **bulk** connection on its own stream (per `hash`); payloads
+> 1 MiB are chunked with the `FileChunk` offset mechanism. A new Offer supersedes outstanding offers from
+that origin; locally-applied clipboard is tagged `(origin,hash)` and not re-offered (loop prevention).
+Gated by mode (off/text-only/full) + permission. `ClipFormat` values in Appendix C.
 
 ### 7.8 File transfer (bulk connection)
 ```
@@ -277,8 +297,8 @@ Connect/disconnect debounced; `CoordinatorChanged` off by default.
 datagram hasn't flushed; ~1000 Hz hard cap (not a cadence); ≤2 ms sender budget; on the interactive
 connection only. **Receiver:** apply if `(owner_epoch, seq)` newer; inject absolute logical-pixel position
 on `display_id`; clamp; optional ≤1-frame smoothing off by default. **Pointer-lock/relative consumers**
-(games): on a pointer-locked target the sender switches to cumulative-delta mode (same newest-wins seq);
-else pointer-lock is out of scope for v1 and surfaced. **Budget:** ≤5 ms wired / ≤15 ms good Wi-Fi,
+(games): the sender switches to the `PointerMotionRel` datagram (tag 0x02, cumulative deltas, §7.6) when
+the target reports a pointer-locked app; otherwise the absolute `PointerMotion` (tag 0x01) is used. **Budget:** ≤5 ms wired / ≤15 ms good Wi-Fi,
 asserted by the harness.
 
 ---
@@ -319,11 +339,15 @@ size caps (§0.3) + panic-free fuzzed decoders.
 ## Appendix A — CRDT document schema (normative)
 Automerge root keys (**permissions and trusted list are intentionally absent** — local store, §9):
 - `layout_rev: u64` — monotonic layout revision (LWW by `(layout_rev, editor device_id)`).
-- `devices: Map<device_id_hex, { name: str, os: str, alias?: str }>`
+- `devices: Map<device_id_hex, { name: str, os: str }>`  (the user-chosen alias lives in `aliases`
+  below — not duplicated here).
 - `layout: Map<device_id_hex, { monitors: List<Monitor> }>`,
   `Monitor { display_id: u32, x: i32, y: i32, w: u32, h: u32, scale_milli: u32, rotation: u16 }`
   in a shared virtual-desktop coordinate space (signed origins). `scale_milli` = scale ×1000 (integer).
-- `aliases: Map<device_id_hex, str>`; `input_prefs: Map<...>`.
+- `aliases: Map<device_id_hex, str>` — optional user-chosen display alias per device.
+- `input_prefs: { edge_dwell_ms: u32, lock_on_drag: bool, cursor_accel: bool, cmd_ctrl_swap: bool,
+  hotkeys: Map<str, str> }` — cluster-wide input preferences (`hotkeys` maps an action name, e.g.
+  `"jump:<device_id_hex>"` or `"panic"`, to a platform-neutral chord string).
 
 **Post-merge normalization**: after applying changes each engine deterministically re-derives
 the edge-adjacency map from merged `Monitor` rects (overlaps resolved by ascending `device_id`, then
