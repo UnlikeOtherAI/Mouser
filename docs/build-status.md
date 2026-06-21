@@ -25,7 +25,7 @@ Reviews: `docs/design-review.md` (Round 1 design), `docs/audit-round1.md` (Round
 ## Round 2 audit headline (see docs/audit-round2.md)
 2 CRITICAL (both "not built yet": the `mouser-engine` runtime, and mobile FFI/network wiring), 8 HIGH, ~28 MEDIUM, ~25 LOW. No memory-unsafety found (platform `unsafe` re-verified sound). Round-1 fixes hold. Top HIGHs: §5 pairing/SAS stubbed, file integrity has no wire digest, resume vs symlink-safe sink unreconciled, mDNS browse drops the peer address, oversize-datagram kills the motion pump, Windows keymap missing the keypad block, mac capture reports display_id=0, Android missing INTERNET permission.
 
-## Round-2 fix wave + shared clipboard — MERGED to main (`703a4a4`)
+## Round-2 fix wave + shared clipboard — MERGED to main (`4be677a`, gate-fixes included)
 Foundation (`51f3ac8`): §7.7 clipboard wire messages + `HelloAck` + `CapabilitySet` forward-compat fix
 + Android network perms + spec (immediate-sync, progress, prefer-native, settings). Then six gated
 builder branches, each built in its own worktree and merged after verification (full workspace
@@ -37,14 +37,14 @@ build/test/clippy green after every merge; 32 test suites pass):
 - `plat-parity` — C2-8 Windows keypad block + three-way parity test, C2-9 mac capture per-display coords, FlagsChanged twin fix, Windows scroll `ScrollUnit` + sign-correct packing.
 - `election-fix` — `on_yield` exact-term, guarded `start_claim`, no claim-as-lease, no lower-term resurrection, **+ cross-node yield-term fix** (Codex gate caught it pre-merge; fixed + 2 cross-node regression tests).
 
-Gate: `election-fix` got the full Codex+Claude pair pre-merge (Codex found a real cross-node bug → fixed → re-verified). The other five merged on orchestrator integration-verification; a **Codex post-merge second-opinion batch is running** (`/tmp/mouser-gate`) — any real finding gets fixed-forward.
+### Gate (two rounds, all merged — `4be677a`)
+`election-fix` got the full Codex+Claude pair pre-merge (Codex found a real cross-node yield-term bug → fixed → re-verified). The other five merged on orchestrator integration-verification, then a **Codex post-merge second-opinion** FAILed all five with concrete follow-ups (the gate's value): files `on_ack` trusted impossible acks (HIGH), clip-engine `on_data` skipped receipt gates + no same-origin offer supersession, Windows `Html` lacked CF_HTML + empty-write garbage byte, mac capture `expect()` on poisoned locks, missing motion-fallback test. Four **fix branches** (`net-test`, `clip-engine-fix`, `files-fix`, `platform-fix`) addressed every verified finding with mutation-discriminated tests, were orchestrator-verified, and merged. A final Codex confirmation pass is running (`/tmp/mouser-gate2`). Net result: all Round-2 audit findings that don't require the engine are fixed; the shared clipboard core + platform adapters are in.
 
 ## Queued
-1. Process the Codex post-merge gate verdicts; fix-forward any real findings.
-2. **Clipboard UI wave**: desktop settings toggles (`apps/desktop`) + Mac-style progress/"wait" indicator; mobile clipboard hooks + native-preference + progress.
-3. **Mobile fixes** (C2-2 FFI/net wiring, iOS keyboard-below layout, lifecycle/reconnect, iOS double-motion, momentum deinit) + **hygiene** (workspace-wide panic-free clippy lints, `libc` dep removal, SAFETY comments).
-4. **Round 3 audit** on the whole codebase after the clipboard-UI + mobile waves land (per request).
-5. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
+1. **Clipboard UI wave**: desktop settings toggles (`apps/desktop`) + Mac-style progress/"wait" indicator wired to engine progress; mobile clipboard hooks + native-preference + progress.
+2. **Mobile fixes** (C2-2 FFI/net wiring, iOS keyboard-below layout, lifecycle/reconnect, iOS double-motion, momentum deinit) + **hygiene** (workspace-wide panic-free clippy lints, `libc` dep removal, SAFETY comments).
+3. **Round 3 audit** on the whole codebase after the clipboard-UI + mobile waves land (per request).
+4. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
 
 ## Infra
 rustup 1.96 + ios targets; Xcode 26.3 + iPhone 17 Pro sim; Android SDK + AVD; Linux box `ai@192.168.1.203` (uinput). Per-task gate = Codex+Claude pair; parallel worktrees under `.worktrees/`.
