@@ -20,12 +20,23 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
+    entitlements:
+      path: Sources/Mouser.entitlements
+      properties:
+        # Multicast entitlement — required alongside the Local Network usage
+        # string for mDNS/Bonjour discovery on iOS. See docs/tech-stack.md §6.
+        com.apple.developer.networking.multicast: true
     info:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: Mouser
         CFBundleShortVersionString: "0.1.0"
         CFBundleVersion: "1"
+        # Local Network (mDNS/LAN) — required on iOS 14+ for the companion to
+        # discover and dial engines over Bonjour. See docs/tech-stack.md §6.
+        NSLocalNetworkUsageDescription: Mouser discovers and connects to your computers on the local network to control their mouse and keyboard.
+        NSBonjourServices:
+          - _mouser._udp
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
