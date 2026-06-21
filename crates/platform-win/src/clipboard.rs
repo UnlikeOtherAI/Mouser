@@ -276,7 +276,12 @@ fn alloc_global(bytes: &[u8]) -> PlatformResult<HGLOBAL> {
 fn utf16le_bytes_to_utf8(raw: &[u8]) -> Vec<u8> {
     let units: Vec<u16> = raw
         .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        // `chunks_exact(2)` only yields 2-byte slices; the slice pattern is
+        // infallible here but lets us read the pair without panicking indexes.
+        .filter_map(|c| match c {
+            [lo, hi] => Some(u16::from_le_bytes([*lo, *hi])),
+            _ => None,
+        })
         .take_while(|&u| u != 0)
         .collect();
     String::from_utf16_lossy(&units).into_bytes()

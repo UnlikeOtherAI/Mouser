@@ -100,7 +100,9 @@ fn header_with_offsets(
 #[must_use]
 pub(crate) fn decode(payload: &[u8]) -> Vec<u8> {
     if let Some(range) = fragment_range_from_header(payload) {
-        return payload[range].to_vec();
+        if let Some(frag) = payload.get(range) {
+            return frag.to_vec();
+        }
     }
     if let Some(frag) = fragment_between_markers(payload) {
         return frag;
@@ -112,7 +114,7 @@ pub(crate) fn decode(payload: &[u8]) -> Vec<u8> {
 /// they bound, if both are present and in-bounds.
 fn fragment_range_from_header(payload: &[u8]) -> Option<std::ops::Range<usize>> {
     let header_end = find(payload, b"<")?.min(payload.len());
-    let header = std::str::from_utf8(&payload[..header_end]).ok()?;
+    let header = std::str::from_utf8(payload.get(..header_end)?).ok()?;
     let start = header_offset(header, "StartFragment:")?;
     let end = header_offset(header, "EndFragment:")?;
     if start <= end && end <= payload.len() {
@@ -133,7 +135,7 @@ fn header_offset(header: &str, key: &str) -> Option<usize> {
 fn fragment_between_markers(payload: &[u8]) -> Option<Vec<u8>> {
     let start = find(payload, START_FRAGMENT.as_bytes())? + START_FRAGMENT.len();
     let end = find(payload, END_FRAGMENT.as_bytes())?;
-    (start <= end).then(|| payload[start..end].to_vec())
+    payload.get(start..end).map(<[u8]>::to_vec)
 }
 
 /// First index of `needle` in `haystack` (tiny substring search; payloads are small).

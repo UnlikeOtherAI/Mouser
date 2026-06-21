@@ -2908,7 +2908,6 @@ version = "0.0.0"
 dependencies = [
  "core-foundation",
  "core-graphics",
- "libc",
  "mouser-core",
  "objc2",
  "objc2-app-kit",

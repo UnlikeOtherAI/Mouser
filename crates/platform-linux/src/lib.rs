@@ -11,6 +11,11 @@
 //! keymap's pure-data surface and the stub below compile, so
 //! `cargo build -p platform-linux` succeeds everywhere.
 
+// This crate keeps `unsafe` (uinput / evdev) so it can't adopt
+// `[lints] workspace = true` (that would pull in `unsafe_code = "forbid"`).
+// Replicate the workspace panic-free clippy denies here instead (audit R2).
+#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+
 pub mod clipboard;
 pub mod keymap;
 

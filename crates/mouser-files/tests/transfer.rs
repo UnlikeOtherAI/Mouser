@@ -102,6 +102,11 @@ fn make_fail_finish_sink(_idx: usize, _path: &Path) -> Result<FailFinishSink, Si
 
 /// Pull the `FileAccept` out of `accept_offer`'s outbound list (always the first message
 /// for a non-rejected offer); panics with the actual variant otherwise.
+// `allow(clippy::panic)`: a test-only assertion helper. `allow-panic-in-tests`
+// exempts panics inside `#[test]` fns but not this shared helper; `#[track_caller]`
+// keeps the failure pointed at the calling test.
+#[track_caller]
+#[allow(clippy::panic)]
 fn expect_accept(out: Vec<Outbound>) -> mouser_protocol::FileAccept {
     match out.into_iter().next() {
         Some(Outbound::Accept(a)) => a,

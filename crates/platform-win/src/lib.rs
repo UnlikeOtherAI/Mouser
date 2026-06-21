@@ -34,6 +34,11 @@
 //! **virtual-desktop** space, matching the wire protocol's absolute
 //! `PointerMotion` convention (§7.6); see [`inject::move_cursor`].
 
+// This crate keeps `unsafe` (Win32 SendInput / clipboard) so it can't adopt
+// `[lints] workspace = true` (that would pull in `unsafe_code = "forbid"`).
+// Replicate the workspace panic-free clippy denies here instead (audit R2).
+#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+
 // `keymap` is pure logic with no platform deps — always compiled so the
 // Appendix B Windows table is testable on any host.
 pub mod keymap;

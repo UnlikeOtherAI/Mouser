@@ -21,3 +21,16 @@ repository = "https://github.com/UnlikeOtherAI/Mouser"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Panic-free discipline for every crate that adopts `[lints] workspace = true`
+# (audit R2: panic-free lints were not workspace-wide). Runtime paths must
+# propagate errors / recover poisons instead of unwrap/expect/panic, and index
+# via checked `.get()`. `#[cfg(test)]` code is exempt — the table below lifts the
+# denies under `cfg(test)` so tests may keep unwrap/panic/indexing.
+# Platform crates that keep `unsafe` (platform-mac/-win/-linux) can't use
+# `[lints] workspace = true` (it would also pull in `unsafe_code = "forbid"`),
+# so they replicate these three denies via an inner `#![deny(...)]` in lib.rs.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

@@ -8,7 +8,7 @@
 //!
 //! Linux-only: it needs `/dev/uinput` and `input_linux::Key`.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use input_linux::Key;
 use mouser_core::platform::{InputInjection, PlatformError, PlatformResult, ScrollUnit};
@@ -88,6 +88,16 @@ fn boxed<E: std::error::Error + Send + Sync + 'static>(e: E) -> PlatformError {
     Box::new(e)
 }
 
+/// Lock the device mutex, recovering the guard if a previous holder panicked.
+///
+/// A poisoned uinput mutex only means a prior injection unwound mid-write; the
+/// `VirtualDevice` itself is still a valid handle, so we recover via
+/// [`PoisonError::into_inner`] rather than `.expect(...)` — keeping the runtime
+/// path panic-free (mirrors `platform-mac`'s `lock_recover`).
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn button_of(index: u8) -> Result<Button, UnknownButton> {
     match index {
         0 => Ok(Button::Left),
@@ -103,21 +113,21 @@ impl InputInjection for UinputInjector {
     fn move_cursor(&self, _display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
         let ax = self.scale(x, self.desktop_w);
         let ay = self.scale(y, self.desktop_h);
-        self.dev.lock().expect("uinput mutex").move_abs(ax, ay).map_err(boxed)
+        lock_recover(&self.dev).move_abs(ax, ay).map_err(boxed)
     }
 
     fn move_cursor_relative(&self, dx: i32, dy: i32) -> PlatformResult<()> {
-        self.dev.lock().expect("uinput mutex").move_rel(dx, dy).map_err(boxed)
+        lock_recover(&self.dev).move_rel(dx, dy).map_err(boxed)
     }
 
     fn button(&self, button: u8, down: bool) -> PlatformResult<()> {
         let b = button_of(button).map_err(boxed)?;
-        self.dev.lock().expect("uinput mutex").button(b, down).map_err(boxed)
+        lock_recover(&self.dev).button(b, down).map_err(boxed)
     }
 
     fn key(&self, usage: u16, down: bool, mods: u16) -> PlatformResult<()> {
         let key: Key = hid_usage_to_evdev(usage).ok_or_else(|| boxed(UnmappedKey(usage)))?;
-        let dev = self.dev.lock().expect("uinput mutex");
+        let dev = lock_recover(&self.dev);
         // Press modifiers before the key (and release after) so chords land as a
         // real combination, mirroring how a hardware keyboard reports them.
         let modifiers = mods_to_evdev(mods);
@@ -143,6 +153,6 @@ impl InputInjection for UinputInjector {
             ScrollUnit::Detent120 => (dx / 120, dy / 120),
             ScrollUnit::LogicalPixel => (dx, dy),
         };
-        self.dev.lock().expect("uinput mutex").scroll(sx, sy).map_err(boxed)
+        lock_recover(&self.dev).scroll(sx, sy).map_err(boxed)
     }
 }
