@@ -30,3 +30,7 @@ pub use identity::{
     device_id_from_public_key, device_id_from_public_key_bytes, DeviceIdentity, IdentityError,
 };
 pub use ownership::{Ownership, OwnershipUpdate, RejectReason};
+pub use platform::{
+    CaptureDecision, ClipFormat, Clipboard, InputCapture, InputInjection, InputSink,
+    LocalInputEvent, PlatformError, PlatformResult, ScrollUnit, Tray, TrayState,
+};

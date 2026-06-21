@@ -10,6 +10,12 @@ repository.workspace = true
 # adopt the workspace `unsafe_code = "forbid"` lint. All Linux-only code is
 # cfg-gated so the crate still builds as an empty stub on macOS / Windows.
 
+# `mouser-core` provides the `InputInjection`/`InputCapture` trait contracts the
+# adapter structs implement (audit H2). The keymap's host-independent
+# `supported_hid_usages` is buildable everywhere; the uinput adapter is Linux-only.
+[dependencies]
+mouser-core = { path = "../mouser-core" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 input-linux = "0.7"
 

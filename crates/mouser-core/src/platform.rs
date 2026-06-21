@@ -102,18 +102,49 @@ pub enum ScrollUnit {
     LogicalPixel,
 }
 
+/// What the adapter should do with a captured local event after the sink has
+/// seen it (audit H3).
+///
+/// In the active-device model a machine that currently owns a *remote* peer must
+/// **swallow its own local input** (so the cursor/keys don't also drive the
+/// local desktop) while still forwarding the event over the wire. The sink
+/// returns this decision per event so the engine — not the adapter — owns the
+/// suppress-vs-passthrough policy (spec §7.4, §9).
+///
+/// Real suppression is a platform capability, not a guarantee: on macOS it
+/// requires an active **default** `CGEventTap` (not listen-only) backed by the
+/// Accessibility grant; without that the adapter can only observe. When an
+/// adapter cannot honor [`CaptureDecision::Suppress`] it must pass the event
+/// through and report the reduced capability (e.g. `CapState::PermissionMissing`)
+/// rather than silently pretend it suppressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureDecision {
+    /// Let the event continue to the local OS as normal.
+    PassThrough,
+    /// Swallow the event locally (do not deliver it to the local desktop). Used
+    /// while this machine owns a remote peer and is forwarding input.
+    Suppress,
+}
+
 /// A sink for locally-observed input events delivered by [`InputCapture`].
 ///
 /// The callback runs on the adapter's capture thread and must be cheap and
 /// non-blocking; it hands events to the engine, which makes ownership/forwarding
-/// decisions off the hot path.
+/// decisions off the hot path and replies with a [`CaptureDecision`] telling the
+/// adapter whether to swallow the event locally (audit H3).
 pub trait InputSink: Send + Sync {
-    /// Receive one locally-observed input event.
-    fn on_event(&self, event: LocalInputEvent);
+    /// Receive one locally-observed input event and decide its local fate.
+    fn on_event(&self, event: LocalInputEvent) -> CaptureDecision;
 }
 
 /// Captures local input so the engine can detect edge crossings, local reclaim, and
 /// the panic hotkey, and forward events while this machine is the owner.
+///
+/// For each event the adapter calls [`InputSink::on_event`] and honors the
+/// returned [`CaptureDecision`]. Whether [`CaptureDecision::Suppress`] is
+/// actually enforceable is platform- and permission-dependent; adapters expose
+/// that via [`InputCapture::can_suppress`] so the engine can downgrade behavior
+/// instead of assuming local input is gone (audit H3).
 pub trait InputCapture: Send + Sync {
     /// Begin capturing local input, delivering events to `sink`. Idempotent: calling
     /// `start` while already capturing is a no-op.
@@ -121,6 +152,13 @@ pub trait InputCapture: Send + Sync {
 
     /// Stop capturing local input. Idempotent.
     fn stop(&self) -> PlatformResult<()>;
+
+    /// Whether this capture backend can actually swallow local input
+    /// ([`CaptureDecision::Suppress`]) in its current state. `false` means
+    /// suppression requests are observed but pass through (e.g. listen-only tap,
+    /// or missing Accessibility on macOS); the engine should surface the reduced
+    /// capability rather than rely on suppression.
+    fn can_suppress(&self) -> bool;
 }
 
 /// Read and write the system clipboard (spec §7.7).

@@ -10,8 +10,9 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 
 use input_linux::{
-    EventKind, EventTime, InputId, Key, KeyEvent, KeyState, RelativeAxis, RelativeEvent,
-    SynchronizeEvent, SynchronizeKind, UInputHandle,
+    AbsoluteAxis, AbsoluteEvent, AbsoluteInfo, AbsoluteInfoSetup, EventKind, EventTime, InputId,
+    Key, KeyEvent, KeyState, RelativeAxis, RelativeEvent, SynchronizeEvent, SynchronizeKind,
+    UInputHandle,
 };
 
 /// Name the kernel advertises for our virtual device.
@@ -23,7 +24,14 @@ const UINPUT_PATH: &str = "/dev/uinput";
 /// USB bus type (`BUS_USB`), used purely cosmetically for the device id.
 const BUS_USB: u16 = 0x03;
 
-/// Mouse buttons this spike can synthesize.
+/// Inclusive maximum of the normalized absolute-axis range (`0..=ABS_MAX`).
+///
+/// The kernel maps these axis values across the pointer's coordinate space; the
+/// adapter scales display-local logical pixels into this range
+/// ([`VirtualDevice::move_abs`]).
+pub const ABS_MAX: i32 = 0xFFFF;
+
+/// Mouse buttons this device can synthesize (§7.5 indices 0..=4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Button {
     /// Primary (left) mouse button — `BTN_LEFT`.
@@ -32,6 +40,10 @@ pub enum Button {
     Right,
     /// Middle / wheel mouse button — `BTN_MIDDLE`.
     Middle,
+    /// Back / button 4 — `BTN_SIDE`.
+    Back,
+    /// Forward / button 5 — `BTN_EXTRA`.
+    Forward,
 }
 
 impl Button {
@@ -40,6 +52,8 @@ impl Button {
             Button::Left => Key::ButtonLeft,
             Button::Right => Key::ButtonRight,
             Button::Middle => Key::ButtonMiddle,
+            Button::Back => Key::ButtonSide,
+            Button::Forward => Key::ButtonExtra,
         }
     }
 }
@@ -71,19 +85,28 @@ impl VirtualDevice {
         // Declare which event classes this device produces.
         handle.set_evbit(EventKind::Key)?;
         handle.set_evbit(EventKind::Relative)?;
+        handle.set_evbit(EventKind::Absolute)?;
         handle.set_evbit(EventKind::Synchronize)?;
 
-        // Relative pointer axes.
+        // Relative pointer axes + wheels (scroll).
         handle.set_relbit(RelativeAxis::X)?;
         handle.set_relbit(RelativeAxis::Y)?;
+        handle.set_relbit(RelativeAxis::Wheel)?;
+        handle.set_relbit(RelativeAxis::HorizontalWheel)?;
 
-        // Mouse buttons.
-        for button in [Button::Left, Button::Right, Button::Middle] {
-            handle.set_keybit(button.key())?;
+        // Mouse buttons (left/right/middle + back/forward, §7.5).
+        for key in [
+            Key::ButtonLeft,
+            Key::ButtonRight,
+            Key::ButtonMiddle,
+            Key::ButtonSide,
+            Key::ButtonExtra,
+        ] {
+            handle.set_keybit(key)?;
         }
 
-        // A handful of representative keyboard keys for the spike.
-        for key in spike_keys() {
+        // Every keyboard key the canonical keymap can produce (audit H11).
+        for key in crate::keymap::all_evdev_keys() {
             handle.set_keybit(key)?;
         }
 
@@ -94,7 +117,19 @@ impl VirtualDevice {
             version: 1,
         };
 
-        handle.create(&id, DEVICE_NAME.as_bytes(), 0, &[])?;
+        // Absolute X/Y axes over a normalized range so the adapter can place the
+        // cursor at a logical-pixel position (scaled into `0..=ABS_MAX`).
+        let abs = [
+            AbsoluteInfoSetup {
+                axis: AbsoluteAxis::X,
+                info: abs_info(),
+            },
+            AbsoluteInfoSetup {
+                axis: AbsoluteAxis::Y,
+                info: abs_info(),
+            },
+        ];
+        handle.create(&id, DEVICE_NAME.as_bytes(), 0, &abs)?;
         Ok(Self { handle })
     }
 
@@ -109,6 +144,45 @@ impl VirtualDevice {
             *RelativeEvent::new(t, RelativeAxis::Y, dy).as_event(),
             *sync(t).as_event(),
         ];
+        self.write_all(&events)
+    }
+
+    /// Move the cursor to an **absolute** position, each axis a value in
+    /// `0..=ABS_MAX` (the caller scales display-local logical pixels into that
+    /// range). The kernel maps the normalized value across the pointer space.
+    ///
+    /// # Errors
+    /// Propagates any write error from the uinput fd.
+    pub fn move_abs(&self, x: i32, y: i32) -> io::Result<()> {
+        let t = now();
+        let cx = x.clamp(0, ABS_MAX);
+        let cy = y.clamp(0, ABS_MAX);
+        let events = [
+            *AbsoluteEvent::new(t, AbsoluteAxis::X, cx).as_event(),
+            *AbsoluteEvent::new(t, AbsoluteAxis::Y, cy).as_event(),
+            *sync(t).as_event(),
+        ];
+        self.write_all(&events)
+    }
+
+    /// Scroll by wheel detents: `dy` = vertical (`REL_WHEEL`), `dx` = horizontal
+    /// (`REL_HWHEEL`). Zero deltas are skipped so no spurious wheel event fires.
+    ///
+    /// # Errors
+    /// Propagates any write error from the uinput fd.
+    pub fn scroll(&self, dx: i32, dy: i32) -> io::Result<()> {
+        let t = now();
+        let mut events = Vec::with_capacity(3);
+        if dy != 0 {
+            events.push(*RelativeEvent::new(t, RelativeAxis::Wheel, dy).as_event());
+        }
+        if dx != 0 {
+            events.push(*RelativeEvent::new(t, RelativeAxis::HorizontalWheel, dx).as_event());
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        events.push(*sync(t).as_event());
         self.write_all(&events)
     }
 
@@ -172,9 +246,16 @@ impl Drop for VirtualDevice {
     }
 }
 
-/// A representative slice of keyboard keys enabled on the spike device.
-fn spike_keys() -> [Key; 5] {
-    [Key::A, Key::B, Key::C, Key::Enter, Key::Space]
+/// Absolute-axis descriptor for the normalized `0..=ABS_MAX` pointer range.
+fn abs_info() -> AbsoluteInfo {
+    AbsoluteInfo {
+        value: 0,
+        minimum: 0,
+        maximum: ABS_MAX,
+        fuzz: 0,
+        flat: 0,
+        resolution: 0,
+    }
 }
 
 /// Build a `SYN_REPORT` event closing an input report.
