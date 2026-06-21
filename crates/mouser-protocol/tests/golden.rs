@@ -1,7 +1,11 @@
 //! Golden vectors and forward-compat conformance for the wire protocol.
 //! These are the canonical byte expectations referenced by docs/communication-interface.md §0.1.
 
-use mouser_protocol::{decode_frame, encode_frame, from_cbor, to_cbor, AckStatus, Ping, TYPE_PING};
+use mouser_protocol::{
+    decode_frame, encode_frame, from_cbor, to_cbor, AckStatus, Capability, CapabilitySet, Ping,
+    TYPE_PING,
+};
+use std::collections::BTreeSet;
 
 #[test]
 fn ping_golden_vector_matches_spec() {
@@ -51,4 +55,24 @@ fn unknown_frame_type_is_skippable() {
     assert_eq!(f.msg_type, 0xFFFE);
     assert_eq!(f.payload, &body);
     assert_eq!(consumed, frame.len());
+}
+
+#[test]
+fn capability_set_is_ascending_and_drops_unknown() {
+    // Encodes as an ascending CBOR integer array: {Mouse=1, Keyboard=0} -> [0,1].
+    let set = CapabilitySet(BTreeSet::from([Capability::Mouse, Capability::Keyboard]));
+    assert_eq!(to_cbor(&set).expect("encode"), [0x82, 0x00, 0x01]);
+
+    // Decoding an array with an unknown member (99) drops it, keeping {0,1,2}.
+    // CBOR array(4)[2, 0, 99, 1] = 84 02 00 18 63 01
+    let decoded: CapabilitySet =
+        from_cbor(&[0x84, 0x02, 0x00, 0x18, 0x63, 0x01]).expect("forward-compat decode");
+    assert_eq!(
+        decoded,
+        CapabilitySet(BTreeSet::from([
+            Capability::Keyboard,
+            Capability::Mouse,
+            Capability::Clipboard,
+        ]))
+    );
 }

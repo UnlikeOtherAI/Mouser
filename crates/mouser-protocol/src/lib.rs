@@ -14,6 +14,9 @@ pub mod framing;
 pub mod messages;
 
 pub use codec::{from_cbor, to_cbor, CodecError};
-pub use enums::{AckStatus, Os, Role};
+pub use enums::{
+    AckStatus, BlockedReason, CapState, Capability, CapabilitySet, ClipFormat, FocusKind,
+    GoodbyeReason, NotifyKind, Os, PointerMode, Role, ScrollUnit, TransferReason,
+};
 pub use framing::{decode_frame, encode_frame, Frame, FrameError, MAX_CONTROL_FRAME};
 pub use messages::{Ping, TYPE_HELLO_ACK, TYPE_PING};
