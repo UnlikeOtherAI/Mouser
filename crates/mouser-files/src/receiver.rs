@@ -60,26 +60,33 @@ pub struct ReceiverConfig {
     /// An in-band `FileEntry.sha256` from the offer fills any `None` slot (C2-4); an
     /// out-of-band value supplied here takes precedence and must match if both are set.
     pub expected_hashes: Vec<Option<Hash>>,
-    /// Max bytes any single offered file may declare. `None` ⇒ unbounded.
+    /// Max bytes any single offered file may declare. `None` ⇒ unbounded. Defaults to
+    /// [`crate::DEFAULT_MAX_FILE_SIZE`] (set `None` via [`ReceiverConfig::with_limits`] to
+    /// opt out).
     pub max_file_size: Option<u64>,
-    /// Max number of files a single offer may list. `None` ⇒ unbounded.
+    /// Max number of files a single offer may list. `None` ⇒ unbounded. Defaults to
+    /// [`crate::DEFAULT_MAX_FILES`].
     pub max_files: Option<usize>,
     /// Max total bytes (sum of all files' `size`) a single offer may declare. `None` ⇒
-    /// unbounded.
+    /// unbounded. Defaults to [`crate::DEFAULT_MAX_TOTAL_BYTES`].
     pub max_total_bytes: Option<u64>,
 }
 
 impl ReceiverConfig {
-    /// Quarantine-only config (no expected hashes, no admission bounds — completion gates
-    /// on size alone). Add bounds with [`ReceiverConfig::with_limits`] for untrusted peers.
+    /// Quarantine config with **sane finite admission bounds by default** (audit R2 — an
+    /// untrusted offer must not be able to ask for unbounded disk on the default path):
+    /// [`crate::DEFAULT_MAX_FILE_SIZE`], [`crate::DEFAULT_MAX_FILES`], and
+    /// [`crate::DEFAULT_MAX_TOTAL_BYTES`]. No expected hashes (completion gates on size,
+    /// plus any in-band offer digest). Tighten or loosen with
+    /// [`ReceiverConfig::with_limits`] (pass `None` for a dimension to make it unbounded).
     #[must_use]
     pub fn new(quarantine: PathBuf) -> Self {
         Self {
             quarantine,
             expected_hashes: Vec::new(),
-            max_file_size: None,
-            max_files: None,
-            max_total_bytes: None,
+            max_file_size: Some(crate::DEFAULT_MAX_FILE_SIZE),
+            max_files: Some(crate::DEFAULT_MAX_FILES),
+            max_total_bytes: Some(crate::DEFAULT_MAX_TOTAL_BYTES),
         }
     }
 

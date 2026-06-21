@@ -682,6 +682,26 @@ fn offer_within_bounds_is_accepted() {
     assert!(matches!(out.first(), Some(Outbound::Accept(_))));
 }
 
+/// R2 — the DEFAULT config (no `with_limits`) must already be bounded: an offer whose file
+/// count exceeds [`mouser_files::DEFAULT_MAX_FILES`] is rejected before any sink opens, so
+/// the default runtime path does not admit an unbounded offer.
+#[test]
+fn default_config_rejects_over_cap_offer() {
+    let no_sink = |_: usize, _: &Path| -> Result<MemSink, SinkError> {
+        panic!("no sink may open for an over-cap offer on the default config")
+    };
+    // One more file than the default cap allows; every file is tiny (1 byte) so only the
+    // file-count bound can trip — proving the default is finite, not the size caps.
+    let sizes = vec![1u64; mouser_files::DEFAULT_MAX_FILES + 1];
+    let cfg = ReceiverConfig::new(PathBuf::from(Q));
+    let (r, out) = Receiver::accept_offer(&offer_n(5, &sizes), cfg, no_sink).expect("ok");
+    assert!(
+        r.is_aborted(),
+        "the default config must reject an over-cap offer"
+    );
+    assert!(matches!(out.as_slice(), [Outbound::Reject(_)]));
+}
+
 // --- Sender resume-trust -----------------------------------------------------------
 
 #[test]
@@ -740,6 +760,145 @@ fn sender_rejects_resume_offset_past_size() {
         ),
         "a resume offset past size must be rejected"
     );
+}
+
+/// C2-4 — an ack must never confirm bytes the sender did not actually put on the wire. An
+/// ack whose `acked_through` exceeds `sent` is rejected and does NOT complete the file (a
+/// hostile peer cannot "ack" a file done before any chunk was sent).
+#[test]
+fn sender_rejects_ack_beyond_sent() {
+    // File is larger than one default chunk (256 KiB) so the first poll only puts a partial
+    // prefix on the wire — `sent + 1` is then past `sent` yet still well within `size`,
+    // isolating the "past what we actually sent" rejection from the size bound.
+    let size = 1_000_000u64;
+    let mut sender = Sender::new(
+        0xA4,
+        vec![("x".into(), MemSource::new(bytes(7, size as usize)))],
+    )
+    .expect("s");
+    // Accept first so the window opens, then send exactly one chunk.
+    sender
+        .on_accept(&mouser_protocol::FileAccept {
+            transfer_id: 0xA4,
+            resume: vec![],
+        })
+        .expect("accept");
+    let chunk = sender.poll_chunk().expect("poll").expect("a chunk");
+    let sent = chunk.offset + chunk.data.len() as u64;
+    assert!(
+        sent > 0 && sent < size,
+        "only part of the file is on the wire (sent {sent} of {size})"
+    );
+
+    // The peer claims MORE bytes acked than were ever sent → impossible, must be rejected.
+    // `sent + 1` stays below `size`, so only the `> sent` check can trip.
+    let forged = mouser_protocol::FileAck {
+        transfer_id: 0xA4,
+        file_index: 0,
+        acked_through: sent + 1,
+    };
+    assert!(
+        matches!(
+            sender.on_ack(&forged),
+            Err(FileError::OffsetOutOfRange { .. })
+        ),
+        "an ack past `sent` must be rejected"
+    );
+    assert!(
+        !sender.is_complete(),
+        "a rejected impossible ack must not complete the file"
+    );
+
+    // A legitimate ack of the bytes actually sent still works and advances the window.
+    sender
+        .on_ack(&mouser_protocol::FileAck {
+            transfer_id: 0xA4,
+            file_index: 0,
+            acked_through: sent,
+        })
+        .expect("legit ack");
+}
+
+/// An ack arriving before the offer is accepted is impossible (no bytes can have been
+/// sent) and must be rejected rather than silently advancing `acked`.
+#[test]
+fn sender_rejects_ack_before_accept() {
+    let mut sender =
+        Sender::new(0xA5, vec![("x".into(), MemSource::new(bytes(7, 4_000)))]).expect("s");
+    let premature = mouser_protocol::FileAck {
+        transfer_id: 0xA5,
+        file_index: 0,
+        acked_through: 0,
+    };
+    assert!(
+        matches!(sender.on_ack(&premature), Err(FileError::Protocol(_))),
+        "an ack before FileAccept must be rejected"
+    );
+    assert!(!sender.is_complete());
+}
+
+/// R2 — `on_accept` validates the WHOLE resume vec before mutating any state: an accept
+/// whose resume has a valid point followed by a duplicate `file_index` must leave the
+/// sender unchanged (no poisoned partial state), and a later VALID accept must still apply.
+#[test]
+fn sender_on_accept_rejects_partial_mutation_on_duplicate() {
+    let mut sender = Sender::new(
+        0xA6,
+        vec![
+            ("a".into(), MemSource::new(bytes(7, 4_000))),
+            ("b".into(), MemSource::new(bytes(8, 4_000))),
+        ],
+    )
+    .expect("s");
+
+    // Valid resume for file 0, THEN a duplicate file_index 0 — the whole accept is rejected.
+    let bad = mouser_protocol::FileAccept {
+        transfer_id: 0xA6,
+        resume: vec![
+            mouser_protocol::ResumePoint {
+                file_index: 0,
+                offset: 1_000,
+            },
+            mouser_protocol::ResumePoint {
+                file_index: 0,
+                offset: 2_000,
+            },
+        ],
+    };
+    assert!(
+        matches!(sender.on_accept(&bad), Err(FileError::Protocol(_))),
+        "an accept with a duplicate resume index must be rejected"
+    );
+
+    // The first (valid) point must NOT have been applied: a later clean accept can resume
+    // file 0 at a different offset, and on completion both files transfer correctly. The
+    // prefix must equal file 0's first 1500 bytes so the resumed bytes line up.
+    let receiver_prefix0 = bytes(7, 4_000)[..1_500].to_vec();
+    let good = mouser_protocol::FileAccept {
+        transfer_id: 0xA6,
+        resume: vec![mouser_protocol::ResumePoint {
+            file_index: 0,
+            offset: 1_500,
+        }],
+    };
+    sender
+        .on_accept(&good)
+        .expect("a later valid accept still applies after a rejected one");
+
+    // Drive against a receiver that already holds the matching 1500-byte prefix of file 0.
+    let prefix = receiver_prefix0.clone();
+    let make = move |i: usize, _p: &Path| {
+        Ok(if i == 0 {
+            MemSink::with_prefix(prefix.clone())
+        } else {
+            MemSink::new()
+        })
+    };
+    let offer = sender.offer();
+    let config = ReceiverConfig::new(PathBuf::from(Q));
+    let (mut receiver, _out) = Receiver::accept_offer(&offer, config, make).expect("offer");
+    drive_until_complete(&mut sender, &mut receiver).expect("transfer completes");
+    assert!(sender.is_complete() && receiver.is_complete());
 }
 
 // --- C2-5: disk-backed FsSink resume + symlink safety ------------------------------
@@ -865,6 +1024,69 @@ mod disk {
         );
         let on_disk = std::fs::read(&path).expect("read resume.dat");
         assert_eq!(on_disk, content, "prefix + resumed bytes equal the source");
+    }
+
+    /// C2-5 — the resume seed hash and all subsequent reads/writes go through the open file
+    /// DESCRIPTOR, never the path name. Once `FsSink::open` has seeded the rolling hash from
+    /// the prefix, the directory entry is irrelevant: here the path is unlinked AND replaced
+    /// with decoy content right after open, yet the sink finishes the original file via its
+    /// handle and the streaming digest equals `sha256(content)`. A digest that depended on
+    /// re-reading the path would instead be poisoned by the decoy bytes.
+    #[test]
+    fn fs_sink_seed_hash_reads_through_handle_not_path() {
+        let scratch = Scratch::new("seed-handle");
+        let content = bytes(77, 500_000);
+        let prefix_len = 200_000usize;
+        let path = scratch.path("resume.dat");
+        let prefix = content.get(..prefix_len).expect("prefix slice").to_vec();
+        std::fs::write(&path, &prefix).expect("seed partial");
+
+        // Open the sink: this seeds the rolling hash from the on-disk prefix THROUGH the
+        // handle it will keep writing to (the C2-5 fix), and pins that inode via the FD.
+        let mut sink = FsSink::open(&path).expect("open resume");
+        assert_eq!(sink.existing_len(), prefix_len as u64);
+
+        // Detach the path name from the sink's inode and point it at decoy bytes. The FD the
+        // sink holds still references the original (now-unlinked) inode; nothing the sink
+        // does afterwards may touch the decoy. A path-based reopen would read the decoy.
+        let decoy = bytes(99, prefix_len);
+        let tmp = scratch.path("decoy.tmp");
+        std::fs::write(&tmp, &decoy).expect("write decoy");
+        std::fs::rename(&tmp, &path).expect("swap path inode");
+
+        // Write the remainder of the ORIGINAL content through the handle and finalize.
+        let remainder = content.get(prefix_len..).expect("remainder slice");
+        sink.write_at(prefix_len as u64, remainder)
+            .expect("write remainder");
+        let digest = sink.finish().expect("finish");
+
+        assert_eq!(
+            digest,
+            sha256(&content),
+            "the streaming digest must cover the handle's bytes (prefix+remainder), \
+             never the decoy now living at the path"
+        );
+    }
+
+    /// C2-5 (direct): the seed hash for a resumed prefix is computed from the bytes the
+    /// handle holds. Open a sink on a prefix, immediately finalize WITHOUT writing anything,
+    /// and the digest must equal `sha256(prefix)` — i.e. `open` rolled the existing bytes
+    /// into the hasher through the handle, so resume hashing is exercised in isolation.
+    #[test]
+    fn fs_sink_seed_hash_of_prefix_equals_sha256_of_prefix() {
+        let scratch = Scratch::new("seed-only");
+        let prefix = bytes(55, 300_000);
+        let path = scratch.path("partial.dat");
+        std::fs::write(&path, &prefix).expect("seed partial");
+
+        let mut sink = FsSink::open(&path).expect("open resume");
+        assert_eq!(sink.existing_len(), prefix.len() as u64);
+        let digest = sink.finish().expect("finish");
+        assert_eq!(
+            digest,
+            sha256(&prefix),
+            "open() must seed the rolling hash with the existing prefix via the handle"
+        );
     }
 
     /// `FsSink::open` must refuse a path whose final component is a pre-existing symlink

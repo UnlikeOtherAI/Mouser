@@ -53,6 +53,19 @@ pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
 /// Oversize chunks are rejected *before* allocating, per the decode discipline.
 pub const MAX_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Default admission cap on any single offered file's declared `size` (audit R2 —
+/// unbounded-disk DoS). Generous but finite: 64 GiB. Override per-receiver with
+/// [`ReceiverConfig::with_limits`].
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Default admission cap on the number of files a single offer may list (audit R2).
+/// Override per-receiver with [`ReceiverConfig::with_limits`].
+pub const DEFAULT_MAX_FILES: usize = 10_000;
+
+/// Default admission cap on the sum of all offered files' `size` (audit R2). Generous but
+/// finite: 256 GiB. Override per-receiver with [`ReceiverConfig::with_limits`].
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+
 /// A 32-byte SHA-256 digest used for the optional end-to-end integrity check.
 pub type Hash = [u8; 32];
 
