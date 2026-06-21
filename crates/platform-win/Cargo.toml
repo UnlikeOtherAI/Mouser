@@ -1,0 +1,25 @@
+[package]
+name = "platform-win"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NOTE: this crate deliberately does NOT set `[lints] workspace = true`.
+# The workspace forbids `unsafe_code`, but this Windows input-injection skeleton
+# must call Win32 APIs (`SendInput`, `GetCursorPos`, `GetSystemMetrics`) that
+# require `unsafe`. Reconciliation with the core traits (`InputCapture` /
+# `InputInjection`) is a later step. All Windows-only code is cfg-gated so the
+# crate builds as a stub on macOS / Linux (the pure `keymap` module is always
+# compiled and tested).
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[[example]]
+name = "inject_demo"
+path = "examples/inject_demo.rs"

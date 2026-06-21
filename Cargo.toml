@@ -8,6 +8,7 @@ members = [
   "crates/mouser-ffi",
   "crates/platform-mac",
   "crates/platform-linux",
+  "crates/platform-win",
 ]
 
 [workspace.package]
