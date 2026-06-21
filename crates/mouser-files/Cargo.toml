@@ -1,0 +1,14 @@
+[package]
+name = "mouser-files"
+version = "0.0.0"
+description = "Mouser file-transfer engine: pure sender/receiver state machines, windowed cumulative-ack, resume, integrity check, and path-safe quarantine landing (see docs/communication-interface.md §7.8)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mouser-protocol = { path = "../mouser-protocol" }
+sha2 = "0.10"
+
+[lints]
+workspace = true
