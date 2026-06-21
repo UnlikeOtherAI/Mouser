@@ -31,6 +31,7 @@ pub mod capture;
 pub mod display_info;
 pub mod inject;
 pub mod keymap;
+pub mod keymap_capture;
 
 pub use adapter::{MacCapture, MacInjector};
 pub use capture::{install_listen_only_tap, CaptureError};
@@ -42,6 +43,6 @@ pub use inject::{
     InjectError,
 };
 pub use keymap::{
-    cgkeycode_to_hid_usage, hid_usage_to_cgkeycode, mods_to_cgflags, mods_to_cgkeycodes,
-    supported_hid_usages,
+    hid_usage_to_cgkeycode, mods_to_cgflags, mods_to_cgkeycodes, supported_hid_usages,
 };
+pub use keymap_capture::{cgkeycode_to_hid_usage, flags_changed_event};

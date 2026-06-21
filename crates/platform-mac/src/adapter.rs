@@ -12,12 +12,13 @@
 //!   adapter falls back to listen-only and reports `can_suppress() == false`
 //!   instead of pretending it swallowed input.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
-    CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-    CallbackResult, EventField,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CallbackResult, EventField,
 };
 use mouser_core::platform::{
     CaptureDecision, InputCapture, InputInjection, InputSink, LocalInputEvent, PlatformError,
@@ -26,7 +27,7 @@ use mouser_core::platform::{
 
 use crate::display_info::display_bounds;
 use crate::inject;
-use crate::keymap::cgkeycode_to_hid_usage;
+use crate::keymap_capture::{cgkeycode_to_hid_usage, flags_changed_event};
 
 /// macOS input injector. Stateless; every call posts a fresh `CGEvent`.
 ///
@@ -103,9 +104,11 @@ impl InputInjection for MacInjector {
 /// Translate a captured `CGEvent` into a [`LocalInputEvent`], or `None` for event
 /// types we don't forward.
 ///
-/// Captured `mods` is reported as `0`: macOS taps don't expose a portable flags
-/// getter here, so the engine derives modifier state from the observed modifier
-/// **key** transitions (HID 0xE0..=0xE7) it also receives.
+/// Captured `mods` is reported as `0`: the engine derives modifier state from the
+/// observed modifier **key** transitions (HID 0xE0..=0xE7) it also receives.
+/// `FlagsChanged` is **not** handled here — modifier transitions need the
+/// previous-flags state held per-capture, so they are resolved in the tap
+/// callback via [`flags_changed_event`] (see [`make_callback`]).
 fn to_local_event(etype: CGEventType, event: &CGEvent) -> Option<LocalInputEvent> {
     match etype {
         CGEventType::MouseMoved
@@ -203,18 +206,59 @@ fn events_of_interest() -> Vec<CGEventType> {
     ]
 }
 
+/// Hand one modeled event to the sink and translate its [`CaptureDecision`] into
+/// the tap's [`CallbackResult`].
+fn decision_for(sink: &dyn InputSink, ev: LocalInputEvent) -> CallbackResult {
+    match sink.on_event(ev) {
+        CaptureDecision::PassThrough => CallbackResult::Keep,
+        CaptureDecision::Suppress => CallbackResult::Drop,
+    }
+}
+
+/// Resolve a `FlagsChanged` event into a `Key` and forward it to the sink.
+///
+/// macOS delivers modifier (Ctrl/Shift/Alt/Cmd) transitions as `FlagsChanged`,
+/// not KeyDown/KeyUp. Down vs up is the diff of this event's flags against the
+/// previous flags held in `prev_flags`; `prev_flags` is then advanced to the new
+/// value so the next transition diffs correctly. Returns the sink's decision so a
+/// suppress-capable tap can drop a modifier press; events we don't model
+/// (Fn/CapsLock, or a shared-flag release that left no net change) pass through.
+fn handle_flags_changed(
+    sink: &dyn InputSink,
+    event: &CGEvent,
+    prev_flags: &AtomicU64,
+) -> CallbackResult {
+    let next = event.get_flags();
+    let prev = CGEventFlags::from_bits_truncate(prev_flags.swap(next.bits(), Ordering::Relaxed));
+    let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+    let resolved = u16::try_from(keycode)
+        .ok()
+        .and_then(|kc| flags_changed_event(kc, prev, next));
+    match resolved {
+        Some((usage, down)) => decision_for(sink, LocalInputEvent::Key { usage, down, mods: 0 }),
+        None => CallbackResult::Keep,
+    }
+}
+
 /// Build the tap callback: forward to the sink, honor its [`CaptureDecision`].
+///
+/// Modifier-key (`FlagsChanged`) transitions are stateful — down vs up is a diff
+/// against the previously observed `CGEventFlags`, tracked here per-capture in an
+/// atomic seeded to the empty flag set.
 fn make_callback(
     sink: Arc<dyn InputSink>,
 ) -> impl Fn(core_graphics::event::CGEventTapProxy, CGEventType, &CGEvent) -> CallbackResult + Send + 'static
 {
-    move |_proxy, etype, event| match to_local_event(etype, event) {
-        Some(ev) => match sink.on_event(ev) {
-            CaptureDecision::PassThrough => CallbackResult::Keep,
-            CaptureDecision::Suppress => CallbackResult::Drop,
-        },
-        // Events we don't model are always passed through.
-        None => CallbackResult::Keep,
+    let prev_flags = Arc::new(AtomicU64::new(CGEventFlags::CGEventFlagNull.bits()));
+    move |_proxy, etype, event| {
+        if matches!(etype, CGEventType::FlagsChanged) {
+            return handle_flags_changed(sink.as_ref(), event, &prev_flags);
+        }
+        match to_local_event(etype, event) {
+            Some(ev) => decision_for(sink.as_ref(), ev),
+            // Events we don't model are always passed through.
+            None => CallbackResult::Keep,
+        }
     }
 }
 
@@ -323,6 +367,45 @@ impl std::error::Error for CaptureStartFailed {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sink that records every event and replies with a fixed decision.
+    struct RecordingSink {
+        decision: CaptureDecision,
+        seen: Mutex<Vec<LocalInputEvent>>,
+    }
+
+    impl RecordingSink {
+        fn new(decision: CaptureDecision) -> Self {
+            Self {
+                decision,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl InputSink for RecordingSink {
+        fn on_event(&self, event: LocalInputEvent) -> CaptureDecision {
+            self.seen.lock().expect("seen").push(event);
+            self.decision
+        }
+    }
+
+    #[test]
+    fn suppress_decision_drops_the_event() {
+        // A modifier Key the engine wants swallowed maps to a tap Drop, and the
+        // sink actually saw the event.
+        let sink = RecordingSink::new(CaptureDecision::Suppress);
+        let key = LocalInputEvent::Key { usage: 0xE3, down: true, mods: 0 };
+        assert!(matches!(decision_for(&sink, key), CallbackResult::Drop));
+        assert_eq!(sink.seen.lock().expect("seen").as_slice(), &[key]);
+    }
+
+    #[test]
+    fn passthrough_decision_keeps_the_event() {
+        let sink = RecordingSink::new(CaptureDecision::PassThrough);
+        let key = LocalInputEvent::Key { usage: 0xE0, down: false, mods: 0 };
+        assert!(matches!(decision_for(&sink, key), CallbackResult::Keep));
+    }
 
     #[test]
     fn unknown_display_id_is_an_error() {

@@ -151,17 +151,6 @@ pub fn hid_usage_to_cgkeycode(usage: u16) -> Option<CGKeyCode> {
     Some(code)
 }
 
-/// Reverse of [`hid_usage_to_cgkeycode`]: a macOS `CGKeyCode` → its HID usage
-/// (Usage Page 0x07), or `None` if no mapped usage produces that keycode.
-///
-/// Used by capture to report locally-observed keys as HID usages
-/// ([`crate::adapter::MacCapture`]). Linear over the mapped set — small and only
-/// on the (cold) capture path.
-#[must_use]
-pub fn cgkeycode_to_hid_usage(keycode: CGKeyCode) -> Option<u16> {
-    (0x04u16..=0xE7).find(|&u| hid_usage_to_cgkeycode(u) == Some(keycode))
-}
-
 /// One active modifier the wire `mods` bitmask can carry (Appendix B bit order).
 ///
 /// Each entry is the HID usage of the modifier key; the adapter resolves it to a
