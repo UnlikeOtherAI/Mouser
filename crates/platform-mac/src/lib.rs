@@ -8,8 +8,14 @@
 //! routes to the right monitor (audit M1).
 //!
 //! It deliberately does **not** set `[lints] workspace = true`: the workspace
-//! forbids `unsafe_code`, but the macOS path is C-API-driven (`CGEvent*`,
-//! `CGEventTap*`, `CGWarpMouseCursorPosition`, CoreFoundation run-loop fns).
+//! forbids `unsafe_code`, but the macOS path is C/Objective-C-API-driven.
+//! The input spike ([`inject`]/[`capture`]) calls `core-graphics`' safe wrappers
+//! (`CGEvent*`, `CGEventTap*`, `CGWarpMouseCursorPosition`, CoreFoundation
+//! run-loop fns) and adds no `unsafe`. The **drag-and-drop spike** ([`dragdrop`])
+//! does use `unsafe`: defining an Objective-C `NSDraggingSource` class
+//! (`objc2::define_class!`), `msg_send!`, and a handful of AppKit calls that
+//! `objc2` marks `unsafe`. That `unsafe` is confined to [`dragdrop`]; the rest of
+//! the crate stays wrapper-only.
 //!
 //! ## Capability reality (see `docs/tech-stack.md` §4)
 //! - **Injection** (`inject`): needs **Accessibility** for posted events to take
@@ -29,6 +35,7 @@
 pub mod adapter;
 pub mod capture;
 pub mod display_info;
+pub mod dragdrop;
 pub mod inject;
 pub mod keymap;
 pub mod keymap_capture;
@@ -37,6 +44,10 @@ pub use adapter::{MacCapture, MacInjector};
 pub use capture::{install_listen_only_tap, CaptureError};
 pub use display_info::{
     active_display_bounds, display_bounds, main_display_bounds, DisplayBounds,
+};
+pub use dragdrop::{
+    begin_file_drag, read_dragged_file_urls, read_dragged_file_urls_from, write_file_urls,
+    DragError, DragSession,
 };
 pub use inject::{
     button, cursor_position, key_press, left_click, move_cursor, move_cursor_rel, scroll,

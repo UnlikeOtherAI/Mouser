@@ -155,7 +155,10 @@ impl InteractiveEndpoint {
     }
 }
 
-fn build_server_config(
+// Exposed `pub(crate)` (additive) so the bulk connection (§6.2, `crate::bulk`) reuses
+// the exact same cert/pin/TLS-1.3/ALPN builders as the interactive plane — there is one
+// security root, never a divergent copy.
+pub(crate) fn build_server_config(
     cert: &TlsCertificate,
     peer_policy: PinPolicy,
 ) -> Result<ServerConfig, NetError> {
@@ -167,7 +170,7 @@ fn build_server_config(
     Ok(config)
 }
 
-fn build_client_config(
+pub(crate) fn build_client_config(
     cert: &TlsCertificate,
     peer_policy: PinPolicy,
 ) -> Result<ClientConfig, NetError> {

@@ -11,15 +11,20 @@
 //! - [`motion`] — app-level keep-newest pointer-motion datagram sender (§8/§7.6).
 //! - [`transport`] — a `quinn` interactive connection: long-lived control stream
 //!   (framed CBOR, §0.2/§6.1) + RFC 9221 datagram plane for `PointerMotion` (§7.6).
+//! - [`bulk`] — the second QUIC connection (§6.2): `BulkHello` binding to the
+//!   interactive session (§5 step 5) + one dedicated framed stream per `transfer_id`,
+//!   reusing the interactive plane's cert/pin/TLS builders.
 //!
 //! **Stubbed for this skeleton** (see module docs): the §5 `Hello`/`HelloAck`
-//! handshake, the mandatory SAS pairing, and the `channel_sig` identity proof. The
-//! bulk connection (§6.2) is also not yet wired. Cert pinning (§3) is enforced.
+//! handshake and the mandatory SAS pairing on the *interactive* plane. The bulk plane's
+//! `channel_sig` binding (§5 step 5) IS implemented in [`bulk`]. Cert pinning (§3) is
+//! enforced on both planes.
 
 // §0.3 panic-free decode discipline: the decode/runtime path must never panic.
 // Decoders use checked slicing + `try_into` and return `NetError` instead.
 #![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+pub mod bulk;
 pub mod discovery;
 pub mod identity;
 pub mod motion;
@@ -27,8 +32,11 @@ pub mod pin;
 pub mod tls;
 pub mod transport;
 
+pub use bulk::{BulkConnection, BulkEndpoint, TransferStream};
 pub use discovery::{Advertiser, Browser, PeerAdvert, SERVICE_TYPE};
-pub use identity::{build_tls_certificate, device_id_from_cert, TlsCertificate};
+pub use identity::{
+    build_tls_certificate, device_id_from_cert, verifying_key_from_cert, TlsCertificate,
+};
 pub use mouser_core::{DeviceId, DeviceIdentity};
 pub use pin::{DeviceIdPinVerifier, PinPolicy};
 pub use tls::ALPN_MOUSER_1;

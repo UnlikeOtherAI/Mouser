@@ -100,6 +100,19 @@ fn ed25519_public_key_from_cert(der: &[u8]) -> Result<[u8; 32], NetError> {
     Ok(out)
 }
 
+/// Extract the Ed25519 **verifying key** from a presented leaf certificate's SPKI.
+/// The leaf's public key **is** the device identity key (§3), so this is the verifying
+/// key for the §5 `channel_sig` proof — letting the bulk plane (`crate::bulk`) check the
+/// binding signature against the same key it pins, with no extra wire field. Reuses the
+/// single SPKI extraction in [`ed25519_public_key_from_cert`].
+pub fn verifying_key_from_cert(
+    cert: &CertificateDer<'_>,
+) -> Result<ed25519_dalek::VerifyingKey, NetError> {
+    let key = ed25519_public_key_from_cert(cert.as_ref())?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key)
+        .map_err(|e| NetError::Identity(format!("bad Ed25519 key: {e}")))
+}
+
 /// Minimal DER reader (length-prefixed TLV walk) for SPKI extraction. Panic-free.
 struct DerCursor<'a> {
     buf: &'a [u8],

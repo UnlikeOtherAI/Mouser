@@ -4,8 +4,10 @@
 use mouser_protocol::{
     decode_datagram, decode_frame, encode_frame, encode_motion, encode_motion_rel, from_cbor,
     to_cbor, AckStatus, BlockedReason, CapState, Capability, CapabilitySet, ClipFormat, Datagram,
-    FocusKind, GoodbyeReason, NotifyKind, Os, Ping, PointerMode, PointerMotion, PointerMotionRel,
-    Role, ScrollUnit, TransferReason, TAG_POINTER_MOTION, TAG_POINTER_MOTION_REL, TYPE_PING,
+    FileAccept, FileAck, FileChunk, FileDone, FileEntry, FileOffer, FileReject, FocusKind,
+    GoodbyeReason, NotifyKind, Os, Ping, PointerMode, PointerMotion, PointerMotionRel, ResumePoint,
+    Role, ScrollUnit, TransferReason, TAG_POINTER_MOTION, TAG_POINTER_MOTION_REL, TYPE_FILE_CHUNK,
+    TYPE_PING,
 };
 use std::collections::BTreeSet;
 
@@ -197,4 +199,104 @@ fn struct_decode_ignores_unknown_field_and_preserves_known() {
     ];
     let decoded: Ping = from_cbor(&bytes).expect("forward-compat struct decode");
     assert_eq!(decoded, Ping { id: 7 });
+}
+
+#[test]
+fn file_transfer_messages_round_trip() {
+    // §7.8: every file-transfer message survives a CBOR encode/decode round-trip.
+    let offer = FileOffer {
+        transfer_id: 0x1122334455667788,
+        files: vec![
+            FileEntry {
+                name: "report.pdf".into(),
+                size: 9_000_000,
+            },
+            FileEntry {
+                name: "notes.txt".into(),
+                size: 17,
+            },
+        ],
+    };
+    let back: FileOffer = from_cbor(&to_cbor(&offer).expect("enc")).expect("dec");
+    assert_eq!(back, offer);
+
+    let accept = FileAccept {
+        transfer_id: 7,
+        resume: vec![ResumePoint {
+            file_index: 1,
+            offset: 4096,
+        }],
+    };
+    let back: FileAccept = from_cbor(&to_cbor(&accept).expect("enc")).expect("dec");
+    assert_eq!(back, accept);
+
+    let reject = FileReject {
+        transfer_id: 7,
+        reason: "permission denied".into(),
+    };
+    let back: FileReject = from_cbor(&to_cbor(&reject).expect("enc")).expect("dec");
+    assert_eq!(back, reject);
+
+    let chunk = FileChunk {
+        transfer_id: 7,
+        file_index: 0,
+        offset: 1 << 20,
+        data: vec![1, 2, 3, 4, 5],
+    };
+    let back: FileChunk = from_cbor(&to_cbor(&chunk).expect("enc")).expect("dec");
+    assert_eq!(back, chunk);
+
+    let ack = FileAck {
+        transfer_id: 7,
+        file_index: 0,
+        acked_through: 8 * 1024 * 1024,
+    };
+    let back: FileAck = from_cbor(&to_cbor(&ack).expect("enc")).expect("dec");
+    assert_eq!(back, ack);
+
+    let done = FileDone {
+        transfer_id: 7,
+        ok: true,
+    };
+    let back: FileDone = from_cbor(&to_cbor(&done).expect("enc")).expect("dec");
+    assert_eq!(back, done);
+}
+
+#[test]
+fn file_chunk_golden_vector_encodes_data_as_byte_string() {
+    // Golden bytes for FileChunk{transfer_id:1, file_index:0, offset:0, data:[DEADBEEF]}.
+    // §0.1: structs are definite-length CBOR maps keyed by the field-name string, and a
+    // `bytes` field is a CBOR **byte string** — NOT an array of integers. The decisive
+    // bytes are the `data` value `0x44 DE AD BE EF` (0x44 = major type 2 / byte-string of
+    // length 4), which would be `0x84 ...` if it (wrongly) encoded as an array.
+    let chunk = FileChunk {
+        transfer_id: 1,
+        file_index: 0,
+        offset: 0,
+        data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+    };
+    let encoded = to_cbor(&chunk).expect("encode");
+    assert_eq!(
+        encoded,
+        [
+            0xA4, // map(4)
+            0x6B, 0x74, 0x72, 0x61, 0x6E, 0x73, 0x66, 0x65, 0x72, 0x5F, 0x69, 0x64, // "transfer_id"
+            0x01, // 1
+            0x6A, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x69, 0x6E, 0x64, 0x65, 0x78, // "file_index"
+            0x00, // 0
+            0x66, 0x6F, 0x66, 0x66, 0x73, 0x65, 0x74, // "offset"
+            0x00, // 0
+            0x64, 0x64, 0x61, 0x74, 0x61, // "data"
+            0x44, 0xDE, 0xAD, 0xBE, 0xEF, // byte-string(4) DE AD BE EF
+        ],
+        "FileChunk golden bytes (§0.1 byte-string encoding for `data`)"
+    );
+
+    // And it must frame + deframe through the §0.2 envelope on the bulk stream.
+    let frame = encode_frame(TYPE_FILE_CHUNK, 0, &encoded).expect("frame");
+    let (decoded, consumed) = decode_frame(&frame).expect("deframe");
+    assert_eq!(consumed, frame.len());
+    assert_eq!(decoded.msg_type, TYPE_FILE_CHUNK);
+    let round: FileChunk = from_cbor(decoded.payload).expect("decode");
+    assert_eq!(round, chunk);
 }

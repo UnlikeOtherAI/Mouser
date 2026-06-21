@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/mouser-protocol",
   "crates/mouser-core",
+  "crates/mouser-files",
   "crates/mouser-net",
   "crates/mouser-testkit",
   "crates/mouser-ffi",

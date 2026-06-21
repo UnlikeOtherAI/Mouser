@@ -19,6 +19,18 @@ mouser-core = { path = "../mouser-core" }
 # `elcapitan` exposes CGEventPostToPid. Both are post-10.13 baselines we target.
 core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10"
+libc = "0.2"
+# AppKit + Foundation bindings for the cross-machine drag-and-drop spike
+# (NSPasteboard / NSDraggingSession / NSWindow / NSView). objc2 message sends
+# require `unsafe`, which is why this crate does not adopt the workspace
+# `forbid(unsafe_code)` lint (see lib.rs).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSArray", "NSGeometry", "NSObject"] }
+objc2-app-kit = { version = "0.3", features = [
+  "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem",
+  "NSDraggingSession", "NSWindow", "NSView", "NSResponder", "NSApplication",
+  "NSEvent", "NSImage", "NSGraphics", "NSGraphicsContext", "NSColor",
+] }
 
 [dev-dependencies]
 # Keymap parity test (audit H11): compares the mac & linux HID-usage coverage.
@@ -28,3 +40,7 @@ platform-linux = { path = "../platform-linux" }
 [[example]]
 name = "inject_demo"
 path = "examples/inject_demo.rs"
+
+[[example]]
+name = "drag_demo"
+path = "examples/drag_demo.rs"

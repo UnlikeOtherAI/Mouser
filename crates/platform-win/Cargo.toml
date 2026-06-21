@@ -20,6 +20,8 @@ windows = { version = "0.62", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Example target name is crate-prefixed: examples share one output dir, so a bare
+# `inject_demo` would collide with platform-mac's example of the same name.
 [[example]]
-name = "inject_demo"
+name = "win_inject_demo"
 path = "examples/inject_demo.rs"
