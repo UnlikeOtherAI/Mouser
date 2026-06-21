@@ -43,3 +43,60 @@ export interface NavItem {
   id: SectionId;
   label: string;
 }
+
+// ---------------------------------------------------------------------------
+// Clipboard (§7.7). These mirror `crates/mouser-clipboard/src/settings.rs`
+// (`ClipboardSettings` / `SyncDirection`) and the engine's progress events
+// (`reassembly::Progress`). UI-local for now: enforced in core once IPC lands.
+// ---------------------------------------------------------------------------
+
+/** Which way clipboard content may flow (Rust `SyncDirection`). */
+export type SyncDirection = "bidirectional" | "send_only" | "receive_only";
+
+/**
+ * The Clipboard section of a device's settings (Rust `ClipboardSettings`).
+ * Replicated per device, not cluster-wide.
+ */
+export interface ClipboardSettings {
+  /** Master on/off. When false: no offer is sent and inbound offers ignored. */
+  sharedClipboard: boolean;
+  /** Per-format gate: utf8_text / html / rtf. */
+  syncText: boolean;
+  /** Per-format gate: png images. */
+  syncImages: boolean;
+  /** Per-format gate: uri_list (file references). */
+  syncFiles: boolean;
+  /** Skip eager auto-pull above this many bytes (0 = unlimited). */
+  maxAutoSyncBytes: number;
+  /** Prefer the OS Universal Clipboard between two Apple devices (default on). */
+  preferNativeApple: boolean;
+  /** Direction the clipboard may flow for this device. */
+  direction: SyncDirection;
+}
+
+/** Clipboard payload kind, grouped to the three per-format gates (§7.7). */
+export type ClipFormat = "text" | "image" | "files";
+
+/** Direction of a single in-flight transfer relative to this device. */
+export type TransferDirection = "incoming" | "outgoing";
+
+/** Lifecycle of an in-flight transfer (engine `pending` → applied / dropped). */
+export type TransferState = "active" | "done" | "failed";
+
+/**
+ * One in-flight clipboard transfer, mirroring the engine's progress events
+ * (`reassembly::Progress`: `received_bytes` / `size`). Drives the Mac-style
+ * "wait" indicator until `last = true` arrives and the hash verifies.
+ */
+export interface ClipboardTransfer {
+  id: string;
+  /** Display name of the peer device on the other end. */
+  peer: string;
+  direction: TransferDirection;
+  format: ClipFormat;
+  /** Contiguous bytes reassembled so far (`Progress.received_bytes`). */
+  received: number;
+  /** Total expected size from the offer (`Progress.size`). */
+  total: number;
+  state: TransferState;
+}

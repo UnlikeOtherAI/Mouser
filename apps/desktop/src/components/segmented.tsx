@@ -10,6 +10,8 @@ interface SegmentedProps<T extends string> {
   value: T;
   onChange: (next: T) => void;
   label: string;
+  /** When true the whole group is greyed out and non-interactive. */
+  disabled?: boolean;
 }
 
 /**
@@ -22,12 +24,17 @@ export function Segmented<T extends string>({
   value,
   onChange,
   label,
+  disabled = false,
 }: SegmentedProps<T>): React.JSX.Element {
   return (
     <div
       role="radiogroup"
       aria-label={label}
-      className="inline-flex rounded-lg border border-ink-line bg-ink-soft p-0.5"
+      aria-disabled={disabled || undefined}
+      className={cx(
+        "inline-flex rounded-lg border border-ink-line bg-ink-soft p-0.5",
+        disabled && "cursor-not-allowed opacity-50",
+      )}
     >
       {options.map((opt) => {
         const active = opt.value === value;
@@ -37,10 +44,12 @@ export function Segmented<T extends string>({
             type="button"
             role="radio"
             aria-checked={active}
+            disabled={disabled}
             onClick={() => onChange(opt.value)}
             className={cx(
               "rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
               "focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
+              disabled && "cursor-not-allowed",
               active
                 ? "bg-accent text-white"
                 : "text-muted hover:text-slate-200",
