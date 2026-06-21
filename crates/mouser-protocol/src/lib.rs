@@ -1,6 +1,6 @@
 //! Mouser wire protocol — control-stream framing, the message envelope, and the
 //! wire enums. This crate is the byte-level contract from
-//! `docs/communication-interface.md` (v2.3); two independently-built engines that
+//! `docs/communication-interface.md` (v2.5); two independently-built engines that
 //! agree on this crate can interoperate.
 //!
 //! The decode path is held to a no-panic discipline (see the crate-level lint
