@@ -1,9 +1,17 @@
 [package]
 name = "mouser-core"
 version = "0.0.0"
+description = "Mouser core: platform-agnostic identity, ownership, and election logic (no I/O)."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+mouser-protocol = { path = "../mouser-protocol" }
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+data-encoding = "2"
 
 [lints]
 workspace = true
