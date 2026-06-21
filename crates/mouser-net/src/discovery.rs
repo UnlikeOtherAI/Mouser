@@ -1,0 +1,192 @@
+//! mDNS/DNS-SD discovery (§4) over the [`mdns_sd`] crate. Advertises and browses the
+//! `_mouser._udp.local` service. TXT is **advisory only** — trust is established in §5,
+//! never from TXT. The typed TXT keys (§4) are: `txtvers`, `id`, `name`, `os`, `ver`,
+//! `iport`, `bport`, `caps`, `role`.
+
+use std::collections::HashMap;
+
+use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
+
+use crate::NetError;
+
+/// Create a `ServiceDaemon`, optionally enabling the loopback interfaces (disabled by
+/// default in `mdns-sd`). Loopback is needed for single-host discovery (e.g. tests).
+fn new_daemon(loopback: bool) -> Result<ServiceDaemon, NetError> {
+    let daemon = ServiceDaemon::new().map_err(|e| NetError::Discovery(e.to_string()))?;
+    if loopback {
+        daemon
+            .enable_interface(IfKind::LoopbackV4)
+            .map_err(|e| NetError::Discovery(e.to_string()))?;
+    }
+    Ok(daemon)
+}
+
+/// The Mouser DNS-SD service type (§4).
+pub const SERVICE_TYPE: &str = "_mouser._udp.local.";
+
+/// TXT version (§4: `txtvers=1`).
+pub const TXT_VERSION: &str = "1";
+
+/// The advertised attributes of a Mouser peer (§4). Mirrors the typed TXT keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerAdvert {
+    /// `id`: base32 (no-pad, lowercase) of the full `device_id`.
+    pub id: String,
+    /// `name`: display name.
+    pub name: String,
+    /// `os`: OS string (e.g. `macos`).
+    pub os: String,
+    /// `ver`: engine version (display only).
+    pub ver: String,
+    /// `iport`: interactive-connection UDP port.
+    pub iport: u16,
+    /// `bport`: bulk-connection UDP port.
+    pub bport: u16,
+    /// `caps`: advisory capability CSV (untrusted hint).
+    pub caps: String,
+    /// `role`: coordinator-eligibility role string.
+    pub role: String,
+}
+
+impl PeerAdvert {
+    /// The DNS-SD instance name (§4): `"<display name> (<short id>)"`, unique even
+    /// when display names collide.
+    pub fn instance_name(&self) -> String {
+        let short = self.id.get(..8).unwrap_or(self.id.as_str());
+        format!("{} ({})", self.name, short)
+    }
+
+    fn txt_map(&self) -> HashMap<String, String> {
+        let mut txt = HashMap::new();
+        txt.insert("txtvers".to_string(), TXT_VERSION.to_string());
+        txt.insert("id".to_string(), self.id.clone());
+        txt.insert("name".to_string(), self.name.clone());
+        txt.insert("os".to_string(), self.os.clone());
+        txt.insert("ver".to_string(), self.ver.clone());
+        txt.insert("iport".to_string(), self.iport.to_string());
+        txt.insert("bport".to_string(), self.bport.to_string());
+        txt.insert("caps".to_string(), self.caps.clone());
+        txt.insert("role".to_string(), self.role.clone());
+        txt
+    }
+
+    /// Parse a [`PeerAdvert`] back from a resolved [`ServiceInfo`]'s TXT records,
+    /// ignoring unknown keys (§4 forward-compat).
+    pub fn from_service_info(info: &ServiceInfo) -> Option<Self> {
+        let get = |k: &str| info.get_property_val_str(k).map(str::to_string);
+        Some(Self {
+            id: get("id")?,
+            name: get("name").unwrap_or_default(),
+            os: get("os").unwrap_or_default(),
+            ver: get("ver").unwrap_or_default(),
+            iport: get("iport").and_then(|s| s.parse().ok()).unwrap_or(0),
+            bport: get("bport").and_then(|s| s.parse().ok()).unwrap_or(0),
+            caps: get("caps").unwrap_or_default(),
+            role: get("role").unwrap_or_default(),
+        })
+    }
+}
+
+/// A running mDNS advertisement; dropping it (or calling [`Advertiser::unregister`])
+/// stops the announcement.
+pub struct Advertiser {
+    daemon: ServiceDaemon,
+    fullname: String,
+}
+
+impl Advertiser {
+    /// Advertise `advert` on `host_ip:advert.iport` over mDNS (§4).
+    pub fn advertise(advert: &PeerAdvert, host_ip: &str) -> Result<Self, NetError> {
+        Self::advertise_with(advert, host_ip, false)
+    }
+
+    /// As [`Advertiser::advertise`], but also enable the loopback interface so the
+    /// service is discoverable on the same host (e.g. `127.0.0.1`, tests).
+    pub fn advertise_loopback(advert: &PeerAdvert) -> Result<Self, NetError> {
+        Self::advertise_with(advert, "127.0.0.1", true)
+    }
+
+    fn advertise_with(
+        advert: &PeerAdvert,
+        host_ip: &str,
+        loopback: bool,
+    ) -> Result<Self, NetError> {
+        let daemon = new_daemon(loopback)?;
+        let host_name = format!("{}.local.", advert.id);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &advert.instance_name(),
+            &host_name,
+            host_ip,
+            advert.iport,
+            advert.txt_map(),
+        )
+        .map_err(|e| NetError::Discovery(e.to_string()))?;
+        let fullname = info.get_fullname().to_string();
+        daemon
+            .register(info)
+            .map_err(|e| NetError::Discovery(e.to_string()))?;
+        Ok(Self { daemon, fullname })
+    }
+
+    /// Stop advertising this service.
+    pub fn unregister(&self) -> Result<(), NetError> {
+        self.daemon
+            .unregister(&self.fullname)
+            .map_err(|e| NetError::Discovery(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl Drop for Advertiser {
+    fn drop(&mut self) {
+        let _ = self.daemon.unregister(&self.fullname);
+        let _ = self.daemon.shutdown();
+    }
+}
+
+/// A browse session yielding resolved peers as they appear on the network (§4).
+pub struct Browser {
+    daemon: ServiceDaemon,
+    events: Receiver<ServiceEvent>,
+}
+
+impl Browser {
+    /// Start browsing for `_mouser._udp.local` peers.
+    pub fn browse() -> Result<Self, NetError> {
+        Self::browse_with(false)
+    }
+
+    /// As [`Browser::browse`], but also enable the loopback interface so same-host
+    /// services are discovered (tests).
+    pub fn browse_loopback() -> Result<Self, NetError> {
+        Self::browse_with(true)
+    }
+
+    fn browse_with(loopback: bool) -> Result<Self, NetError> {
+        let daemon = new_daemon(loopback)?;
+        let events = daemon
+            .browse(SERVICE_TYPE)
+            .map_err(|e| NetError::Discovery(e.to_string()))?;
+        Ok(Self { daemon, events })
+    }
+
+    /// Await the next fully-resolved peer (its TXT parsed into a [`PeerAdvert`]),
+    /// skipping non-resolution events. Returns `None` if the browse channel closes.
+    pub async fn next_peer(&self) -> Option<PeerAdvert> {
+        loop {
+            let event = self.events.recv_async().await.ok()?;
+            if let ServiceEvent::ServiceResolved(info) = event {
+                if let Some(peer) = PeerAdvert::from_service_info(&info) {
+                    return Some(peer);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        let _ = self.daemon.shutdown();
+    }
+}

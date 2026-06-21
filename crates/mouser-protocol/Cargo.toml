@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+postcard = { version = "1", features = ["alloc"] }
 
 [lints]
 workspace = true

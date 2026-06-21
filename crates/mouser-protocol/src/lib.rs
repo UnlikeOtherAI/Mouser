@@ -9,11 +9,16 @@
 #![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod codec;
+pub mod datagram;
 pub mod enums;
 pub mod framing;
 pub mod messages;
 
 pub use codec::{from_cbor, to_cbor, CodecError};
+pub use datagram::{
+    decode_datagram, encode_motion, encode_motion_rel, Datagram, DatagramError, PointerMotion,
+    PointerMotionRel, TAG_POINTER_MOTION, TAG_POINTER_MOTION_REL,
+};
 pub use enums::{
     AckStatus, BlockedReason, CapState, Capability, CapabilitySet, ClipFormat, FocusKind,
     GoodbyeReason, NotifyKind, Os, PointerMode, Role, ScrollUnit, TransferReason,
