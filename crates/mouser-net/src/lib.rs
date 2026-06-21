@@ -3,10 +3,12 @@
 //!
 //! This crate currently implements the **transport skeleton**:
 //! - [`discovery`] — advertise/browse `_mouser._udp.local` over mDNS (§4).
-//! - [`identity`] — Ed25519 identity key, `device_id = SHA-256(SPKI)`, and a
-//!   self-signed TLS leaf cert built from that key (§3).
+//! - [`identity`] — the TLS leaf cert built from the [`mouser_core::DeviceIdentity`]
+//!   key, plus `device_id_from_cert` which feeds the single `mouser-core` SPKI→hash
+//!   derivation (§3). The identity itself lives in `mouser-core`.
 //! - [`pin`] — `device_id`-pinning rustls cert verifiers (§3).
 //! - [`tls`] — TLS 1.3 rustls configs with ALPN `mouser/1` (§2).
+//! - [`motion`] — app-level keep-newest pointer-motion datagram sender (§8/§7.6).
 //! - [`transport`] — a `quinn` interactive connection: long-lived control stream
 //!   (framed CBOR, §0.2/§6.1) + RFC 9221 datagram plane for `PointerMotion` (§7.6).
 //!
@@ -20,12 +22,14 @@
 
 pub mod discovery;
 pub mod identity;
+pub mod motion;
 pub mod pin;
 pub mod tls;
 pub mod transport;
 
 pub use discovery::{Advertiser, Browser, PeerAdvert, SERVICE_TYPE};
-pub use identity::{device_id_from_cert, Identity, TlsCertificate};
+pub use identity::{build_tls_certificate, device_id_from_cert, TlsCertificate};
+pub use mouser_core::{DeviceId, DeviceIdentity};
 pub use pin::{DeviceIdPinVerifier, PinPolicy};
 pub use tls::ALPN_MOUSER_1;
 pub use transport::{loopback_addr, InteractiveConnection, InteractiveEndpoint};

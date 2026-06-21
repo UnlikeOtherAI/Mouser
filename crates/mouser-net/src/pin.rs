@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use mouser_core::DeviceId;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -27,7 +28,7 @@ use crate::identity::device_id_from_cert;
 #[derive(Clone)]
 pub enum PinPolicy {
     /// Require `SHA-256(cert SPKI) == device_id` (trusted-peer resume path, §3).
-    Pinned([u8; 32]),
+    Pinned(DeviceId),
     /// Accept any well-formed identity cert (first-contact). Pairing/SAS — STUBBED —
     /// would gate trust on the reported `device_id` before exchanging input/state.
     TrustOnFirstUse,
@@ -37,7 +38,7 @@ pub enum PinPolicy {
 /// directions (§3 mandates the check on both ends).
 #[derive(Debug)]
 pub struct DeviceIdPinVerifier {
-    policy_pinned: Option<[u8; 32]>,
+    policy_pinned: Option<DeviceId>,
     algs: WebPkiSupportedAlgorithms,
     empty_hints: Vec<DistinguishedName>,
 }
