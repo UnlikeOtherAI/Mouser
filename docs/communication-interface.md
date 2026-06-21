@@ -193,12 +193,15 @@ Layout changes travel only as `StateDelta` (v1 `LayoutUpdate` removed).
 [32] FocusState        { owner: bytes32, owner_epoch: u64, state: FocusKind }
 [33] CapabilityState   { device_id: bytes32, capture: CapState, inject: CapState, reason: BlockedReason }
 [34] OwnershipRequest  { from: bytes32, reason: TransferReason }  // non-owner asks the current owner to hand off
+[35] PointerModeReq    { owner_epoch: u64, mode: PointerMode }    // target → owner: select absolute/relative motion
 ```
-- Ownership is a **single token with monotonic `owner_epoch`**, minted **only by the current owner**, so
-  `OwnershipTransfer` is always an owner-minted *grant*. A non-owner that wants ownership (UI / hotkey)
-  sends `OwnershipRequest` to the current owner, which mints `epoch+1` and broadcasts the
-  `OwnershipTransfer`; the target replies `OwnershipAck`. Single-minter means two valid grants for one
-  epoch cannot exist.
+- Ownership is a **single token with monotonic `owner_epoch`**. Who mints `epoch+1` depends on the case:
+  during a **normal handoff** only the **current owner** mints (so `OwnershipTransfer` is an owner-minted
+  *grant*) — a non-owner that wants ownership sends `OwnershipRequest` (mobile `UiSelect` included) and the
+  owner mints + grants. When the **owner is unreachable** (heartbeat-timeout) or on a **local-input or
+  panic reclaim**, the reclaiming device **self-mints** `epoch+1` directly (no reachable owner to conflict
+  with). So a *reachable* owner is the sole minter; an unreachable one is replaced by self-mint plus the
+  simultaneous-reclaim tiebreak below — two valid grants for one epoch cannot otherwise exist.
 - **Acceptance rule:** accept an `OwnershipTransfer`/`FocusState` iff its `owner_epoch` is **strictly
   greater** than the locally-known epoch. The lone exception is *simultaneous reclaim* — two devices
   independently self-mint the same `epoch+1` after an owner heartbeat-timeout (below): there the claim
@@ -237,8 +240,11 @@ PointerMotionRel (datagram, postcard, 1-byte tag 0x02 = relative):  // pointer-l
   (`display_id`, Appendix A); origin top-left, y-down; receiver clamps. Loss self-heals (absolute).
 - **Tag 0x02 (relative):** used only when the target reports a pointer-locked/relative consumer (games,
   3D). `dx_acc,dy_acc` are **cumulative** deltas since session start, so a dropped packet costs at most
-  the motion between two surviving samples (still newest-wins, not per-packet deltas). The sender selects
-  the mode from the target's `CapabilityState`/focus; the 1-byte tag is the wire discriminator.
+  the motion between two surviving samples (still newest-wins, not per-packet deltas). **Mode selection is
+  explicit on the wire:** the sender defaults to absolute and switches to `PointerMotionRel` only after
+  receiving `PointerModeReq{mode: Relative}` from the target (sent when the target's foreground app grabs
+  pointer-lock), switching back on `PointerModeReq{mode: Absolute}`. The 1-byte datagram tag carries the
+  mode each packet so a receiver can always discriminate.
 - Both: a change in `owner_epoch` resets `last_seq`; `seq` compared wraparound-safe (RFC 1982); no `ts`;
   unknown tag → drop; apply only if `(owner_epoch, seq)` is newer.
 - Authorized only from a trusted peer with `mouse` permission that is the current owner; path-validated
@@ -248,13 +254,14 @@ PointerMotionRel (datagram, postcard, 1-byte tag 0x02 = relative):  // pointer-l
 ```
 [50] ClipboardOffer { entries: [{ format: ClipFormat, hash: bytes32, size: u64 }], origin: bytes32 }
 [51] ClipboardPull  { hash: bytes32, format: ClipFormat }
-[52] ClipboardData  { hash: bytes32, format: ClipFormat, data: bytes }   // bulk connection if large
+[52] ClipboardData  { hash: bytes32, format: ClipFormat, offset: u64, data: bytes, last: bool }  // bulk; chunked
 ```
 `hash = SHA-256(canonical(format, bytes))`, where `canonical` per `ClipFormat` is: `utf8_text` = UTF-8
 with CRLF→LF and no trailing NUL; `html` / `rtf` = bytes as-is; `png` = the raw PNG byte stream;
-`uri_list` = UTF-8, LF-separated, no trailing blank line. The puller verifies the received data's hash
-(drop on mismatch). `ClipboardData` rides the **bulk** connection on its own stream (per `hash`); payloads
-> 1 MiB are chunked with the `FileChunk` offset mechanism. A new Offer supersedes outstanding offers from
+`uri_list` = UTF-8, LF-separated, no trailing blank line. The puller verifies the *reassembled* data's hash
+(drop on mismatch). `ClipboardData` rides the **bulk** connection on its own per-`hash` stream as ordered
+chunks: `offset` is the byte offset, `data` ≤ 1 MiB per chunk, `last = true` on the final chunk (the offer's
+`size` bounds the total). A new Offer supersedes outstanding offers from
 that origin; locally-applied clipboard is tagged `(origin,hash)` and not re-offered (loop prevention).
 Gated by mode (off/text-only/full) + permission. `ClipFormat` values in Appendix C.
 
@@ -297,9 +304,9 @@ Connect/disconnect debounced; `CoordinatorChanged` off by default.
 datagram hasn't flushed; ~1000 Hz hard cap (not a cadence); ≤2 ms sender budget; on the interactive
 connection only. **Receiver:** apply if `(owner_epoch, seq)` newer; inject absolute logical-pixel position
 on `display_id`; clamp; optional ≤1-frame smoothing off by default. **Pointer-lock/relative consumers**
-(games): the sender switches to the `PointerMotionRel` datagram (tag 0x02, cumulative deltas, §7.6) when
-the target reports a pointer-locked app; otherwise the absolute `PointerMotion` (tag 0x01) is used. **Budget:** ≤5 ms wired / ≤15 ms good Wi-Fi,
-asserted by the harness.
+(games): on `PointerModeReq{Relative}` from the target the sender switches to the `PointerMotionRel`
+datagram (tag 0x02, cumulative deltas, §7.6); otherwise the absolute `PointerMotion` (tag 0x01) is used.
+**Budget:** ≤5 ms wired / ≤15 ms good Wi-Fi, asserted by the harness.
 
 ---
 
@@ -375,4 +382,5 @@ decoders map an unknown value to `Unknown`. For `set<>` members an unknown value
   compositor_unsupported=5, Unknown=255
 - `ClipFormat`: utf8_text=0, html=1, png=2, uri_list=3, rtf=4, Unknown=255
 - `ScrollUnit`: detent120=0, logical_pixel=1, Unknown=255
+- `PointerMode`: absolute=0, relative=1, Unknown=255
 - `NotifyKind`: device_connected=0, device_disconnected=1, config_changed=2, coordinator_changed=3, Unknown=255
