@@ -1,0 +1,14 @@
+[package]
+name = "mouser-protocol"
+version = "0.0.0"
+description = "Mouser wire protocol: framing, message envelope, and wire enums (see docs/communication-interface.md)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+
+[lints]
+workspace = true
