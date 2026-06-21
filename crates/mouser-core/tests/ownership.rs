@@ -292,6 +292,48 @@ fn grant_then_self_reclaim_origin_is_tracked() {
 }
 
 #[test]
+fn duplicate_reclaim_observation_is_idempotent() {
+    // R2: observing the SAME reclaim claim twice must be idempotent — the second copy
+    // is at an epoch that is no longer strictly-greater, so it is rejected as stale and
+    // leaves state untouched (a replayed/duplicated OwnershipTransfer can't re-apply).
+    let mut own = Ownership::new(C);
+    match own.observe(A, 6, true) {
+        OwnershipUpdate::Accepted { owner, epoch } => {
+            assert_eq!(owner, A);
+            assert_eq!(epoch, 6);
+        }
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+    // Exact duplicate of the same reclaim: equal owner + equal epoch -> not strictly
+    // greater, and owner == current owner so the tiebreak branch is skipped -> stale.
+    match own.observe(A, 6, true) {
+        OwnershipUpdate::Rejected(RejectReason::StaleEpoch) => {}
+        other => panic!("expected StaleEpoch on duplicate reclaim, got {other:?}"),
+    }
+    assert_eq!(own.owner(), A, "duplicate reclaim must not change owner");
+    assert_eq!(own.epoch(), 6, "duplicate reclaim must not change epoch");
+}
+
+#[test]
+fn self_reclaim_then_duplicate_self_observation_is_noop() {
+    // R2: after we self-reclaim, observing our own already-applied reclaim epoch again
+    // (e.g. an echoed FocusState) is a no-op stale reject, not a re-mint or refocus.
+    let mut own = Ownership::new(LOW);
+    let minted = own.reclaim();
+    assert_eq!(minted, 1);
+    assert!(own.is_owner());
+    assert_eq!(own.focus(), FocusKind::Active);
+    // Our own reclaim, echoed back at the same epoch: stale, state unchanged.
+    match own.observe(LOW, 1, true) {
+        OwnershipUpdate::Rejected(RejectReason::StaleEpoch) => {}
+        other => panic!("expected StaleEpoch on self echo, got {other:?}"),
+    }
+    assert_eq!(own.owner(), LOW);
+    assert_eq!(own.epoch(), 1);
+    assert_eq!(own.focus(), FocusKind::Active);
+}
+
+#[test]
 fn observe_with_reason_maps_local_reclaim_to_reclaim() {
     // observe_with_reason: LocalReclaim is a reclaim, others are grants.
     // Genuine simultaneous reclaim via the wire reason resolves by lower id.
