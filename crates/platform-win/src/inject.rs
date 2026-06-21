@@ -266,25 +266,32 @@ fn wheel_mouse_data(delta: i32) -> u32 {
     clamped as u32
 }
 
+/// Convert a scroll delta pair in `unit` to whole `Detent120` wheel deltas.
+///
+/// `SendInput`'s wheel is natively in `Detent120` units (`WHEEL_DELTA` = 120 per
+/// notch), so a `Detent120` value passes through unchanged; a `LogicalPixel` value
+/// is converted to whole detents (mirroring the mac/linux adapters' handling —
+/// divide by `WHEEL_DELTA`). A sub-detent pixel delta truncates to 0 (no spurious
+/// notch). This is the exact arithmetic [`scroll`] applies, factored out as a pure
+/// function so it is unit-testable without a `SendInput` call.
+fn detents_for(dx: i32, dy: i32, unit: ScrollUnit) -> (i32, i32) {
+    match unit {
+        ScrollUnit::Detent120 => (dx, dy),
+        ScrollUnit::LogicalPixel => (dx / WHEEL_DELTA, dy / WHEEL_DELTA),
+    }
+}
+
 /// Scroll by wheel deltas (`dx` horizontal, `dy` vertical) in the given
 /// [`ScrollUnit`].
 ///
-/// `SendInput`'s wheel is natively in `Detent120` units (`WHEEL_DELTA` = 120 per
-/// notch), so a `Detent120` value maps through unchanged; a `LogicalPixel` value
-/// is converted to whole detents here (mirroring the mac/linux adapters'
-/// `Detent120` vs `LogicalPixel` handling — divide by `WHEEL_DELTA`). Vertical
-/// uses `MOUSEEVENTF_WHEEL`, horizontal `MOUSEEVENTF_HWHEEL`. The signed delta is
+/// Deltas are converted to whole detents by [`detents_for`]; vertical uses
+/// `MOUSEEVENTF_WHEEL`, horizontal `MOUSEEVENTF_HWHEEL`. The signed delta is
 /// packed sign-correctly via [`wheel_mouse_data`].
 ///
 /// # Errors
 /// [`InjectError::SendInput`] if an event was not queued.
 pub fn scroll(dx: i32, dy: i32, unit: ScrollUnit) -> Result<(), InjectError> {
-    let (dx, dy) = match unit {
-        ScrollUnit::Detent120 => (dx, dy),
-        // Best-effort hi-res -> detents, matching platform-mac/linux. A
-        // sub-detent pixel delta truncates to 0 (no spurious notch).
-        ScrollUnit::LogicalPixel => (dx / WHEEL_DELTA, dy / WHEEL_DELTA),
-    };
+    let (dx, dy) = detents_for(dx, dy, unit);
     if dy != 0 {
         let mi = MOUSEINPUT {
             dx: 0,
@@ -427,11 +434,19 @@ mod tests {
 
     #[test]
     fn scroll_logical_pixels_convert_to_detents() {
-        // Sanity on the unit math (no SendInput call): 120 logical px = 1 detent,
-        // sub-detent truncates to 0. We exercise the same arithmetic scroll uses.
-        let to_detents = |d: i32| d / WHEEL_DELTA;
-        assert_eq!(to_detents(120), 1);
-        assert_eq!(to_detents(-240), -2);
-        assert_eq!(to_detents(60), 0);
+        // Exercise the *production* conversion `scroll` uses (no SendInput call):
+        // 120 logical px = 1 detent, sub-detent truncates to 0, sign preserved.
+        // Both axes go through the same fn.
+        assert_eq!(detents_for(120, -240, ScrollUnit::LogicalPixel), (1, -2));
+        assert_eq!(detents_for(60, -60, ScrollUnit::LogicalPixel), (0, 0));
+        assert_eq!(detents_for(360, 240, ScrollUnit::LogicalPixel), (3, 2));
+    }
+
+    #[test]
+    fn scroll_detent_unit_passes_through_unchanged() {
+        // `Detent120` is already the native wheel unit, so `scroll`'s conversion
+        // must leave both axes untouched (no second division).
+        assert_eq!(detents_for(1, -3, ScrollUnit::Detent120), (1, -3));
+        assert_eq!(detents_for(0, 0, ScrollUnit::Detent120), (0, 0));
     }
 }

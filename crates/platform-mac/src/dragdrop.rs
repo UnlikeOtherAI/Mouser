@@ -175,11 +175,8 @@ pub fn begin_file_drag(
     let source = MouserDragSource::new(mtm);
     let source_proto: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
 
-    let session = view.beginDraggingSessionWithItems_event_source(
-        &items_array,
-        &event,
-        source_proto,
-    );
+    let session =
+        view.beginDraggingSessionWithItems_event_source(&items_array, &event, source_proto);
 
     Ok(DragSession {
         _window: window,

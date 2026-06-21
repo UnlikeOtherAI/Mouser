@@ -10,14 +10,16 @@
 //! | `ClipFormat` | Win32 clipboard format                                  |
 //! |--------------|---------------------------------------------------------|
 //! | `Utf8Text`   | `CF_UNICODETEXT` (UTF-16LE on the clipboard; we transcode to/from UTF-8) |
-//! | `Html`       | registered `"HTML Format"` (the CF_HTML wrapper, bytes as-is) |
+//! | `Html`       | registered `"HTML Format"` (CF_HTML: the wire's raw fragment wrapped in the required description header; see [`crate::cfhtml`]) |
 //! | `Rtf`        | registered `"Rich Text Format"` (bytes as-is)         |
 //! | `Png`        | registered `"PNG"` (raw PNG byte stream)              |
 //! | `UriList`    | `CF_HDROP` ↔ a `text/uri-list` of `file://` URIs       |
 //!
 //! `Utf8Text` is the one format the clipboard stores in a different encoding than
 //! the wire: Windows uses UTF-16LE (`CF_UNICODETEXT`), so we transcode both ways.
-//! `Html`/`Rtf`/`Png` are opaque bytes carried verbatim. `UriList` bridges the wire
+//! `Html` is wrapped into / unwrapped from the CF_HTML description-header format
+//! ([`crate::cfhtml`]) so a round-trip with the raw-fragment mac/linux clipboards
+//! interoperates. `Rtf`/`Png` are opaque bytes carried verbatim. `UriList` bridges the wire
 //! `text/uri-list` (LF-separated `file://` URIs, spec §7.7) and the native
 //! `CF_HDROP` file-drop list; see [`hdrop`].
 //!
@@ -44,7 +46,7 @@ use windows::Win32::System::DataExchange::{
     IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
 };
 use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
 
@@ -102,6 +104,9 @@ impl Clipboard for WinClipboard {
         let decoded = match format {
             ClipFormat::Utf8Text => utf16le_bytes_to_utf8(&raw),
             ClipFormat::UriList => hdrop::hdrop_bytes_to_uri_list(handle)?,
+            // CF_HTML carries a description header around the fragment; strip it
+            // so the wire/mac/linux raw-fragment representation is returned.
+            ClipFormat::Html => crate::cfhtml::decode(&raw),
             _ => raw,
         };
         Ok(Some(decoded))
@@ -118,6 +123,9 @@ impl Clipboard for WinClipboard {
                 utf8_to_utf16le_bytes(s)
             }
             ClipFormat::UriList => hdrop::uri_list_to_hdrop_bytes(data)?,
+            // Windows CF_HTML requires the description header (Version/StartHTML/
+            // …/EndFragment offsets) wrapping the raw fragment we carry on the wire.
+            ClipFormat::Html => crate::cfhtml::encode(data),
             _ => data.to_vec(),
         };
 
@@ -230,9 +238,23 @@ fn read_hglobal_bytes(handle: HANDLE) -> PlatformResult<Vec<u8>> {
 /// `SetClipboardData` requires `GMEM_MOVEABLE` memory and, on success, takes
 /// ownership of it. The block is unlocked before returning so the clipboard can
 /// relocate it.
+///
+/// An **empty** payload allocates a zero-length block (no lock/copy): `GlobalLock`
+/// of a zero-length object returns null, and forcing a 1-byte allocation (the
+/// prior `len.max(1)`) published a stale, uninitialized byte that reads observed
+/// as `GlobalSize == 1` — an empty write would not round-trip to empty. A
+/// zero-length handle is valid for `SetClipboardData`, and `GlobalSize` reports
+/// `0`, so an empty write correctly reads back as empty. `GMEM_ZEROINIT` zeroes
+/// any allocator slack so no stale bytes can ever leak into the clipboard.
 fn alloc_global(bytes: &[u8]) -> PlatformResult<HGLOBAL> {
-    // SAFETY: standard allocation request; returns a valid handle or an error.
-    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) }.map_err(boxed)?;
+    // SAFETY: zero-initialized moveable allocation of exactly `bytes.len()` bytes;
+    // returns a valid handle (possibly zero-length) or an error.
+    let hglobal =
+        unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }.map_err(boxed)?;
+    if bytes.is_empty() {
+        // Nothing to copy; a zero-length block can't be locked and needs no fill.
+        return Ok(hglobal);
+    }
     // SAFETY: just-allocated handle; lock to get a writable pointer to >= len bytes.
     let ptr = unsafe { GlobalLock(hglobal) } as *mut u8;
     if ptr.is_null() {

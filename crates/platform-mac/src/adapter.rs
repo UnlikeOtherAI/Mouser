@@ -12,7 +12,7 @@
 //!   adapter falls back to listen-only and reports `can_suppress() == false`
 //!   instead of pretending it swallowed input.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
@@ -55,6 +55,20 @@ impl MacInjector {
 
 fn boxed(e: inject::InjectError) -> PlatformError {
     Box::new(e)
+}
+
+/// Lock a capture mutex on a **runtime** path without ever panicking (audit:
+/// capture panic discipline).
+///
+/// A `Mutex` poisons when a thread panics while holding it. The data these locks
+/// protect ([`CaptureRun`], [`ModifierState`]) carries **no broken invariant**
+/// after such a panic — it is a plain run-loop handle / a per-keyCode held-state
+/// map — so the only correct response on the event-tap and control paths is to
+/// recover the guard via [`PoisonError::into_inner`] rather than `.expect(...)`,
+/// which would abort capture (the tap callback unwinding across the FFI boundary
+/// is undefined behavior). Behavior on the happy (unpoisoned) path is identical.
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Error when a wire `display_id` matches no active display.
@@ -179,7 +193,7 @@ fn handle_flags_changed(
 ) -> CallbackResult {
     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
     let resolved = u16::try_from(keycode).ok().and_then(|kc| {
-        let mut guard = state.lock().expect("modifier-state mutex");
+        let mut guard = lock_recover(state);
         flags_changed_event(kc, &mut guard)
     });
     match resolved {
@@ -222,7 +236,7 @@ fn make_callback(
 impl InputCapture for MacCapture {
     fn start(&self, sink: Arc<dyn InputSink>) -> PlatformResult<()> {
         // Idempotent: already running.
-        if self.inner.lock().expect("capture mutex").run_loop.is_some() {
+        if lock_recover(&self.inner).run_loop.is_some() {
             return Ok(());
         }
 
@@ -270,7 +284,7 @@ impl InputCapture for MacCapture {
                 tap.enable();
 
                 {
-                    let mut g = inner.lock().expect("capture mutex");
+                    let mut g = lock_recover(&inner);
                     g.run_loop = Some(run_loop.clone());
                     g.can_suppress = can_suppress;
                 }
@@ -280,7 +294,7 @@ impl InputCapture for MacCapture {
                 CFRunLoop::run_current();
 
                 // Run loop ended: clear shared state and drop the tap.
-                inner.lock().expect("capture mutex").run_loop = None;
+                lock_recover(&inner).run_loop = None;
                 drop(tap);
             })
             .map_err(|e| -> PlatformError { Box::new(e) })?;
@@ -292,7 +306,7 @@ impl InputCapture for MacCapture {
     }
 
     fn stop(&self) -> PlatformResult<()> {
-        let run_loop = self.inner.lock().expect("capture mutex").run_loop.take();
+        let run_loop = lock_recover(&self.inner).run_loop.take();
         if let Some(rl) = run_loop {
             rl.stop();
         }
@@ -300,7 +314,7 @@ impl InputCapture for MacCapture {
     }
 
     fn can_suppress(&self) -> bool {
-        self.inner.lock().expect("capture mutex").can_suppress
+        lock_recover(&self.inner).can_suppress
     }
 }
 
@@ -370,6 +384,44 @@ mod tests {
             mods: 0,
         };
         assert!(matches!(decision_for(&sink, key), CallbackResult::Keep));
+    }
+
+    #[test]
+    fn lock_recover_recovers_a_poisoned_mutex() {
+        // Poison a mutex by panicking while its guard is held, then prove the
+        // runtime lock helper still hands back the (intact) data instead of
+        // propagating the panic — capture must never abort on a poisoned lock.
+        let m = Arc::new(Mutex::new(7_u32));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().expect("acquire to poison");
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(m.lock().is_err(), "mutex should be poisoned");
+        // The helper recovers rather than panics, and the value is unchanged.
+        assert_eq!(*lock_recover(&m), 7);
+    }
+
+    #[test]
+    fn capture_control_path_survives_poison() {
+        // Poison the real capture mutex (panic while holding its guard), then
+        // prove the InputCapture control path (can_suppress / stop) recovers
+        // instead of panicking — a poisoned lock must never abort capture.
+        let cap = MacCapture::new();
+        let inner = Arc::clone(&cap.inner);
+        let _ = std::thread::spawn(move || {
+            let _g = inner.lock().expect("acquire to poison");
+            panic!("poison the capture mutex");
+        })
+        .join();
+        assert!(
+            cap.inner.lock().is_err(),
+            "capture mutex should be poisoned"
+        );
+        // Both go through `lock_recover` and must return, not unwind.
+        assert!(!cap.can_suppress());
+        assert!(cap.stop().is_ok());
     }
 
     #[test]
