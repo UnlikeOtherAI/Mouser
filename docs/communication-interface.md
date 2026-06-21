@@ -259,8 +259,10 @@ PointerMotionRel (datagram, postcard, 1-byte tag 0x02 = relative):  // pointer-l
 `hash = SHA-256(canonical(format, bytes))`, where `canonical` per `ClipFormat` is: `utf8_text` = UTF-8
 with CRLF→LF and no trailing NUL; `html` / `rtf` = bytes as-is; `png` = the raw PNG byte stream;
 `uri_list` = UTF-8, LF-separated, no trailing blank line. The puller verifies the *reassembled* data's hash
-(drop on mismatch). `ClipboardData` rides the **bulk** connection on its own per-`hash` stream as ordered
-chunks: `offset` is the byte offset, `data` ≤ 1 MiB per chunk, `last = true` on the final chunk (the offer's
+(drop on mismatch). **Transport by size:** a small payload (text formats within the control-stream cap)
+rides the **interactive** control stream as a single `ClipboardData` (`offset = 0`, `last = true`); `png`
+or any payload over the control cap rides the **bulk** connection on its own per-`hash` stream as ordered
+chunks (`offset` = byte offset, `data` ≤ 1 MiB per chunk, `last = true` on the final chunk; the offer's
 `size` bounds the total). A new Offer supersedes outstanding offers from
 that origin; locally-applied clipboard is tagged `(origin,hash)` and not re-offered (loop prevention).
 Gated by mode (off/text-only/full) + permission. `ClipFormat` values in Appendix C.
@@ -304,7 +306,7 @@ Connect/disconnect debounced; `CoordinatorChanged` off by default.
 datagram hasn't flushed; ~1000 Hz hard cap (not a cadence); ≤2 ms sender budget; on the interactive
 connection only. **Receiver:** apply if `(owner_epoch, seq)` newer; inject absolute logical-pixel position
 on `display_id`; clamp; optional ≤1-frame smoothing off by default. **Pointer-lock/relative consumers**
-(games): on `PointerModeReq{Relative}` from the target the sender switches to the `PointerMotionRel`
+(games): on `PointerModeReq{mode: Relative}` from the target the sender switches to the `PointerMotionRel`
 datagram (tag 0x02, cumulative deltas, §7.6); otherwise the absolute `PointerMotion` (tag 0x01) is used.
 **Budget:** ≤5 ms wired / ≤15 ms good Wi-Fi, asserted by the harness.
 

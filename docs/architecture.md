@@ -105,18 +105,22 @@ Election is lease-based on **local-monotonic TTL** (never cross-machine wall-clo
 and defined partition-heal. (Spec §7.10.)
 
 ### 4.6 Input ownership & focus
-Exactly one device owns input, modeled as a **single token with a monotonic `owner_epoch`**. Only the
-current owner mints `epoch+1`; receivers accept only strictly-higher epochs (ties → lower `device_id`);
-transfers require an ack. Ownership changes via:
+Exactly one device owns input, modeled as a **single token with a monotonic `owner_epoch`** (spec §7.4).
+During a **normal handoff** only the current owner mints `epoch+1` (an owner-minted `OwnershipTransfer`
+grant); when the owner is **unreachable** (heartbeat-timeout) or on a **local-input/panic reclaim**, the
+reclaiming device self-mints `epoch+1`. Receivers accept only strictly-higher epochs; simultaneous
+self-reclaims tie-break to the lower `device_id`; transfers require an ack. Ownership changes via:
 - **edge crossing** (per the normalized per-monitor layout),
-- **explicit hotkey / UI selection**, and
+- **explicit hotkey**, and **UI / mobile selection** (an `OwnershipRequest` to the current owner), and
 - **local reclaim** — using a machine's *own* hardware reclaims ownership.
 A **global panic hotkey** unconditionally reclaims local ownership regardless of cluster state, and a
 handoff that isn't acked within a timeout snaps back. On owner heartbeat-timeout the physically-attached device reclaims.
 
 ### 4.7 Clipboard, file transfer, notifications
-Clipboard (text on interactive, images/files on bulk; hash-dedup + loop prevention), drag-drop file
-transfer (bulk, sanitized paths, quarantine dir), debounced notifications (spec §7.7–7.9).
+Clipboard: offers/pulls and small text payloads (≤ control cap) ride the interactive control stream;
+images and any payload over the control cap ride the bulk connection as chunked `ClipboardData` (spec
+§7.7); hash-dedup + loop prevention throughout. Drag-drop file transfer (bulk, sanitized paths,
+quarantine dir). Debounced notifications (spec §7.7–7.9).
 
 ---
 
@@ -174,7 +178,8 @@ never embeds the engine or owns the daemon lifecycle (§3).
 
 A protocol peer (capability `remote_control_only`, coordinator-ineligible) reusing `mouser-core` via
 uniffi (Swift/Kotlin). Portrait: touchpad on top → motion datagrams; native keyboard below → HID
-`KeyEvent`s on the control stream. Quick device selection issues an `OwnershipTransfer` (UiSelect). A
+`KeyEvent`s on the control stream. Quick device selection issues an `OwnershipRequest` (reason `UiSelect`)
+to the current owner, which grants it. A
 persistent "Controlling: <device>" banner + haptics on tap/edge.
 
 ---
