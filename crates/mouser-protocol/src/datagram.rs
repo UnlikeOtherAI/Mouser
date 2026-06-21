@@ -1,6 +1,7 @@
 //! Pointer-motion datagram plane (§7.6). Datagrams are encoded with **postcard**
-//! (fixed layout, little-endian scalars) behind a **1-byte tag** that selects the
-//! motion mode so a receiver can always discriminate:
+//! (varint wire format: LEB128 for integers, zig-zag for signed; postcard is the byte
+//! oracle for the body) behind a **1-byte tag** that selects the motion mode so a
+//! receiver can always discriminate:
 //!
 //! - tag `0x01` → [`PointerMotion`] (absolute, default).
 //! - tag `0x02` → [`PointerMotionRel`] (relative / pointer-locked, cumulative deltas).
@@ -95,19 +96,27 @@ fn encode_tagged<T: Serialize>(tag: u8, body: &T) -> Result<Vec<u8>, DatagramErr
 
 /// Decode a motion datagram from `buf`, dispatching on the 1-byte tag. An unknown
 /// tag yields [`Datagram::Unknown`] (drop, never error) per §7.6.
+///
+/// Strict decode (A6): the postcard body must consume the whole remainder after the
+/// tag. Trailing bytes are rejected so two distinct datagrams cannot decode to the
+/// same message (the byte-exact interop oracle, §7.6).
 pub fn decode_datagram(buf: &[u8]) -> Result<Datagram, DatagramError> {
     let (&tag, body) = buf.split_first().ok_or(DatagramError::Empty)?;
     match tag {
-        TAG_POINTER_MOTION => {
-            let m = postcard::from_bytes(body).map_err(|e| DatagramError::Codec(e.to_string()))?;
-            Ok(Datagram::Motion(m))
-        }
-        TAG_POINTER_MOTION_REL => {
-            let m = postcard::from_bytes(body).map_err(|e| DatagramError::Codec(e.to_string()))?;
-            Ok(Datagram::MotionRel(m))
-        }
+        TAG_POINTER_MOTION => Ok(Datagram::Motion(decode_body(body)?)),
+        TAG_POINTER_MOTION_REL => Ok(Datagram::MotionRel(decode_body(body)?)),
         other => Ok(Datagram::Unknown(other)),
     }
+}
+
+/// Decode a postcard body and reject any trailing bytes after the first item.
+fn decode_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, DatagramError> {
+    let (value, rest) =
+        postcard::take_from_bytes(body).map_err(|e| DatagramError::Codec(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(DatagramError::Codec("trailing bytes".to_string()));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -158,5 +167,40 @@ mod tests {
     #[test]
     fn empty_datagram_errors() {
         assert_eq!(decode_datagram(&[]), Err(DatagramError::Empty));
+    }
+
+    #[test]
+    fn padded_absolute_motion_is_rejected() {
+        // A valid absolute-motion datagram with a stray trailing byte must error
+        // (A6 strict decode), not silently decode to the same message.
+        let m = PointerMotion {
+            owner_epoch: 3,
+            seq: 42,
+            display_id: 1,
+            x: -10,
+            y: 200,
+        };
+        let mut bytes = encode_motion(&m).expect("encode");
+        bytes.push(0x00);
+        assert_eq!(
+            decode_datagram(&bytes),
+            Err(DatagramError::Codec("trailing bytes".to_string()))
+        );
+    }
+
+    #[test]
+    fn padded_relative_motion_is_rejected() {
+        let m = PointerMotionRel {
+            owner_epoch: 7,
+            seq: 1,
+            dx_acc: -5,
+            dy_acc: 9000,
+        };
+        let mut bytes = encode_motion_rel(&m).expect("encode");
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(
+            decode_datagram(&bytes),
+            Err(DatagramError::Codec("trailing bytes".to_string()))
+        );
     }
 }
