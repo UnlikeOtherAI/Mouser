@@ -157,6 +157,7 @@ impl Election {
     /// Returns [`ElectionEvent::Yield`] if this device was the holder and is now
     /// superseded by a superior lease, else [`ElectionEvent::None`].
     pub fn on_lease(&mut self, lease: Lease, now: Instant) -> ElectionEvent {
+        let prior_seen = self.seen_term;
         self.seen_term = self.seen_term.max(lease.term);
         let ttl = Self::clamp_ttl(lease.ttl);
 
@@ -174,6 +175,13 @@ impl Election {
                 }
                 if Self::supersedes(lease.term, lease.holder, current.term, current.holder) {
                     let was_me = current.holder == self.me;
+                    // Capture OUR relinquished lease term before we overwrite `held`:
+                    // the Yield must carry the term of the lease we are giving up
+                    // (`current.term`), NOT the superior lease's `lease.term`. A peer
+                    // that believes us-as-holder at our term only drops it on an
+                    // exact-term `on_yield` match, so emitting the higher incoming term
+                    // would make the cross-node yield a no-op.
+                    let relinquished_term = current.term;
                     self.held = Some(Held {
                         holder: lease.holder,
                         term: lease.term,
@@ -183,7 +191,7 @@ impl Election {
                     if was_me {
                         return ElectionEvent::Yield {
                             from: self.me,
-                            term: lease.term,
+                            term: relinquished_term,
                         };
                     }
                     return ElectionEvent::None;
@@ -192,6 +200,14 @@ impl Election {
                 ElectionEvent::None
             }
             None => {
+                // No current coordinator. Accept the lease only if its term is not
+                // *below* a term we've already seen: a lease whose term has been
+                // superseded is stale/replayed and must not resurrect a coordinator
+                // we (or the cluster) already moved past. Equal-to-seen is fine — that
+                // is the live holder advertising at the current term.
+                if lease.term < prior_seen {
+                    return ElectionEvent::None;
+                }
                 self.held = Some(Held {
                     holder: lease.holder,
                     term: lease.term,
@@ -205,57 +221,75 @@ impl Election {
 
     /// Apply a received `CoordinatorClaim { candidate, term }` (spec §7.10).
     ///
-    /// If this device is the current holder and the claim is **strictly superior**
-    /// (higher term, or equal term with a lower candidate id), it yields and the
-    /// candidate becomes the believed coordinator. Otherwise the claim is ignored
-    /// (the rightful holder keeps/asserts its lease).
-    pub fn on_claim(&mut self, candidate: DeviceId, term: u64, now: Instant) -> ElectionEvent {
+    /// A `CoordinatorClaim` is a **campaign announcement, not a lease**: it advertises
+    /// that `candidate` *intends* to lead at `term`, but it carries no TTL and grants no
+    /// liveness. This machine therefore **never installs `candidate` as the believed
+    /// coordinator from a claim** (that would fabricate a coordinator with a synthetic
+    /// deadline and let an unauthenticated/replayed claim invent leadership). The
+    /// believed coordinator changes only when a real [`Lease`] arrives (see
+    /// [`Election::on_lease`]). A claim only ever:
+    /// - advances `seen_term` (so our own future campaign out-terms it), and
+    /// - if **we** are the current holder, decides whether to abdicate or defend:
+    ///   - claim **strictly superior** to us → we drop our lease and emit
+    ///     [`ElectionEvent::Yield`] (we abdicate; the candidate must still earn the
+    ///     lease via its own `CoordinatorLease`),
+    ///   - claim **inferior** to us → we re-assert via [`ElectionEvent::RenewLease`] so
+    ///     the candidate backs off.
+    ///
+    /// When we are *not* the holder, a claim is purely informational (it bumps
+    /// `seen_term`); it neither installs nor evicts whatever lease we currently believe.
+    pub fn on_claim(&mut self, candidate: DeviceId, term: u64, _now: Instant) -> ElectionEvent {
         self.seen_term = self.seen_term.max(term);
 
-        match self.held {
-            Some(current) => {
-                if Self::supersedes(term, candidate, current.term, current.holder) {
-                    let was_me = current.holder == self.me;
-                    self.held = Some(Held {
-                        holder: candidate,
-                        term,
-                        ttl: current.ttl,
-                        deadline: now + current.ttl,
-                    });
-                    if was_me {
-                        return ElectionEvent::Yield {
-                            from: self.me,
-                            term,
-                        };
-                    }
-                    ElectionEvent::None
-                } else {
-                    // Our (or the current holder's) lease is superior. If it is ours,
-                    // re-assert it so the candidate backs off.
-                    if current.holder == self.me {
-                        return ElectionEvent::RenewLease(self.current_lease(current));
-                    }
-                    ElectionEvent::None
-                }
+        let Some(current) = self.held else {
+            // No believed coordinator. A bare claim is not a lease, so we do NOT
+            // fabricate one here — just observe the term and wait for a real lease.
+            return ElectionEvent::None;
+        };
+
+        if current.holder != self.me {
+            // The claim targets / contends with a holder that isn't us. We don't
+            // install the candidate (no lease yet) and we don't evict the holder we
+            // believe in on the strength of an unauthenticated claim — its lease still
+            // expires via `tick` if it is truly gone. Informational only.
+            return ElectionEvent::None;
+        }
+
+        // We are the current holder: decide whether to abdicate or defend.
+        if Self::supersedes(term, candidate, current.term, current.holder) {
+            // The candidate out-ranks us. Abdicate by dropping our lease (we leave no
+            // coordinator believed; the candidate still has to win the lease itself).
+            // The Yield carries the term of the lease WE are relinquishing
+            // (`current.term`), NOT the superior claim's `term`: a peer that believes
+            // us-as-holder at our lease term only drops it on an exact-term match
+            // (`on_yield`), so emitting the claim's higher term would make the
+            // cross-node yield a no-op and leave our stale lease standing elsewhere.
+            self.held = None;
+            ElectionEvent::Yield {
+                from: self.me,
+                term: current.term,
             }
-            None => {
-                self.held = Some(Held {
-                    holder: candidate,
-                    term,
-                    ttl: DEFAULT_TTL,
-                    deadline: now + DEFAULT_TTL,
-                });
-                ElectionEvent::None
-            }
+        } else {
+            // Our lease is superior — re-assert it so the candidate backs off.
+            ElectionEvent::RenewLease(self.current_lease(current))
         }
     }
 
-    /// Apply a received `CoordinatorYield { from, term }` (spec §7.10). If the yielding
-    /// device is the current holder at this term, the lease is dropped, leaving no
-    /// coordinator until a new claim/lease arrives.
+    /// Apply a received `CoordinatorYield { from, term }` (spec §7.10).
+    ///
+    /// The lease is dropped **only** when the yield is from the current holder *at the
+    /// exact same term* (`current.term == term`). A yield carrying any other term —
+    /// higher (stale/forged/reordered) or lower (replayed) — must NOT knock out a valid
+    /// coordinator: a `from` device only yields the term it actually holds, so a
+    /// non-matching term is not a real abdication of the lease we believe in.
+    ///
+    /// The yield's term is also folded into `seen_term` so a subsequent *legitimate*
+    /// claim can't reuse a now-stale term (otherwise a campaign after a high-term yield
+    /// could collide with the term that yield observed).
     pub fn on_yield(&mut self, from: DeviceId, term: u64) -> ElectionEvent {
+        self.seen_term = self.seen_term.max(term);
         if let Some(current) = self.held {
-            if current.holder == from && current.term <= term {
+            if current.holder == from && current.term == term {
                 self.held = None;
             }
         }
@@ -294,10 +328,30 @@ impl Election {
         ElectionEvent::None
     }
 
-    /// Start a campaign for coordinator: increment the term beyond the highest seen
-    /// and emit a [`ElectionEvent::Claim`] (spec §7.10 "candidate increments term").
-    /// Use when there is no coordinator, or to challenge an inferior one.
+    /// Start a campaign for coordinator: increment the term beyond the highest seen and
+    /// emit an [`ElectionEvent::Claim`] (spec §7.10 "candidate increments term").
+    ///
+    /// **Guarded — does NOT unconditionally usurp.** A higher term always *wins* the
+    /// term comparison, so campaigning whenever we feel like it would let any node
+    /// preempt a perfectly healthy coordinator at will (an unauthenticated-liveness
+    /// hazard). We therefore campaign only when it is legitimate to do so:
+    /// - there is **no believed coordinator** (none yet, or the last lease has expired
+    ///   by `now`), **or**
+    /// - **we are already the holder** (re-campaign to defend / bump our own term), **or**
+    /// - the held lease is **provably inferior to us**: at equal term the sole
+    ///   deterministic tiebreak is the lowest `device_id`, so if our id is lower than
+    ///   the current holder's we are the rightful winner and may challenge it.
+    ///
+    /// Otherwise (a valid coordinator with a lower-or-equal — i.e. winning — id holds
+    /// the lease) we back off and return [`ElectionEvent::None`], leaving `seen_term`
+    /// untouched so we don't needlessly inflate the term space.
+    ///
+    /// On a legitimate campaign we provisionally take the lease locally at the new term
+    /// (peers confirm via their own term rules) and emit the `Claim`.
     pub fn start_claim(&mut self, now: Instant) -> ElectionEvent {
+        if !self.may_campaign(now) {
+            return ElectionEvent::None;
+        }
         let term = self.seen_term.saturating_add(1);
         self.seen_term = term;
         // Provisionally take the lease locally at the new term; peers confirm via
@@ -312,6 +366,23 @@ impl Election {
         ElectionEvent::Claim {
             candidate: self.me,
             term,
+        }
+    }
+
+    /// Whether a [`Election::start_claim`] campaign is legitimate right now (see that
+    /// method's docs): no valid coordinator, we already hold it, or the held lease is
+    /// provably inferior to us by the lowest-`device_id` tiebreak.
+    fn may_campaign(&self, now: Instant) -> bool {
+        match self.held {
+            None => true,
+            Some(current) => {
+                // An expired lease is not a valid coordinator.
+                if now >= current.deadline {
+                    return true;
+                }
+                // We already hold it, or we win the deterministic id tiebreak.
+                current.holder == self.me || self.me < current.holder
+            }
         }
     }
 
