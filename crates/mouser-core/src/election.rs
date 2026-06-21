@@ -175,6 +175,13 @@ impl Election {
                 }
                 if Self::supersedes(lease.term, lease.holder, current.term, current.holder) {
                     let was_me = current.holder == self.me;
+                    // Capture OUR relinquished lease term before we overwrite `held`:
+                    // the Yield must carry the term of the lease we are giving up
+                    // (`current.term`), NOT the superior lease's `lease.term`. A peer
+                    // that believes us-as-holder at our term only drops it on an
+                    // exact-term `on_yield` match, so emitting the higher incoming term
+                    // would make the cross-node yield a no-op.
+                    let relinquished_term = current.term;
                     self.held = Some(Held {
                         holder: lease.holder,
                         term: lease.term,
@@ -184,7 +191,7 @@ impl Election {
                     if was_me {
                         return ElectionEvent::Yield {
                             from: self.me,
-                            term: lease.term,
+                            term: relinquished_term,
                         };
                     }
                     return ElectionEvent::None;
@@ -252,10 +259,15 @@ impl Election {
         if Self::supersedes(term, candidate, current.term, current.holder) {
             // The candidate out-ranks us. Abdicate by dropping our lease (we leave no
             // coordinator believed; the candidate still has to win the lease itself).
+            // The Yield carries the term of the lease WE are relinquishing
+            // (`current.term`), NOT the superior claim's `term`: a peer that believes
+            // us-as-holder at our lease term only drops it on an exact-term match
+            // (`on_yield`), so emitting the claim's higher term would make the
+            // cross-node yield a no-op and leave our stale lease standing elsewhere.
             self.held = None;
             ElectionEvent::Yield {
                 from: self.me,
-                term,
+                term: current.term,
             }
         } else {
             // Our lease is superior — re-assert it so the candidate backs off.

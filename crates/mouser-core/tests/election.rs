@@ -126,11 +126,13 @@ fn higher_term_lease_supersedes_and_yields() {
     // A is holder at term 1.
     e.start_claim(t0);
     assert!(e.is_coordinator());
-    // B advertises a strictly-higher term -> A yields.
+    // B advertises a strictly-higher term -> A yields. The Yield carries A's
+    // RELINQUISHED term (1, the lease A is giving up), not B's superior term (2),
+    // so a peer's exact-match `on_yield` drops the right (A@1) stale lease.
     match e.on_lease(lease(B, 2), t0) {
         ElectionEvent::Yield { from, term } => {
             assert_eq!(from, A);
-            assert_eq!(term, 2);
+            assert_eq!(term, 1, "yield carries A's relinquished term, not B's");
         }
         other => panic!("expected Yield, got {other:?}"),
     }
@@ -157,13 +159,18 @@ fn equal_term_tiebreak_lower_device_id_wins() {
 fn equal_term_tiebreak_when_we_are_the_loser_yields() {
     let t0 = Instant::now();
     // A is holder at term 5; LOW (lower id) advertises the same term -> A yields.
+    // Same-term tiebreak: A's relinquished term (5) equals the incoming term, so the
+    // Yield carries 5 either way.
     let mut e = Election::new(A);
     e.on_lease(lease(A, 5), t0); // adopt our own as current
     assert_eq!(e.coordinator(), Some(A));
     match e.on_lease(lease(LOW, 5), t0) {
         ElectionEvent::Yield { from, term } => {
             assert_eq!(from, A);
-            assert_eq!(term, 5);
+            assert_eq!(
+                term, 5,
+                "relinquished term == incoming term at equal-term tiebreak"
+            );
         }
         other => panic!("expected Yield, got {other:?}"),
     }
@@ -182,11 +189,12 @@ fn partition_heal_two_holders_meet_higher_term_wins() {
     x.start_claim(t0); // term 3
     assert_eq!(x.term(), Some(3));
     assert!(x.is_coordinator());
-    // X hears Y's (B) lease at term 4 -> X yields, Y wins.
+    // X hears Y's (B) lease at term 4 -> X yields, Y wins. X's Yield carries its own
+    // RELINQUISHED term (3), not Y's superior term (4).
     match x.on_lease(lease(B, 4), t0) {
         ElectionEvent::Yield { from, term } => {
             assert_eq!(from, A);
-            assert_eq!(term, 4);
+            assert_eq!(term, 3, "yield carries X's relinquished term, not Y's");
         }
         other => panic!("expected Yield, got {other:?}"),
     }
@@ -250,7 +258,10 @@ fn holder_yields_to_superior_claim_but_does_not_install_candidate() {
     match e.on_claim(B, 2, t0) {
         ElectionEvent::Yield { from, term } => {
             assert_eq!(from, A);
-            assert_eq!(term, 2);
+            assert_eq!(
+                term, 1,
+                "yield carries A's relinquished term (1), not the claim's term (2)"
+            );
         }
         other => panic!("expected Yield, got {other:?}"),
     }
@@ -550,4 +561,81 @@ fn start_claim_redefends_when_we_already_hold() {
         }
         other => panic!("expected Claim term 2, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Gate regression: cross-node abdication Yield must carry the RELINQUISHED lease
+// term so a peer's exact-match `on_yield` drops the right stale lease. Before the
+// fix the Yield carried the SUPERIOR incoming term (T+1), the peer's `== term`
+// check failed, and the cross-node yield was a no-op (stale lease never dropped).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cross_node_yield_from_on_claim_abdication_drops_peers_stale_lease() {
+    let t0 = Instant::now();
+    // H holds a lease at term T (=2).
+    let mut h = Election::new(B);
+    h.on_lease(lease(B, 2), t0);
+    assert_eq!(h.coordinator(), Some(B));
+
+    // A superior candidate C claims at T+1 -> H abdicates and emits a Yield. The
+    // captured Yield must carry H's RELINQUISHED term T (2), NOT the claim's T+1 (3).
+    let (from, term) = match h.on_claim(LOW, 3, t0) {
+        ElectionEvent::Yield { from, term } => (from, term),
+        other => panic!("expected Yield from abdication, got {other:?}"),
+    };
+    assert_eq!(from, B);
+    assert_eq!(
+        term, 2,
+        "abdication yield must carry the relinquished term T, not T+1"
+    );
+
+    // Peer X independently believes H@T (=2). Feeding it the captured Yield must drop
+    // the stale lease. Pre-fix the term would have been 3 and `on_yield`'s exact-match
+    // (current.term == term) would FAIL, leaving X.coordinator() == Some(B).
+    let mut x = Election::new(A);
+    x.on_lease(lease(B, 2), t0);
+    assert_eq!(x.coordinator(), Some(B));
+    assert_eq!(x.on_yield(from, term), ElectionEvent::None);
+    assert_eq!(
+        x.coordinator(),
+        None,
+        "peer must drop the stale lease on the relinquished-term yield"
+    );
+}
+
+#[test]
+fn cross_node_yield_from_on_lease_supersede_drops_peers_stale_lease() {
+    let t0 = Instant::now();
+    // H holds a lease at term T (=2).
+    let mut h = Election::new(B);
+    h.on_lease(lease(B, 2), t0);
+    assert_eq!(h.coordinator(), Some(B));
+
+    // A superior lease from C at T+1 supersedes H -> H emits a Yield. The captured
+    // Yield must carry H's RELINQUISHED term T (2), NOT the superseding lease's T+1.
+    let (from, term) = match h.on_lease(lease(LOW, 3), t0) {
+        ElectionEvent::Yield { from, term } => (from, term),
+        other => panic!("expected Yield from supersede, got {other:?}"),
+    };
+    assert_eq!(from, B);
+    assert_eq!(
+        term, 2,
+        "supersede yield must carry the relinquished term T, not the superior lease's term"
+    );
+    // H itself now believes the superior holder at T+1.
+    assert_eq!(h.coordinator(), Some(LOW));
+    assert_eq!(h.term(), Some(3));
+
+    // Peer X independently believes H@T (=2). The captured Yield must drop it. Pre-fix
+    // term would be 3 and the exact-match in `on_yield` would FAIL, leaving Some(B).
+    let mut x = Election::new(A);
+    x.on_lease(lease(B, 2), t0);
+    assert_eq!(x.coordinator(), Some(B));
+    assert_eq!(x.on_yield(from, term), ElectionEvent::None);
+    assert_eq!(
+        x.coordinator(),
+        None,
+        "peer must drop the stale lease on the relinquished-term yield"
+    );
 }
