@@ -92,6 +92,13 @@ final class TrackpadHostView: UIView {
         // before a plain single tap fires.
         singleTap.require(toFail: clickDrag)
 
+        // One-finger pan and click-drag both move the cursor. Without this, a
+        // tap-then-hold-then-drag drives BOTH recognizers' .changed in parallel
+        // and the cursor delta is doubled during a drag-select (audit R2). Make
+        // the plain pan defer to click-drag so exactly one path drives motion:
+        // once the long-press engages, only `handleClickDrag` reports movement.
+        onePan.require(toFail: clickDrag)
+
         [onePan, twoPan, singleTap, twoTap, clickDrag, pinch, rotate].forEach(addGestureRecognizer)
     }
 
