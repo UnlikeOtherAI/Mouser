@@ -4,3 +4,19 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+# NOTE: this crate deliberately does NOT set `[lints] workspace = true`.
+# The workspace forbids `unsafe_code`, but this macOS input-injection spike
+# must call CGEvent/CGEventTap C APIs that require `unsafe`. Reconciliation
+# with the core traits (`InputCapture`/`InputInjection`) is a later step.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `highsierra` exposes CGEventCreateScrollWheelEvent2 (non-variadic scroll);
+# `elcapitan` exposes CGEventPostToPid. Both are post-10.13 baselines we target.
+core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
+core-foundation = "0.10"
+libc = "0.2"
+
+[[example]]
+name = "inject_demo"
+path = "examples/inject_demo.rs"
