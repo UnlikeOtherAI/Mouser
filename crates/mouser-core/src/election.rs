@@ -263,9 +263,11 @@ impl Election {
     }
 
     /// Advance time. If the current lease has expired (`now >= deadline`) it is
-    /// dropped, leaving no coordinator. If this device is the holder and is at/after
-    /// the renewal point (`ttl/3` before expiry), returns [`ElectionEvent::RenewLease`]
-    /// so the engine re-advertises.
+    /// dropped, leaving no coordinator. If this device is the holder and at least
+    /// `ttl/3` has **elapsed** since the lease was started/last renewed, returns
+    /// [`ElectionEvent::RenewLease`] so the engine re-advertises — i.e. the holder
+    /// re-announces roughly 3 times per TTL (spec §7.10 "renew at `ttl/3`"). This is
+    /// time *elapsed since the last renewal*, NOT `ttl/3` remaining before expiry.
     pub fn tick(&mut self, now: Instant) -> ElectionEvent {
         let Some(current) = self.held else {
             return ElectionEvent::None;
@@ -277,7 +279,9 @@ impl Election {
         }
 
         if current.holder == self.me {
-            let renew_at = current.deadline - (current.ttl / 3);
+            // deadline = last_start + ttl, so last_start = deadline - ttl and the
+            // renewal point is last_start + ttl/3 = deadline - ttl + ttl/3.
+            let renew_at = current.deadline - current.ttl + (current.ttl / 3);
             if now >= renew_at {
                 let renewed = Held {
                     deadline: now + current.ttl,

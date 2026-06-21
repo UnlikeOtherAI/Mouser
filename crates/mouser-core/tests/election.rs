@@ -56,11 +56,15 @@ fn holder_renews_at_ttl_over_three() {
         }
     );
     assert!(e.is_coordinator());
-    // Before renewal point: no renew.
-    let before = t0 + DEFAULT_TTL - DEFAULT_TTL / 3 - Duration::from_millis(1);
+    // Renewal fires after ttl/3 has ELAPSED since the lease start (re-announce ~3x
+    // per ttl), NOT when ttl/3 remains before expiry.
+    // Just before ttl/3 elapsed: no renew.
+    let before = t0 + DEFAULT_TTL / 3 - Duration::from_millis(1);
     assert_eq!(e.tick(before), ElectionEvent::None);
-    // At renewal point (ttl/3 before expiry): renew.
-    let at = t0 + DEFAULT_TTL - DEFAULT_TTL / 3;
+    // Sanity: at the OLD (wrong) "ttl/3 before expiry" point we'd have renewed; here
+    // it must already have renewed well before that, so no assertion at 2/3 needed.
+    // At ttl/3 elapsed: renew.
+    let at = t0 + DEFAULT_TTL / 3;
     match e.tick(at) {
         ElectionEvent::RenewLease(l) => {
             assert_eq!(l.holder, A);
@@ -73,12 +77,45 @@ fn holder_renews_at_ttl_over_three() {
 }
 
 #[test]
+fn renew_fires_at_ttl_over_three_elapsed_not_remaining() {
+    // Regression guard for the renew predicate: it must use ttl/3 ELAPSED, not
+    // ttl/3 remaining (= 2*ttl/3 elapsed). Tick at just past ttl/3 elapsed and the
+    // FIRST renew must already fire — under the old "remaining" formula it would not.
+    let t0 = Instant::now();
+    let mut e = Election::new(A);
+    e.start_claim(t0);
+    let just_after_third = t0 + DEFAULT_TTL / 3 + Duration::from_millis(1);
+    match e.tick(just_after_third) {
+        ElectionEvent::RenewLease(l) => assert_eq!(l.holder, A),
+        other => panic!("expected RenewLease at ~ttl/3 elapsed, got {other:?}"),
+    }
+}
+
+#[test]
+fn renews_about_three_times_per_ttl() {
+    // Re-announce cadence: stepping the clock by ttl/3 each time yields a renew on
+    // every step (~3 renewals per ttl), confirming elapsed-since-renewal semantics.
+    let t0 = Instant::now();
+    let mut e = Election::new(A);
+    e.start_claim(t0);
+    let step = DEFAULT_TTL / 3;
+    for i in 1..=3u32 {
+        let now = t0 + step * i;
+        match e.tick(now) {
+            ElectionEvent::RenewLease(l) => assert_eq!(l.holder, A),
+            other => panic!("expected RenewLease on step {i}, got {other:?}"),
+        }
+        assert_eq!(e.deadline(), Some(now + DEFAULT_TTL));
+    }
+}
+
+#[test]
 fn non_holder_never_renews() {
     let t0 = Instant::now();
     let mut e = Election::new(A);
     e.on_lease(lease(B, 1), t0);
-    // Even at the renewal point, A is not the holder -> no renew.
-    let at = t0 + DEFAULT_TTL - DEFAULT_TTL / 3;
+    // Even at the renewal point (ttl/3 elapsed), A is not the holder -> no renew.
+    let at = t0 + DEFAULT_TTL / 3;
     assert_eq!(e.tick(at), ElectionEvent::None);
 }
 
