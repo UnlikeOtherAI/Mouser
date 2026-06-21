@@ -1,0 +1,16 @@
+# Android / Gradle build artifacts
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# Module build outputs
+**/build/
+
+# Keep the Gradle wrapper jar/scripts in the repo (do NOT ignore them).
+!gradle/wrapper/gradle-wrapper.jar
