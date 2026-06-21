@@ -28,6 +28,18 @@ final class MomentumScroller {
 
     var isDecaying: Bool { displayLink != nil }
 
+    /// Tear down the display link if the scroller is deallocated mid-glide so a
+    /// `CADisplayLink` (which retains its target) can never outlive its owning
+    /// Coordinator and keep firing (audit R2 — momentum scroller leak).
+    ///
+    /// `stop()` is `@MainActor`; `deinit` is nonisolated, so we invalidate the
+    /// link directly here rather than calling `stop()`. `CADisplayLink.invalidate`
+    /// removes it from the run loop and releases the target retain.
+    deinit {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
     /// Begin a momentum glide from a release velocity (points/sec).
     func start(velocity: CGSize) {
         stop()

@@ -14,6 +14,9 @@ struct TouchpadView: View {
     var compact: Bool = true
 
     @StateObject private var state = TrackpadState()
+    /// Injected by `CompanionView`; gates streaming and lets the lifecycle stop
+    /// momentum when the app backgrounds (audit R2 — lifecycle/reconnect).
+    @EnvironmentObject private var lifecycle: AppLifecycle
 
     var body: some View {
         GeometryReader { geo in
@@ -28,7 +31,7 @@ struct TouchpadView: View {
                 if state.activeTouchPoints.isEmpty {
                     idleHint
                 }
-                TrackpadSurface(state: state)
+                TrackpadSurface(state: state, lifecycle: lifecycle)
                     .ignoresSafeArea(edges: compact ? [] : .all)
                     .accessibilityIdentifier("touchpad.surface")
                     .accessibilityLabel("Touchpad")
