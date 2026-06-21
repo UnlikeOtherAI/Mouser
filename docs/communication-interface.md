@@ -18,7 +18,9 @@ If two engines implement this document, they form a cluster.
   Both are QUIC + TLS 1.3, pinned to the same `device_id`, established together (§5, §6.2).
 - **Control encoding = CBOR** (RFC 8949) via serde/`ciborium`. CBOR is self-describing →
   unknown map keys are skipped and added fields tolerated, which makes version skew safe.
-- **Datagram encoding = postcard**, fixed layout, for `PointerMotion` only.
+- **Datagram encoding = postcard** (its varint-based wire format), for `PointerMotion` only.
+  `postcard` is the byte oracle: integers are LEB128 varints (zig-zag for signed), **not**
+  fixed-width — encode struct fields in declaration order with `postcard`.
 
 ### 0.1 CBOR encoding profile (normative)
 This profile is mandatory; `mouser-protocol` ships **golden vectors** as the conformance oracle.
@@ -34,7 +36,9 @@ This profile is mandatory; `mouser-protocol` ships **golden vectors** as the con
   no duplicates**; an **unrecognized member is dropped** from the set (not kept as `Unknown`), so
   set-member enums need no `Unknown` sentinel.
 - `bytes` → CBOR byte string; `bytes32` → 32-byte byte string. Integers are unsigned unless the
-  field type says `i32`/`i64`. Multi-byte scalars in the postcard datagram are little-endian.
+  field type says `i32`/`i64`. Scalars in the postcard datagram use `postcard`'s varint encoding
+  (LEB128, zig-zag for signed integers) — **not** fixed-width little-endian; `postcard` is the
+  byte oracle, so an implementer matching its varint output stays wire-compatible.
 - **Golden vectors**: `mouser-protocol` produces canonical encoded vectors (including an
   unknown-discriminant case proving the map-to-`Unknown` rule) as its **first deliverable**; until
   then §0.1 + Appendix C are the binding contract. Worked example — `Ping{ id: 7 }` (type `0x05`)

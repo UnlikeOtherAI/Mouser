@@ -14,6 +14,10 @@
 //! handshake, the mandatory SAS pairing, and the `channel_sig` identity proof. The
 //! bulk connection (§6.2) is also not yet wired. Cert pinning (§3) is enforced.
 
+// §0.3 panic-free decode discipline: the decode/runtime path must never panic.
+// Decoders use checked slicing + `try_into` and return `NetError` instead.
+#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+
 pub mod discovery;
 pub mod identity;
 pub mod pin;

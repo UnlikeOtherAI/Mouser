@@ -115,3 +115,58 @@ async fn interactive_connection_roundtrips_ping_and_motion() {
     client_conn.close();
     server_conn.close();
 }
+
+/// Negative pinning (§3): if the dialer pins a `device_id` that does **not** match the
+/// cert the server actually presents, the QUIC/TLS handshake MUST fail. This guards the
+/// pin comparison itself — a neutered `check_pin` (e.g. one that always returns `Ok`)
+/// would make the connect below *succeed*, so this test fails loudly if pinning regresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mismatched_pin_fails_handshake() {
+    let server_id = Identity::generate().expect("server identity");
+    let client_id = Identity::generate().expect("client identity");
+    let client_device_id = client_id.device_id();
+
+    // A third identity the server will NEVER present — the dialer pins this by mistake.
+    let wrong_id = Identity::generate().expect("wrong identity");
+    let wrong_device_id = wrong_id.device_id();
+    assert_ne!(
+        wrong_device_id,
+        server_id.device_id(),
+        "wrong pin must differ from the server's real device_id"
+    );
+
+    // Server presents its real cert and (correctly) pins the client.
+    let server = InteractiveEndpoint::bind_server(
+        &server_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::Pinned(client_device_id),
+    )
+    .expect("bind server");
+    let server_addr = server.local_addr().expect("server addr");
+
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+
+    // The accept side may error or simply never complete once the client aborts the
+    // handshake; bound it with a timeout so the test can't hang either way.
+    let accept = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(5), server.accept_interactive()).await;
+        server // keep the endpoint alive until the dial resolves
+    });
+
+    // Dial pinning the WRONG server device_id → the client's server-cert verifier
+    // rejects the presented cert and the handshake fails deterministically.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.connect_interactive(&client_id, server_addr, PinPolicy::Pinned(wrong_device_id)),
+    )
+    .await
+    .expect("dial did not resolve within timeout (handshake should fail fast)");
+
+    assert!(
+        result.is_err(),
+        "handshake MUST fail when the pinned device_id does not match the presented cert (§3)"
+    );
+
+    let _server = accept.await.expect("accept task");
+}
