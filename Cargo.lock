@@ -2239,6 +2239,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouser-clipboard"
+version = "0.0.0"
+dependencies = [
+ "mouser-core",
+ "mouser-protocol",
+ "sha2",
+]
+
+[[package]]
 name = "mouser-core"
 version = "0.0.0"
 dependencies = [
