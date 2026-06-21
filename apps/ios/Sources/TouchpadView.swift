@@ -1,100 +1,91 @@
 import SwiftUI
 
-/// The remote touchpad surface (brief: "Touchpad above").
+/// The remote touchpad surface (brief: "Touchpad above"), now a full replica of
+/// the macOS trackpad (requirement §2). Composes the UIKit gesture layer
+/// (`TrackpadSurface`), a live finger visualisation, and the gesture readout.
 ///
-/// Captures drag gestures and renders live finger movement — a crosshair at the
-/// current touch point plus a per-frame delta readout. No backend wiring yet;
-/// the deltas surfaced here are what will later become motion datagrams
-/// (architecture §6 / §9).
+/// The same view backs both orientations:
+///   • portrait  → `compact == true`, sits above the native keyboard,
+///   • landscape → `compact == false`, fills the whole screen (one big trackpad).
 struct TouchpadView: View {
-    /// Device label shown faintly on the surface, for orientation.
     let deviceName: String
+    /// True in portrait (shorter readout, idle hint); false in landscape (full
+    /// readout, edge-to-edge surface).
+    var compact: Bool = true
 
-    @State private var touchPoint: CGPoint?
-    @State private var lastPoint: CGPoint?
-    @State private var delta: CGSize = .zero
-    @State private var isTouching = false
+    @StateObject private var state = TrackpadState()
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
+                // The trackpad surface is full-bleed so the pad is maximised
+                // (requirement §1); only the overlays inset for the safe area
+                // so the notch / home indicator never clips the readout.
                 surface
-                grid(in: geo.size)
-                if isTouching, let point = touchPoint {
-                    crosshair(at: point)
-                } else {
+                grid
+                    .ignoresSafeArea(edges: compact ? [] : .all)
+                TouchpadCrosshair(points: state.activeTouchPoints, tint: state.lastEvent.tint)
+                if state.activeTouchPoints.isEmpty {
                     idleHint
                 }
-                readout
-                    .frame(maxWidth: .infinity, maxHeight: .infinity,
-                           alignment: .topLeading)
-                    .padding(14)
+                TrackpadSurface(state: state)
+                    .ignoresSafeArea(edges: compact ? [] : .all)
+                    .accessibilityIdentifier("touchpad.surface")
+                    .accessibilityLabel("Touchpad")
+                GestureReadout(state: state, compact: compact)
+                    .frame(maxWidth: compact ? .infinity : 340, alignment: .leading)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(.leading, overlayInset(geo.safeAreaInsets.leading))
+                    .padding(.top, overlayInset(geo.safeAreaInsets.top))
+                    .padding(.trailing, compact ? 12 : 18)
+                if !compact {
+                    fullScreenBadge
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        .padding(.bottom, max(geo.safeAreaInsets.bottom, 18))
+                }
             }
-            .contentShape(Rectangle())
-            .gesture(dragGesture)
         }
-        .accessibilityIdentifier("touchpad.surface")
-        .accessibilityLabel("Touchpad")
+        .onAppear { Haptics.shared.warmUp() }
     }
 
-    // MARK: - Gesture
-
-    private var dragGesture: some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                if let previous = lastPoint {
-                    delta = CGSize(
-                        width: value.location.x - previous.x,
-                        height: value.location.y - previous.y
-                    )
-                } else {
-                    delta = .zero
-                }
-                lastPoint = value.location
-                touchPoint = value.location
-                isTouching = true
-            }
-            .onEnded { _ in
-                isTouching = false
-                lastPoint = nil
-                delta = .zero
-            }
+    /// Inset overlays by the safe-area amount (with a sensible minimum) so the
+    /// readout/badge clear the notch and home indicator while the pad stays
+    /// full-bleed.
+    private func overlayInset(_ safeArea: CGFloat) -> CGFloat {
+        max(safeArea, compact ? 12 : 18)
     }
 
     // MARK: - Layers
 
     private var surface: some View {
-        RoundedRectangle(cornerRadius: 28, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: compact ? 28 : 22, style: .continuous)
+        return shape
             .fill(
                 LinearGradient(
-                    colors: [
-                        Color(white: 0.16),
-                        Color(white: 0.10)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
+                    colors: [Color(white: 0.16), Color(white: 0.10)],
+                    startPoint: .top, endPoint: .bottom
                 )
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
-            )
+            .overlay(shape.strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+            // In landscape the pad bleeds edge-to-edge (full-screen trackpad);
+            // in portrait it keeps its inset card look above the keyboard.
+            .ignoresSafeArea(edges: compact ? [] : .all)
     }
 
-    private func grid(in size: CGSize) -> some View {
-        Canvas { context, canvasSize in
+    private var grid: some View {
+        Canvas { context, size in
             let step: CGFloat = 36
             var path = Path()
-            var x: CGFloat = step
-            while x < canvasSize.width {
+            var x = step
+            while x < size.width {
                 path.move(to: CGPoint(x: x, y: 0))
-                path.addLine(to: CGPoint(x: x, y: canvasSize.height))
+                path.addLine(to: CGPoint(x: x, y: size.height))
                 x += step
             }
-            var y: CGFloat = step
-            while y < canvasSize.height {
+            var y = step
+            while y < size.height {
                 path.move(to: CGPoint(x: 0, y: y))
-                path.addLine(to: CGPoint(x: canvasSize.width, y: y))
+                path.addLine(to: CGPoint(x: size.width, y: y))
                 y += step
             }
             context.stroke(path, with: .color(.white.opacity(0.04)), lineWidth: 1)
@@ -102,33 +93,35 @@ struct TouchpadView: View {
         .allowsHitTesting(false)
     }
 
-    private func crosshair(at point: CGPoint) -> some View {
-        TouchpadCrosshair(point: point)
-            .allowsHitTesting(false)
-    }
-
     private var idleHint: some View {
         VStack(spacing: 8) {
             Image(systemName: "hand.point.up.left.fill")
-                .font(.system(size: 30, weight: .light))
-                .foregroundStyle(.white.opacity(0.35))
-            Text("Drag to move \(deviceName)")
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.40))
+                .font(.system(size: compact ? 30 : 38, weight: .light))
+                .foregroundStyle(.white.opacity(0.30))
+            Text(compact ? "Drag to move \(deviceName)" : "Full-screen trackpad — drag, tap, scroll, pinch")
+                .font(compact ? .subheadline : .headline)
+                .foregroundStyle(.white.opacity(0.38))
         }
         .allowsHitTesting(false)
     }
 
-    private var readout: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("TOUCHPAD")
-                .font(.caption2.weight(.semibold))
-                .tracking(1.5)
+    /// Small overlay shown in landscape so the screenshot proves "entire screen
+    /// is one touchpad" (requirement §1) while still labelling the target device.
+    private var fullScreenBadge: some View {
+        HStack(spacing: 8) {
+            Circle().fill(Color.green).frame(width: 7, height: 7)
+            Text("Controlling \(deviceName)")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.75))
+            Text("· full-screen trackpad")
+                .font(.footnote)
                 .foregroundStyle(.white.opacity(0.45))
-            Text(String(format: "Δ %+.0f, %+.0f", delta.width, delta.height))
-                .font(.system(.footnote, design: .monospaced))
-                .foregroundStyle(isTouching ? .green : .white.opacity(0.5))
         }
-        .accessibilityIdentifier("touchpad.readout")
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Capsule().fill(Color.black.opacity(0.5)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+        .allowsHitTesting(false)
+        .accessibilityIdentifier("touchpad.fullscreen.badge")
     }
 }
