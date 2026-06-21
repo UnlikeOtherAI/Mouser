@@ -128,23 +128,41 @@ impl<Src: FileSource> Sender<Src> {
         if self.accepted {
             return Err(FileError::Protocol("duplicate FileAccept".into()));
         }
-        for r in &accept.resume {
+        // Validate the ENTIRE resume vec before mutating any track (audit R2 — atomic
+        // resume): a duplicate `file_index`, an unknown index, or an out-of-range offset
+        // anywhere in the list rejects the whole accept and leaves the sender untouched, so
+        // a later valid accept still applies cleanly (no poisoned partial state).
+        for (pos, r) in accept.resume.iter().enumerate() {
             let t = self
                 .tracks
-                .get_mut(r.file_index as usize)
+                .get(r.file_index as usize)
                 .ok_or(FileError::UnknownFileIndex(r.file_index))?;
-            if t.resumed {
-                return Err(FileError::Protocol(format!(
-                    "duplicate resume for file_index {}",
-                    r.file_index
-                )));
-            }
             if r.offset > t.size {
                 return Err(FileError::OffsetOutOfRange {
                     file_index: r.file_index,
                     offset: r.offset,
                 });
             }
+            // A duplicate `file_index` is a malformed accept (each file's resume point is
+            // declared exactly once). Detected against the already-seen prefix without
+            // touching track state.
+            if accept
+                .resume
+                .get(..pos)
+                .is_some_and(|earlier| earlier.iter().any(|e| e.file_index == r.file_index))
+            {
+                return Err(FileError::Protocol(format!(
+                    "duplicate resume for file_index {}",
+                    r.file_index
+                )));
+            }
+        }
+        // All checks passed — now apply the resume points.
+        for r in &accept.resume {
+            let t = self
+                .tracks
+                .get_mut(r.file_index as usize)
+                .ok_or(FileError::UnknownFileIndex(r.file_index))?;
             t.resumed = true;
             t.sent = r.offset;
             t.acked = r.offset;
@@ -154,21 +172,37 @@ impl<Src: FileSource> Sender<Src> {
     }
 
     /// Apply a `FileAck`, advancing the cumulative ack (and thus re-opening the window).
+    ///
+    /// An ack can only ever confirm bytes that were actually put on the wire, so it is
+    /// rejected (audit C2-4 — "trust the ack") when:
+    /// - the offer has not been accepted yet (no bytes can have been sent),
+    /// - `acked_through` exceeds `sent` (the peer claims bytes we never transmitted —
+    ///   which would otherwise let it mark a file complete before any chunk was sent), or
+    /// - `acked_through` exceeds the file `size`.
+    ///
+    /// A stale (lower-or-equal) ack is a benign duplicate: it is accepted but never moves
+    /// `acked` backwards (cumulative acks are monotonic).
     pub fn on_ack(&mut self, ack: &FileAck) -> Result<(), FileError> {
         if ack.transfer_id != self.transfer_id {
             return Err(FileError::UnknownTransfer(ack.transfer_id));
+        }
+        if !self.accepted {
+            return Err(FileError::Protocol("FileAck before FileAccept".into()));
         }
         let t = self
             .tracks
             .get_mut(ack.file_index as usize)
             .ok_or(FileError::UnknownFileIndex(ack.file_index))?;
-        if ack.acked_through > t.size {
+        if ack.acked_through > t.size || ack.acked_through > t.sent {
+            // Either past the declared size or past what we actually sent — an impossible
+            // ack the peer must not be able to use to "complete" a file early.
             return Err(FileError::OffsetOutOfRange {
                 file_index: ack.file_index,
                 offset: ack.acked_through,
             });
         }
-        // Cumulative acks only ever move forward; a stale (lower) ack is ignored.
+        // Cumulative acks only ever move forward; a stale (lower) ack is ignored so `acked`
+        // never regresses.
         if ack.acked_through > t.acked {
             t.acked = ack.acked_through;
         }

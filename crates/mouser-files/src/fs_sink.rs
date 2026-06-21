@@ -22,7 +22,10 @@
 //!
 //! A resumed sink (an existing partial file) seeds the rolling hash from the bytes
 //! already on disk in [`FsSink::open`], so the digest at `finish()` covers the whole file
-//! regardless of how many legs the transfer took.
+//! regardless of how many legs the transfer took. That seed read goes through the **same
+//! open handle** the sink writes to (positioned `read_at`), never a reopen of the path, so
+//! there is no lstat→open→read TOCTOU window that could decouple the digest from the bytes
+//! actually written.
 //!
 //! Unix-only: positioned writes use the Unix `FileExt`. The path itself is validated to be
 //! inside the quarantine dir purely by [`crate::path`] before this sink is ever opened.
@@ -30,7 +33,6 @@
 #![cfg(unix)]
 
 use std::fs::{File, OpenOptions};
-use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -77,9 +79,13 @@ impl FsSink {
             Err(e) => return Err(SinkError(format!("lstat {}: {e}", path.display()))),
         };
 
-        // write + create, but NOT create_new (resume needs to reopen) and NOT truncate
-        // (resume must keep the prefix). The lstat above already rejected a symlink target.
+        // read + write + create, but NOT create_new (resume needs to reopen) and NOT
+        // truncate (resume must keep the prefix). `read` is required so the resume seed hash
+        // can read the existing prefix through THIS handle (positioned `read_at`) instead of
+        // reopening the path (audit C2-5 — no TOCTOU). The lstat above already rejected a
+        // symlink target.
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(false)
@@ -89,32 +95,13 @@ impl FsSink {
         let mut hasher = Sha256::new();
         if seed && resume_len > 0 {
             // Seed the rolling hash from the bytes already on disk so the final digest
-            // covers the whole file. Read sequentially with a bounded buffer.
-            let mut reader = File::open(path)
-                .map_err(|e| SinkError(format!("reopen-for-hash {}: {e}", path.display())))?;
-            let mut buf = [0u8; 64 * 1024];
-            let mut hashed: u64 = 0;
-            while hashed < resume_len {
-                let n = reader
-                    .read(&mut buf)
-                    .map_err(|e| SinkError(format!("seed-hash read: {e}")))?;
-                if n == 0 {
-                    break;
-                }
-                let take = usize::try_from(resume_len - hashed)
-                    .map(|rem| rem.min(n))
-                    .unwrap_or(n);
-                let slice = buf
-                    .get(..take)
-                    .ok_or_else(|| SinkError("seed-hash slice out of range".into()))?;
-                hasher.update(slice);
-                hashed += take as u64;
-            }
-            if hashed != resume_len {
-                return Err(SinkError(format!(
-                    "seed-hash short read: hashed {hashed} of {resume_len}"
-                )));
-            }
+            // covers the whole file. CRITICAL (audit C2-5 — no TOCTOU): read the prefix
+            // through the SAME open handle we will write to (positioned `read_at`), never
+            // by reopening the path. The lstat above already rejected a symlink target;
+            // reopening would reintroduce a window where the path could be swapped between
+            // the lstat/open and the hash read, decoupling the digest from the bytes
+            // actually written.
+            seed_hash_from_handle(&file, resume_len, &mut hasher)?;
         }
 
         Ok(Self {
@@ -123,6 +110,40 @@ impl FsSink {
             hasher,
         })
     }
+}
+
+/// Roll `len` bytes of an existing prefix into `hasher` by reading through the already-open
+/// `file` handle with positioned reads ([`FileExt::read_at`]) — never by reopening the
+/// path. This keeps the seeded digest bound to the exact bytes the sink will write/extend,
+/// closing the lstat→open→read TOCTOU window (audit C2-5).
+fn seed_hash_from_handle(file: &File, len: u64, hasher: &mut Sha256) -> Result<(), SinkError> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut hashed: u64 = 0;
+    while hashed < len {
+        let want = usize::try_from(len - hashed)
+            .map(|rem| rem.min(buf.len()))
+            .unwrap_or(buf.len());
+        let slot = buf
+            .get_mut(..want)
+            .ok_or_else(|| SinkError("seed-hash slice out of range".into()))?;
+        let n = file
+            .read_at(slot, hashed)
+            .map_err(|e| SinkError(format!("seed-hash read_at {hashed}: {e}")))?;
+        if n == 0 {
+            break; // hit EOF before `len` — reported as a short read below.
+        }
+        let chunk = slot
+            .get(..n)
+            .ok_or_else(|| SinkError("seed-hash read len out of range".into()))?;
+        hasher.update(chunk);
+        hashed += n as u64;
+    }
+    if hashed != len {
+        return Err(SinkError(format!(
+            "seed-hash short read: hashed {hashed} of {len}"
+        )));
+    }
+    Ok(())
 }
 
 impl FileSink for FsSink {
