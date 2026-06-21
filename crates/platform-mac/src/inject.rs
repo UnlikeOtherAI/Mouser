@@ -22,12 +22,13 @@
 
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
+    ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 
-use crate::keymap::hid_usage_to_cgkeycode;
+use crate::keymap::{hid_usage_to_cgkeycode, mods_to_cgflags};
 
 /// Errors from injection calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub enum InjectError {
     Warp(i32),
     /// The HID usage has no macOS key-code mapping yet.
     UnmappedKey(u16),
+    /// A pointer button index that is not defined (§7.5 defines 0..=4).
+    UnknownButton(u8),
 }
 
 impl std::fmt::Display for InjectError {
@@ -49,6 +52,7 @@ impl std::fmt::Display for InjectError {
             Self::EventCreate => write!(f, "failed to create CGEvent"),
             Self::Warp(code) => write!(f, "CGWarpMouseCursorPosition failed (CGError {code})"),
             Self::UnmappedKey(u) => write!(f, "HID usage {u:#06x} has no CGKeyCode mapping"),
+            Self::UnknownButton(b) => write!(f, "pointer button index {b} is not defined (§7.5)"),
         }
     }
 }
@@ -74,12 +78,16 @@ pub fn cursor_position() -> Option<CGPoint> {
     Some(event.location())
 }
 
-/// Move the cursor to a global display point.
+/// Move the cursor to a **global** display point.
 ///
 /// Performs **both** a warp (`CGWarpMouseCursorPosition`, no permission needed,
 /// guarantees the cursor relocates) and a posted `MouseMoved` event (needs
 /// Accessibility; makes apps see real motion). Warp errors are returned; a
 /// dropped `MouseMoved` post is silent (see module docs).
+///
+/// Callers holding display-local coordinates translate to a global point first
+/// (`display_info::DisplayBounds::local_to_global`) — that is what
+/// [`crate::adapter::MacInjector::move_cursor`] does (audit M1).
 pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
     let point = CGPoint::new(x, y);
     CGDisplay::warp_mouse_cursor_position(point).map_err(InjectError::Warp)?;
@@ -92,47 +100,112 @@ pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
     Ok(())
 }
 
+/// Apply a **relative** cursor delta in points (spec §7.6 tag 0x02), used when
+/// the foreground app has grabbed pointer-lock.
+///
+/// Reads the current cursor location, offsets it, and posts a `MouseMoved` event
+/// carrying `(dx, dy)` in the delta fields so relative consumers see motion even
+/// when the absolute position is ignored.
+pub fn move_cursor_rel(dx: i32, dy: i32) -> Result<(), InjectError> {
+    let current = cursor_position().unwrap_or_else(|| CGPoint::new(0.0, 0.0));
+    let point = CGPoint::new(current.x + f64::from(dx), current.y + f64::from(dy));
+    let source = event_source()?;
+    let ev = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
+        .map_err(|()| InjectError::EventCreate)?;
+    ev.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
+    ev.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+    ev.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
+/// Press or release a pointer button by §7.5 index (0=left,1=right,2=middle,
+/// 3=back,4=forward) at the **current** cursor position.
+///
+/// Left/right/middle use the dedicated `CGMouseButton`s; back/forward post
+/// `OtherMouse*` with the button number set. Returns
+/// [`InjectError::UnknownButton`] for any other index.
+pub fn button(index: u8, down: bool) -> Result<(), InjectError> {
+    let point = cursor_position().unwrap_or_else(|| CGPoint::new(0.0, 0.0));
+    let (ty, cg_button, number) = match (index, down) {
+        (0, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left, 0),
+        (0, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left, 0),
+        (1, true) => (CGEventType::RightMouseDown, CGMouseButton::Right, 1),
+        (1, false) => (CGEventType::RightMouseUp, CGMouseButton::Right, 1),
+        (2, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, 2),
+        (2, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, 2),
+        (3, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, 3),
+        (3, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, 3),
+        (4, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center, 4),
+        (4, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, 4),
+        (other, _) => return Err(InjectError::UnknownButton(other)),
+    };
+    let source = event_source()?;
+    let ev = CGEvent::new_mouse_event(source, ty, point, cg_button)
+        .map_err(|()| InjectError::EventCreate)?;
+    ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
+    ev.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
 /// Synthesize a left-button click (down then up) at a global display point.
+///
+/// Builds **both** events before posting either, so a creation failure can't
+/// leave the button logically held (audit M3).
 pub fn left_click(x: f64, y: f64) -> Result<(), InjectError> {
     let point = CGPoint::new(x, y);
+    let mut events = Vec::with_capacity(2);
     for ty in [CGEventType::LeftMouseDown, CGEventType::LeftMouseUp] {
         let source = event_source()?;
         let ev = CGEvent::new_mouse_event(source, ty, point, CGMouseButton::Left)
             .map_err(|()| InjectError::EventCreate)?;
+        events.push(ev);
+    }
+    for ev in events {
         ev.post(CGEventTapLocation::HID);
     }
     Ok(())
 }
 
-/// Press or release a key.
+/// Press or release a key with active modifiers.
 ///
 /// `key` is interpreted as a **HID usage (Usage Page 0x07)** first; if it has no
 /// mapping but fits in a `CGKeyCode` it is treated as a raw `CGKeyCode` so
-/// callers already holding a virtual key code can pass it through. `down` =
-/// true → key-down, false → key-up.
-pub fn key_press(key: u16, down: bool) -> Result<(), InjectError> {
+/// callers already holding a virtual key code can pass it through. `mods` is the
+/// wire bitmask (Appendix B); `cmd_ctrl_swap` applies the optional macOS Cmd↔Ctrl
+/// swap. `down = true` → key-down, false → key-up.
+pub fn key_press(key: u16, down: bool, mods: u16, cmd_ctrl_swap: bool) -> Result<(), InjectError> {
     let keycode: CGKeyCode = match hid_usage_to_cgkeycode(key) {
         Some(code) => code,
-        // Heuristic for the spike: HID usages live in 0x04..=0xE7; anything
-        // outside that range is assumed to already be a raw CGKeyCode.
+        // HID usages live in 0x04..=0xE7; anything outside is assumed to already
+        // be a raw CGKeyCode the caller resolved.
         None if !(0x04..=0xE7).contains(&key) => key,
         None => return Err(InjectError::UnmappedKey(key)),
     };
     let source = event_source()?;
     let ev = CGEvent::new_keyboard_event(source, keycode, down)
         .map_err(|()| InjectError::EventCreate)?;
+    let flags = mods_to_cgflags(mods, cmd_ctrl_swap);
+    if flags != CGEventFlags::CGEventFlagNull {
+        ev.set_flags(flags);
+    }
     ev.post(CGEventTapLocation::HID);
     Ok(())
 }
 
-/// Scroll by pixel deltas (`dx` horizontal, `dy` vertical).
+/// Scroll by deltas (`dx` horizontal, `dy` vertical).
 ///
 /// Wire `Scroll` carries `dx/dy` in either `Detent120` or `LogicalPixel` units
-/// (§7.5); the spike injects pixel-unit scrolling. CG axis-1 is vertical,
-/// axis-2 is horizontal, so we map `dy`→wheel1, `dx`→wheel2.
-pub fn scroll(dx: i32, dy: i32) -> Result<(), InjectError> {
+/// (§7.5). `pixel = true` injects pixel-unit (high-resolution/trackpad)
+/// scrolling; `false` injects line/detent units. CG axis-1 is vertical, axis-2
+/// is horizontal, so `dy`→wheel1, `dx`→wheel2.
+pub fn scroll(dx: i32, dy: i32, pixel: bool) -> Result<(), InjectError> {
+    let unit = if pixel {
+        ScrollEventUnit::PIXEL
+    } else {
+        ScrollEventUnit::LINE
+    };
     let source = event_source()?;
-    let ev = CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, dy, dx, 0)
+    let ev = CGEvent::new_scroll_event(source, unit, 2, dy, dx, 0)
         .map_err(|()| InjectError::EventCreate)?;
     ev.post(CGEventTapLocation::HID);
     Ok(())

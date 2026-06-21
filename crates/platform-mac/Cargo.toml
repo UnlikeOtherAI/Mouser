@@ -6,16 +6,24 @@ license.workspace = true
 repository.workspace = true
 
 # NOTE: this crate deliberately does NOT set `[lints] workspace = true`.
-# The workspace forbids `unsafe_code`, but this macOS input-injection spike
-# must call CGEvent/CGEventTap C APIs that require `unsafe`. Reconciliation
-# with the core traits (`InputCapture`/`InputInjection`) is a later step.
+# The workspace forbids `unsafe_code`, but this macOS input adapter must call
+# CGEvent/CGEventTap C APIs that require `unsafe`.
+
+# `mouser-core` provides the `InputInjection`/`InputCapture` trait contracts the
+# adapter structs implement (audit H2).
+[dependencies]
+mouser-core = { path = "../mouser-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `highsierra` exposes CGEventCreateScrollWheelEvent2 (non-variadic scroll);
 # `elcapitan` exposes CGEventPostToPid. Both are post-10.13 baselines we target.
 core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10"
-libc = "0.2"
+
+[dev-dependencies]
+# Keymap parity test (audit H11): compares the mac & linux HID-usage coverage.
+# The linux table's `supported_hid_usages` is host-independent pure data.
+platform-linux = { path = "../platform-linux" }
 
 [[example]]
 name = "inject_demo"

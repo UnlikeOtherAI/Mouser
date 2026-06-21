@@ -1,25 +1,34 @@
-//! platform-linux — Linux input-injection spike.
+//! platform-linux — the Linux input-injection adapter.
 //!
-//! Standalone (does **not** depend on `mouser-core` traits yet). Creates a
-//! virtual mouse + keyboard through `/dev/uinput` using the `input-linux`
-//! crate and exposes a tiny injection surface: [`VirtualDevice::move_rel`],
-//! [`VirtualDevice::button`], [`VirtualDevice::key`].
+//! [`UinputInjector`] implements `mouser_core::InputInjection` (audit H2) over a
+//! virtual mouse + keyboard created through `/dev/uinput` (the [`VirtualDevice`]
+//! backend). [`keymap`] is the Linux HID↔evdev table (audit H11); its
+//! host-independent `supported_hid_usages` lets the cross-platform keymap parity
+//! test run on a macOS build host.
 //!
-//! All real work is Linux-only and lives in [`uinput`]. On other hosts
-//! (macOS/Windows) the crate still builds: only the stub below is compiled, so
+//! The uinput backend and the adapter are Linux-only and live in [`uinput`] /
+//! [`adapter`]. On other hosts (macOS/Windows) the crate still builds: only the
+//! keymap's pure-data surface and the stub below compile, so
 //! `cargo build -p platform-linux` succeeds everywhere.
 
+pub mod keymap;
+
+#[cfg(target_os = "linux")]
+pub mod adapter;
 #[cfg(target_os = "linux")]
 pub mod uinput;
 
 #[cfg(target_os = "linux")]
+pub use adapter::UinputInjector;
+#[cfg(target_os = "linux")]
 pub use input_linux::Key;
 #[cfg(target_os = "linux")]
-pub use uinput::{Button, VirtualDevice, DEVICE_NAME};
+pub use uinput::{Button, VirtualDevice, ABS_MAX, DEVICE_NAME};
 
 /// Non-Linux stub so the crate compiles on macOS / Windows hosts.
 ///
 /// The uinput backend only exists on Linux; everywhere else this marker keeps
-/// the crate buildable without pulling in Linux-only system APIs.
+/// the crate buildable without pulling in Linux-only system APIs. The [`keymap`]
+/// module's pure-data coverage surface is available on every host.
 #[cfg(not(target_os = "linux"))]
 pub const UNSUPPORTED: &str = "platform-linux uinput backend is only available on Linux";
