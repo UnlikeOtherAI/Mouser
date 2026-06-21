@@ -19,10 +19,16 @@ struct Track<Src> {
     name: String,
     src: Src,
     size: u64,
+    /// Optional precomputed SHA-256 of the file, advertised in the offer's `FileEntry`
+    /// so the receiver can verify integrity end-to-end (C2-4). `None` ⇒ no in-band hash.
+    sha256: Option<crate::Hash>,
     /// Bytes already emitted in chunks (the high-water of what's been put on the wire).
     sent: u64,
     /// Bytes the receiver has cumulatively acked (`FileAck.acked_through`).
     acked: u64,
+    /// Set once a resume point has been applied for this file, so a duplicate
+    /// `file_index` in `FileAccept.resume` is rejected rather than re-applied.
+    resumed: bool,
 }
 
 /// The sender half of a single `transfer_id`. Generic over the [`FileSource`] type.
@@ -36,23 +42,39 @@ pub struct Sender<Src: FileSource> {
 
 impl<Src: FileSource> Sender<Src> {
     /// Build a sender for `files` (each `(name, source)`); the offered `size` is the
-    /// source's length. Fails if the list is empty or has more than `u32::MAX` files.
+    /// source's length. No per-file digest is advertised — use [`Sender::new_with_hashes`]
+    /// to carry SHA-256s in the offer (C2-4). Fails if the list is empty or has more than
+    /// `u32::MAX` files.
     pub fn new(transfer_id: u64, files: Vec<(String, Src)>) -> Result<Self, FileError> {
+        Self::new_with_hashes(
+            transfer_id,
+            files.into_iter().map(|(n, s)| (n, s, None)).collect(),
+        )
+    }
+
+    /// Like [`Sender::new`] but each file carries an optional precomputed SHA-256 that is
+    /// advertised in the offer (`FileEntry.sha256`) so the receiver can verify integrity
+    /// end-to-end (C2-4).
+    pub fn new_with_hashes(
+        transfer_id: u64,
+        files: Vec<(String, Src, Option<crate::Hash>)>,
+    ) -> Result<Self, FileError> {
         if files.is_empty() {
             return Err(FileError::Protocol("nothing to send".into()));
         }
-        u32::try_from(files.len())
-            .map_err(|_| FileError::Protocol("too many files".into()))?;
+        u32::try_from(files.len()).map_err(|_| FileError::Protocol("too many files".into()))?;
         let tracks = files
             .into_iter()
-            .map(|(name, src)| {
+            .map(|(name, src, sha256)| {
                 let size = src.len();
                 Track {
                     name,
                     src,
                     size,
+                    sha256,
                     sent: 0,
                     acked: 0,
+                    resumed: false,
                 }
             })
             .collect();
@@ -74,7 +96,8 @@ impl<Src: FileSource> Sender<Src> {
         Ok(self)
     }
 
-    /// The `FileOffer` to send first (one [`FileEntry`] per file).
+    /// The `FileOffer` to send first (one [`FileEntry`] per file). Each entry carries the
+    /// file's SHA-256 when one was supplied (C2-4), encoded as a CBOR byte string.
     #[must_use]
     pub fn offer(&self) -> FileOffer {
         FileOffer {
@@ -85,6 +108,7 @@ impl<Src: FileSource> Sender<Src> {
                 .map(|t| FileEntry {
                     name: t.name.clone(),
                     size: t.size,
+                    sha256: t.sha256.map(|h| h.to_vec()),
                 })
                 .collect(),
         }
@@ -92,21 +116,36 @@ impl<Src: FileSource> Sender<Src> {
 
     /// Apply the receiver's `FileAccept`: fast-forward each named file's `sent`/`acked`
     /// to the resume offset so the window starts past bytes the receiver already holds.
+    ///
+    /// Single-shot and resume-trusting (audit R2): a second `FileAccept` is rejected
+    /// (`Protocol`), as is a `resume` list with a duplicate `file_index` — the receiver
+    /// declares each file's resume point exactly once, and the offset stays bounded by the
+    /// file `size`.
     pub fn on_accept(&mut self, accept: &FileAccept) -> Result<(), FileError> {
         if accept.transfer_id != self.transfer_id {
             return Err(FileError::UnknownTransfer(accept.transfer_id));
+        }
+        if self.accepted {
+            return Err(FileError::Protocol("duplicate FileAccept".into()));
         }
         for r in &accept.resume {
             let t = self
                 .tracks
                 .get_mut(r.file_index as usize)
                 .ok_or(FileError::UnknownFileIndex(r.file_index))?;
+            if t.resumed {
+                return Err(FileError::Protocol(format!(
+                    "duplicate resume for file_index {}",
+                    r.file_index
+                )));
+            }
             if r.offset > t.size {
                 return Err(FileError::OffsetOutOfRange {
                     file_index: r.file_index,
                     offset: r.offset,
                 });
             }
+            t.resumed = true;
             t.sent = r.offset;
             t.acked = r.offset;
         }

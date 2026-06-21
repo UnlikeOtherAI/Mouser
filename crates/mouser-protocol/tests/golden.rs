@@ -101,7 +101,10 @@ fn pointer_motion_datagram_golden_vector() {
         [TAG_POINTER_MOTION, 0x01, 0x02, 0x03, 0x07, 0x0A],
         "PointerMotion datagram golden bytes"
     );
-    assert_eq!(decode_datagram(&bytes).expect("decode"), Datagram::Motion(m));
+    assert_eq!(
+        decode_datagram(&bytes).expect("decode"),
+        Datagram::Motion(m)
+    );
 }
 
 #[test]
@@ -211,10 +214,12 @@ fn file_transfer_messages_round_trip() {
             FileEntry {
                 name: "report.pdf".into(),
                 size: 9_000_000,
+                sha256: Some(vec![0xAB; 32]),
             },
             FileEntry {
                 name: "notes.txt".into(),
                 size: 17,
+                sha256: None,
             },
         ],
     };
@@ -264,6 +269,51 @@ fn file_transfer_messages_round_trip() {
 }
 
 #[test]
+fn file_entry_sha256_omitted_when_none_and_byte_string_when_present() {
+    // C2-4 / §2 additive-field discipline: the optional `sha256` is skipped entirely
+    // when `None`, so an offer without a digest is byte-identical to the pre-`sha256`
+    // wire form (a map of exactly {name, size}).
+    let no_digest = FileEntry {
+        name: "a".into(),
+        size: 1,
+        sha256: None,
+    };
+    let encoded = to_cbor(&no_digest).expect("encode");
+    assert_eq!(
+        encoded,
+        [
+            0xA2, // map(2) — only name+size, the digest key is absent
+            0x64, 0x6E, 0x61, 0x6D, 0x65, // "name"
+            0x61, 0x61, // "a"
+            0x64, 0x73, 0x69, 0x7A, 0x65, // "size"
+            0x01, // 1
+        ],
+        "sha256:None must be omitted — identical bytes to the pre-digest FileEntry"
+    );
+    // The omitted field still round-trips back to None (serde default on decode).
+    let back: FileEntry = from_cbor(&encoded).expect("decode");
+    assert_eq!(back, no_digest);
+
+    // With a digest present it must encode as a CBOR **byte string** (major type 2),
+    // not an array of ints. A 32-byte digest is `0x58 0x20 <32 bytes>`.
+    let digest = vec![0xEEu8; 32];
+    let with_digest = FileEntry {
+        name: "a".into(),
+        size: 1,
+        sha256: Some(digest.clone()),
+    };
+    let encoded = to_cbor(&with_digest).expect("encode");
+    let mut needle = vec![0x58, 0x20]; // byte-string(32)
+    needle.extend_from_slice(&digest);
+    assert!(
+        encoded.windows(needle.len()).any(|w| w == needle),
+        "sha256:Some must encode as a CBOR byte string (§0.1), got {encoded:02X?}"
+    );
+    let back: FileEntry = from_cbor(&encoded).expect("decode");
+    assert_eq!(back, with_digest);
+}
+
+#[test]
 fn file_chunk_golden_vector_encodes_data_as_byte_string() {
     // Golden bytes for FileChunk{transfer_id:1, file_index:0, offset:0, data:[DEADBEEF]}.
     // §0.1: structs are definite-length CBOR maps keyed by the field-name string, and a
@@ -281,7 +331,8 @@ fn file_chunk_golden_vector_encodes_data_as_byte_string() {
         encoded,
         [
             0xA4, // map(4)
-            0x6B, 0x74, 0x72, 0x61, 0x6E, 0x73, 0x66, 0x65, 0x72, 0x5F, 0x69, 0x64, // "transfer_id"
+            0x6B, 0x74, 0x72, 0x61, 0x6E, 0x73, 0x66, 0x65, 0x72, 0x5F, 0x69,
+            0x64, // "transfer_id"
             0x01, // 1
             0x6A, 0x66, 0x69, 0x6C, 0x65, 0x5F, 0x69, 0x6E, 0x64, 0x65, 0x78, // "file_index"
             0x00, // 0
@@ -394,10 +445,13 @@ fn capability_set_drops_unknown_and_out_of_range_members() {
     let raw: Vec<i128> = vec![0, 1, 2, 99, 65536, -1];
     let bytes = to_cbor(&raw).expect("encode array");
     let set: CapabilitySet = from_cbor(&bytes).expect("forward-compat set decode");
-    let expected: BTreeSet<Capability> =
-        [Capability::Keyboard, Capability::Mouse, Capability::Clipboard]
-            .into_iter()
-            .collect();
+    let expected: BTreeSet<Capability> = [
+        Capability::Keyboard,
+        Capability::Mouse,
+        Capability::Clipboard,
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(set.0, expected);
 }
 

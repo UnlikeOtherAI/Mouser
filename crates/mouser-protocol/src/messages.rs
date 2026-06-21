@@ -66,10 +66,18 @@ pub struct HelloAck {
 /// One advertised file inside a [`FileOffer`] (§7.8): a sanitized-on-receipt `name`
 /// and the total `size` in bytes (bounds the transfer; the receiver pre-allocates
 /// nothing beyond a single chunk).
+///
+/// `sha256` is the optional 32-byte SHA-256 of the file's full contents (audit R2
+/// **C2-4**): when present it travels in-band so the receiver can verify integrity
+/// end-to-end (compare against the reassembled digest before committing `ok=true`).
+/// It encodes as a CBOR **byte string** (§0.1) and is **omitted entirely** when
+/// `None`, so an offer without it is byte-identical to the pre-`sha256` wire form.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub sha256: Option<Vec<u8>>,
 }
 
 /// `[60] FileOffer { transfer_id, files: [{ name, size }] }` (§7.8). Sent on the

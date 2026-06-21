@@ -28,11 +28,15 @@
 
 #![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
+#[cfg(unix)]
+pub mod fs_sink;
 pub mod path;
 pub mod receiver;
 pub mod sender;
 pub mod sink;
 
+#[cfg(unix)]
+pub use fs_sink::FsSink;
 pub use path::{resolve_in_quarantine, sanitize_name, PathError};
 pub use receiver::{FileState, Outbound, Receiver, ReceiverConfig};
 pub use sender::Sender;
