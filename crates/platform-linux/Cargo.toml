@@ -4,3 +4,15 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+# NOTE: this is a standalone uinput input-injection spike. It uses `unsafe`
+# (opening /dev/uinput, syscalls via input-linux), so it intentionally does NOT
+# adopt the workspace `unsafe_code = "forbid"` lint. All Linux-only code is
+# cfg-gated so the crate still builds as an empty stub on macOS / Windows.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+input-linux = "0.7"
+
+[[example]]
+name = "uinput_demo"
+path = "examples/uinput_demo.rs"
