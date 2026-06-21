@@ -9,6 +9,7 @@ members = [
   "crates/platform-mac",
   "crates/platform-linux",
   "crates/platform-win",
+  "apps/desktop/src-tauri",
 ]
 
 [workspace.package]

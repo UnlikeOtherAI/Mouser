@@ -10,9 +10,9 @@ dist
 *.tsbuildinfo
 .pnpm-store
 
-# Tauri
-src-tauri/target
-src-tauri/gen
+# Tauri (match at any depth, e.g. apps/desktop/src-tauri/gen)
+**/src-tauri/target
+**/src-tauri/gen
 
 # OS
 .DS_Store

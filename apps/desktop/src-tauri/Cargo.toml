@@ -1,0 +1,26 @@
+[package]
+name = "mouser-desktop"
+version = "0.0.0"
+description = "Mouser desktop UI shell (Tauri v2). UI client only — does not own the daemon (see docs/tech-stack.md §5)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate is unsafe-free, so it adopts the workspace lints
+# (`unsafe_code = "forbid"`) like the protocol/core crates.
+[lints]
+workspace = true
+
+# The library is what mobile/other shells could embed; the binary is the app.
+[lib]
+name = "mouser_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
