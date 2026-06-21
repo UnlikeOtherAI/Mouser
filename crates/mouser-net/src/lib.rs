@@ -25,6 +25,7 @@
 #![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod bulk;
+mod control;
 pub mod discovery;
 pub mod identity;
 pub mod motion;
@@ -33,10 +34,11 @@ pub mod tls;
 pub mod transport;
 
 pub use bulk::{BulkConnection, BulkEndpoint, TransferStream};
-pub use discovery::{Advertiser, Browser, PeerAdvert, SERVICE_TYPE};
+pub use discovery::{Advertiser, Browser, PeerAdvert, PeerEvent, SERVICE_TYPE};
 pub use identity::{
     build_tls_certificate, device_id_from_cert, verifying_key_from_cert, TlsCertificate,
 };
+pub use motion::{MotionPlane, MotionSender};
 pub use mouser_core::{DeviceId, DeviceIdentity};
 pub use pin::{DeviceIdPinVerifier, PinPolicy};
 pub use tls::ALPN_MOUSER_1;

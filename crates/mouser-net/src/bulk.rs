@@ -94,7 +94,8 @@ impl BulkEndpoint {
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
         let hello = build_bulk_hello(identity, &connection, interactive_session_id)?;
-        let payload = mouser_protocol::to_cbor(&hello).map_err(|e| NetError::Frame(e.to_string()))?;
+        let payload =
+            mouser_protocol::to_cbor(&hello).map_err(|e| NetError::Frame(e.to_string()))?;
         let frame = mouser_protocol::encode_frame(mouser_protocol::TYPE_BULK_HELLO, 0, &payload)
             .map_err(|e| NetError::Frame(e.to_string()))?;
         send.write_all(&frame)
@@ -123,8 +124,7 @@ impl BulkEndpoint {
             .accept_bi()
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
-        let (msg_type, payload) =
-            read_frame(&mut recv, mouser_protocol::MAX_CONTROL_FRAME).await?;
+        let (msg_type, payload) = read_frame(&mut recv, mouser_protocol::MAX_CONTROL_FRAME).await?;
         if msg_type != mouser_protocol::TYPE_BULK_HELLO {
             return Err(NetError::Connect(format!(
                 "expected BulkHello (0x04), got type {msg_type:#06x}"
@@ -139,7 +139,15 @@ impl BulkEndpoint {
         })
     }
 
-    /// Close the endpoint, terminating all bulk connections.
+    /// Gracefully shut down the bulk endpoint (H6, mirrored from the interactive plane):
+    /// send each peer a CONNECTION_CLOSE then wait for in-flight connections to drain, so
+    /// a peer mid-transfer isn't left waiting out the idle timeout.
+    pub async fn shutdown(self) {
+        self.endpoint.close(0u32.into(), b"shutdown");
+        self.endpoint.wait_idle().await;
+    }
+
+    /// Close the endpoint immediately, terminating all bulk connections without draining.
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"shutdown");
     }
@@ -239,7 +247,9 @@ pub struct BulkConnection {
 impl BulkConnection {
     /// The peer's pinned `device_id` from its presented leaf cert (§3).
     pub fn peer_device_id(&self) -> Option<[u8; 32]> {
-        peer_leaf_cert(&self.connection).ok().and_then(|c| device_id_from_cert(&c).ok())
+        peer_leaf_cert(&self.connection)
+            .ok()
+            .and_then(|c| device_id_from_cert(&c).ok())
     }
 
     /// Open a fresh dedicated bidi stream for `transfer_id` (§6.2). The first frame the
@@ -263,8 +273,24 @@ impl BulkConnection {
         Ok(TransferStream { send, recv })
     }
 
-    /// Close the bulk connection cleanly.
+    /// Gracefully shut down the bulk connection (H6, mirrored from the interactive plane):
+    /// send the peer a CONNECTION_CLOSE and await the close handshake, so it isn't left
+    /// waiting for an idle timeout after a transfer completes.
+    pub async fn shutdown(&self) {
+        self.connection.close(0u32.into(), b"bye");
+        self.connection.closed().await;
+    }
+
+    /// Close the bulk connection immediately without awaiting the drain.
     pub fn close(&self) {
+        self.connection.close(0u32.into(), b"bye");
+    }
+}
+
+impl Drop for BulkConnection {
+    fn drop(&mut self) {
+        // Best-effort graceful close (H6): tell the peer we're gone so it doesn't have to
+        // wait out the idle timeout. quinn flushes the CONNECTION_CLOSE on drop.
         self.connection.close(0u32.into(), b"bye");
     }
 }
@@ -297,9 +323,7 @@ impl TransferStream {
 
     /// Signal end-of-transfer by finishing the send half (peer sees clean EOF).
     pub fn finish(&mut self) -> Result<(), NetError> {
-        self.send
-            .finish()
-            .map_err(|e| NetError::Io(e.to_string()))
+        self.send.finish().map_err(|e| NetError::Io(e.to_string()))
     }
 }
 

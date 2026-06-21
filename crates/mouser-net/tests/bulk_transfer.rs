@@ -70,7 +70,9 @@ impl FileSink for FsSink {
     }
 
     fn finish(&mut self) -> Result<mouser_files::Hash, SinkError> {
-        self.file.flush().map_err(|e| SinkError(format!("flush: {e}")))?;
+        self.file
+            .flush()
+            .map_err(|e| SinkError(format!("flush: {e}")))?;
         let bytes = fs::read(&self.path).map_err(|e| SinkError(format!("reread: {e}")))?;
         Ok(sha256(&bytes))
     }
@@ -84,7 +86,10 @@ async fn run_sender(
 ) -> Result<(), String> {
     let offer = sender.offer();
     stream
-        .send_msg(TYPE_FILE_OFFER, &to_cbor(&offer).map_err(|e| e.to_string())?)
+        .send_msg(
+            TYPE_FILE_OFFER,
+            &to_cbor(&offer).map_err(|e| e.to_string())?,
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -155,7 +160,10 @@ async fn run_receiver(
         other => return Err(format!("unexpected first outbound {other:?}")),
     };
     stream
-        .send_msg(TYPE_FILE_ACCEPT, &to_cbor(&accept).map_err(|e| e.to_string())?)
+        .send_msg(
+            TYPE_FILE_ACCEPT,
+            &to_cbor(&accept).map_err(|e| e.to_string())?,
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -248,7 +256,10 @@ async fn bulk_multi_file_transfer_over_two_connections() {
         7,
         vec![
             (names[0].into(), mouser_files::MemSource::new(f_big.clone())),
-            (names[1].into(), mouser_files::MemSource::new(f_small.clone())),
+            (
+                names[1].into(),
+                mouser_files::MemSource::new(f_small.clone()),
+            ),
         ],
     )
     .expect("sender");
@@ -260,7 +271,10 @@ async fn bulk_multi_file_transfer_over_two_connections() {
     // Bytes + hash + sanitized paths on disk.
     for (name, content) in [(names[0], &f_big), (names[1], &f_small)] {
         let landed = quarantine.join(name);
-        assert!(landed.starts_with(&quarantine), "file stays inside quarantine");
+        assert!(
+            landed.starts_with(&quarantine),
+            "file stays inside quarantine"
+        );
         let got = fs::read(&landed).expect("read landed file");
         assert_eq!(&got, content, "received bytes match for {name}");
         assert_eq!(sha256(&got), sha256(content), "sha256 matches for {name}");
@@ -296,7 +310,12 @@ async fn bulk_hello_wrong_session_is_rejected() {
     });
 
     let dial = client
-        .connect_bulk(&client_id, server_addr, PinPolicy::Pinned(server_device_id), 999)
+        .connect_bulk(
+            &client_id,
+            server_addr,
+            PinPolicy::Pinned(server_device_id),
+            999,
+        )
         .await;
 
     let (_server, accept_result) = accept.await.expect("accept task");

@@ -4,6 +4,7 @@
 //! `iport`, `bport`, `caps`, `role`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
@@ -46,6 +47,11 @@ pub struct PeerAdvert {
     pub caps: String,
     /// `role`: coordinator-eligibility role string.
     pub role: String,
+    /// Resolved IP address(es) of the peer (from mDNS A/AAAA records, C2-6). A peer with
+    /// no resolved address can't be dialed, so [`PeerAdvert::from_service_info`] returns
+    /// `None` for one; the connect helpers pair these with `iport`/`bport` for a
+    /// `SocketAddr`. Not part of TXT — these are the SRV/address records, not advisory.
+    pub addrs: Vec<IpAddr>,
 }
 
 impl PeerAdvert {
@@ -71,9 +77,15 @@ impl PeerAdvert {
     }
 
     /// Parse a [`PeerAdvert`] back from a resolved [`ServiceInfo`]'s TXT records,
-    /// ignoring unknown keys (§4 forward-compat).
+    /// ignoring unknown keys (§4 forward-compat). Returns `None` when the service has no
+    /// `id` TXT key **or no resolved address** (C2-6): an address-less peer cannot be
+    /// dialed, so it is skipped rather than surfaced as an undialable [`PeerAdvert`].
     pub fn from_service_info(info: &ServiceInfo) -> Option<Self> {
         let get = |k: &str| info.get_property_val_str(k).map(str::to_string);
+        let addrs: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+        if addrs.is_empty() {
+            return None;
+        }
         Some(Self {
             id: get("id")?,
             name: get("name").unwrap_or_default(),
@@ -83,8 +95,21 @@ impl PeerAdvert {
             bport: get("bport").and_then(|s| s.parse().ok()).unwrap_or(0),
             caps: get("caps").unwrap_or_default(),
             role: get("role").unwrap_or_default(),
+            addrs,
         })
     }
+}
+
+/// An event from a [`Browser`] (C2-6): a peer resolved (`Found`) or a peer that left the
+/// network (`Removed`). `Removed` carries the DNS-SD instance fullname (the same string
+/// the daemon emits in `ServiceRemoved`), which the reconnect supervisor matches against
+/// a previously-`Found` peer to prune it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerEvent {
+    /// A peer was fully resolved (TXT parsed, at least one dialable address).
+    Found(PeerAdvert),
+    /// A previously-advertised peer departed; the `String` is its instance fullname.
+    Removed(String),
 }
 
 /// A running mDNS advertisement; dropping it (or calling [`Advertiser::unregister`])
@@ -171,15 +196,23 @@ impl Browser {
         Ok(Self { daemon, events })
     }
 
-    /// Await the next fully-resolved peer (its TXT parsed into a [`PeerAdvert`]),
-    /// skipping non-resolution events. Returns `None` if the browse channel closes.
-    pub async fn next_peer(&self) -> Option<PeerAdvert> {
+    /// Await the next [`PeerEvent`] (C2-6): a resolved, dialable peer
+    /// ([`PeerEvent::Found`]) or a departure ([`PeerEvent::Removed`]), skipping the
+    /// daemon's intermediate browse events (search-started, service-found-but-unresolved,
+    /// …). A `ServiceResolved` whose TXT lacks `id` or whose address set is empty is
+    /// skipped (can't be dialed). Returns `None` if the browse channel closes.
+    pub async fn next_event(&self) -> Option<PeerEvent> {
         loop {
-            let event = self.events.recv_async().await.ok()?;
-            if let ServiceEvent::ServiceResolved(info) = event {
-                if let Some(peer) = PeerAdvert::from_service_info(&info) {
-                    return Some(peer);
+            match self.events.recv_async().await.ok()? {
+                ServiceEvent::ServiceResolved(info) => {
+                    if let Some(peer) = PeerAdvert::from_service_info(&info) {
+                        return Some(PeerEvent::Found(peer));
+                    }
                 }
+                ServiceEvent::ServiceRemoved(_service_type, fullname) => {
+                    return Some(PeerEvent::Removed(fullname));
+                }
+                _ => continue,
             }
         }
     }

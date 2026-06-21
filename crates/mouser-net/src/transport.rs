@@ -22,14 +22,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use mouser_core::{DeviceId, DeviceIdentity};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{
-    ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, SendStream, ServerConfig,
-    TransportConfig,
-};
-use tokio::sync::Mutex;
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 
+use crate::control::{self, ControlStream};
 use crate::identity::{build_tls_certificate, device_id_from_cert, TlsCertificate};
-use crate::motion::MotionSender;
+use crate::motion::{MotionPlane, MotionSender};
 use crate::pin::PinPolicy;
 use crate::{tls, NetError};
 
@@ -46,9 +43,12 @@ const MAX_IDLE: Duration = Duration::from_secs(20);
 /// 4 KiB is a handful of motion datagrams.
 const DATAGRAM_SEND_BUFFER: usize = 4 * 1024;
 
-/// Reserved control-frame type for the stream-priming frame (A2). It carries an empty
-/// payload and is consumed during connection setup; it is never surfaced to callers.
-const TYPE_STREAM_PRIME: u16 = 0xFFFF;
+/// Bound the quinn datagram *receive* backlog (C2-7 / audit-R2 transport MEDIUM). The
+/// RX buffer is drained oldest-first and unbounded by default; under a burst a stale
+/// `PointerMotion` could sit ahead of the newest one. A small bound keeps the receiver
+/// converging on recent samples (newest-wins, §7.6) and caps inbound memory. 16 KiB is
+/// a few dozen motion datagrams of backlog.
+const DATAGRAM_RECV_BUFFER: usize = 16 * 1024;
 
 /// Which end of the interactive connection a peer is — determines who *opens* the
 /// long-lived control stream (the initiator) and who *accepts* it (§6.1). Named
@@ -71,6 +71,7 @@ fn transport_config() -> Result<Arc<TransportConfig>, NetError> {
     cfg.max_idle_timeout(Some(idle));
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
     cfg.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
+    cfg.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
     Ok(Arc::new(cfg))
 }
 
@@ -191,27 +192,14 @@ pub struct InteractiveConnection {
     motion: MotionSender,
 }
 
-/// The long-lived bidi control stream. `recv` holds a persistent buffer so
-/// [`InteractiveConnection::recv_control`] is cancel-safe (A3).
-struct ControlStream {
-    send: Mutex<SendStream>,
-    recv: Mutex<RecvState>,
-}
-
-/// Receive-side state for the control stream: the quinn stream plus bytes read but not
-/// yet consumed as a complete frame. Buffering here (not on the stack of a `recv`
-/// future) is what makes [`InteractiveConnection::recv_control`] cancel-safe (A3): a
-/// dropped recv future leaves already-read bytes intact in `buf`.
-struct RecvState {
-    stream: RecvStream,
-    buf: Vec<u8>,
-}
-
 impl InteractiveConnection {
     /// Establish the control stream eagerly and symmetrically (A2), then start the
     /// keep-newest motion pump (A4).
     async fn establish(connection: Connection, end: ConnectionEnd) -> Result<Self, NetError> {
-        let (send, recv) = match end {
+        // `seed` carries any bytes already read off the recv stream during setup that are
+        // NOT the priming frame, so the first real frame isn't lost (consume_prime
+        // hardening): they pre-fill the persistent recv buffer.
+        let (send, recv, seed) = match end {
             ConnectionEnd::Initiator => {
                 // Open the bidi stream AND write a priming frame so the stream
                 // materializes on the peer's `accept_bi` regardless of who sends first.
@@ -219,31 +207,28 @@ impl InteractiveConnection {
                     .open_bi()
                     .await
                     .map_err(|e| NetError::Connect(e.to_string()))?;
-                let prime = mouser_protocol::encode_frame(TYPE_STREAM_PRIME, 0, &[])
+                let prime = mouser_protocol::encode_frame(control::TYPE_STREAM_PRIME, 0, &[])
                     .map_err(|e| NetError::Frame(e.to_string()))?;
                 send.write_all(&prime)
                     .await
                     .map_err(|e| NetError::Io(e.to_string()))?;
-                (send, recv)
+                (send, recv, Vec::new())
             }
             ConnectionEnd::Acceptor => {
                 let (send, mut recv) = connection
                     .accept_bi()
                     .await
                     .map_err(|e| NetError::Connect(e.to_string()))?;
-                // Consume the initiator's priming frame. This runs once during setup
-                // (never under a `select!`), so a blocking read is fine here.
-                consume_prime(&mut recv).await?;
-                (send, recv)
+                // Consume the initiator's priming frame — but only discard it if it really
+                // is a `TYPE_STREAM_PRIME`. If a peer materialized the stream with a real
+                // first frame instead, keep its bytes so `recv_control` returns it rather
+                // than blind-discarding a real message. Setup-only (never under a
+                // `select!`), so the blocking reads here are fine.
+                let seed = control::consume_prime(&mut recv).await?;
+                (send, recv, seed)
             }
         };
-        let control = ControlStream {
-            send: Mutex::new(send),
-            recv: Mutex::new(RecvState {
-                stream: recv,
-                buf: Vec::new(),
-            }),
-        };
+        let control = ControlStream::new(send, recv, seed);
         let motion = MotionSender::spawn(connection.clone());
         Ok(Self {
             connection,
@@ -272,14 +257,22 @@ impl InteractiveConnection {
 
     /// Send a framed control message (§0.2): `encode_frame(msg_type, 0, payload)` on
     /// the control stream. `payload` is the CBOR body produced by `mouser-protocol`.
+    ///
+    /// **Cancel-safe:** the encoded frame is handed to a dedicated writer task that owns
+    /// the [`SendStream`] and writes one whole frame at a time; this method only enqueues
+    /// the frame and then awaits a oneshot acking that it is fully on the wire. Dropping
+    /// this future (e.g. under a `tokio::select!` / timeout) cannot leave a partial frame:
+    /// the frame is already queued and the writer still flushes it completely, so the next
+    /// frame is never corrupted.
     pub async fn send_control(&self, msg_type: u16, payload: &[u8]) -> Result<(), NetError> {
-        let frame = mouser_protocol::encode_frame(msg_type, 0, payload)
-            .map_err(|e| NetError::Frame(e.to_string()))?;
-        let mut send = self.control.send.lock().await;
-        send.write_all(&frame)
-            .await
-            .map_err(|e| NetError::Io(e.to_string()))?;
-        Ok(())
+        self.control.send(msg_type, payload).await
+    }
+
+    /// The current pointer-motion transport (C2-7 / §6.1). When this reads
+    /// [`MotionPlane::ControlFallback`] the datagram plane is unavailable for this
+    /// connection and the engine must route `PointerMotion` over the control stream.
+    pub fn motion_plane(&self) -> tokio::sync::watch::Receiver<MotionPlane> {
+        self.motion.plane()
     }
 
     /// Receive one framed control message, returning `(msg_type, payload_bytes)` (§0.2).
@@ -288,8 +281,7 @@ impl InteractiveConnection {
     /// a frame is only removed once fully present, so dropping this future (e.g. under a
     /// `tokio::select!` / timeout) never corrupts the framed stream.
     pub async fn recv_control(&self) -> Result<(u16, Vec<u8>), NetError> {
-        let mut recv = self.control.recv.lock().await;
-        recv_frame(&mut recv).await
+        self.control.recv().await
     }
 
     /// Queue a `PointerMotion` for unreliable delivery (§7.6 tag 0x01) through the
@@ -337,95 +329,11 @@ impl InteractiveConnection {
 
 impl Drop for InteractiveConnection {
     fn drop(&mut self) {
+        // Stop the control writer task (its mpsc sender is dropped with `self.control`,
+        // but abort makes teardown immediate and frees the held SendStream).
+        self.control.abort_writer();
         // Best-effort graceful close (H6): tell the peer we're gone so it doesn't have
         // to wait out the idle timeout. quinn flushes the CONNECTION_CLOSE on drop.
         self.connection.close(0u32.into(), b"bye");
     }
-}
-
-/// Read and discard exactly one priming frame from a freshly accepted control stream
-/// (A2). Setup-only and not cancellation-exposed, so `read_exact` is safe here.
-async fn consume_prime(recv: &mut RecvStream) -> Result<(), NetError> {
-    let mut header = [0u8; 8];
-    recv.read_exact(&mut header)
-        .await
-        .map_err(|e| NetError::Io(e.to_string()))?;
-    let (_msg_type, payload_len) = parse_frame_header(&header)?;
-    if payload_len > 0 {
-        let mut payload = vec![0u8; payload_len];
-        recv.read_exact(&mut payload)
-            .await
-            .map_err(|e| NetError::Io(e.to_string()))?;
-    }
-    Ok(())
-}
-
-/// Cancel-safe framed read (A3). Pulls bytes into `state.buf` with individually
-/// cancel-safe `read()` calls and only removes a frame once it is fully buffered, so a
-/// dropped future loses nothing.
-async fn recv_frame(state: &mut RecvState) -> Result<(u16, Vec<u8>), NetError> {
-    // Ensure the 8-byte header is buffered.
-    fill_to(state, 8).await?;
-    let header: [u8; 8] = state
-        .buf
-        .get(0..8)
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| NetError::Frame("short control frame header".to_string()))?;
-    let (msg_type, payload_len) = parse_frame_header(&header)?;
-
-    // Ensure header + payload are buffered, then split off exactly one frame.
-    let frame_len = 8 + payload_len;
-    fill_to(state, frame_len).await?;
-    let mut frame: Vec<u8> = state.buf.drain(0..frame_len).collect();
-    let payload = frame.split_off(8);
-    Ok((msg_type, payload))
-}
-
-/// Read from the stream into `state.buf` until it holds at least `needed` bytes. Each
-/// `read()` is cancel-safe; partial progress is preserved in `state.buf` (A3).
-async fn fill_to(state: &mut RecvState, needed: usize) -> Result<(), NetError> {
-    let mut chunk = [0u8; 4096];
-    while state.buf.len() < needed {
-        match state
-            .stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| NetError::Io(e.to_string()))?
-        {
-            Some(0) | None => {
-                return Err(NetError::Io("control stream closed".to_string()));
-            }
-            Some(n) => {
-                let read = chunk.get(..n).ok_or_else(|| {
-                    NetError::Io("control stream read overran buffer".to_string())
-                })?;
-                state.buf.extend_from_slice(read);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Parse the §0.2 frame header, returning `(msg_type, payload_len)`. Checked slicing
-/// (no panicking index — §0.3): `len: u32 (LE) | type: u16 (LE) | flags: u16 (LE)`.
-fn parse_frame_header(header: &[u8; 8]) -> Result<(u16, usize), NetError> {
-    let len_bytes: [u8; 4] = header
-        .get(0..4)
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| NetError::Frame("short control frame header".to_string()))?;
-    let type_bytes: [u8; 2] = header
-        .get(4..6)
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| NetError::Frame("short control frame header".to_string()))?;
-    let len = u32::from_le_bytes(len_bytes);
-    let msg_type = u16::from_le_bytes(type_bytes);
-    if !(4..=mouser_protocol::MAX_CONTROL_FRAME).contains(&len) {
-        return Err(NetError::Frame(
-            "control frame length out of range".to_string(),
-        ));
-    }
-    // `len` counts the type+flags+payload (header bytes after the length); payload is
-    // that minus the 4-byte type+flags.
-    let payload_len = (len - 4) as usize;
-    Ok((msg_type, payload_len))
 }

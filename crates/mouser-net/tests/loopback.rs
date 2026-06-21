@@ -304,3 +304,119 @@ async fn recv_control_is_cancel_safe_under_timeout() {
     server_conn.close();
     client_conn.close();
 }
+
+/// `send_control` cancel-safety: dropping a `send_control` future (e.g. under a
+/// `tokio::select!`/timeout) must never leave a partial frame on the wire and desync the
+/// long-lived control stream. The writer-task design guarantees a frame, once dequeued,
+/// is written in full; this test stresses that by interleaving **completed** sends with
+/// **cancelled** ones (each wrapped in a `Duration::ZERO` timeout that fires at the ack
+/// await) and asserting the receiver sees frames strictly in order with intact payloads —
+/// and that every *completed* send arrives. A regression (partial write on cancel) would
+/// corrupt the length-prefixing and the next CBOR body would fail to decode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_control_cancel_safe_does_not_corrupt_next_frame() {
+    use std::sync::Arc;
+
+    let server_id = DeviceIdentity::generate();
+    let client_id = DeviceIdentity::generate();
+    let server_device_id = server_id.device_id();
+    let client_device_id = client_id.device_id();
+
+    let server = InteractiveEndpoint::bind_server(
+        &server_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::Pinned(client_device_id),
+    )
+    .expect("bind server");
+    let server_addr = server.local_addr().expect("server addr");
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+
+    let accept = tokio::spawn(async move {
+        let conn = server.accept_interactive().await.expect("accept");
+        (server, conn)
+    });
+    let client_conn = Arc::new(
+        client
+            .connect_interactive(&client_id, server_addr, PinPolicy::Pinned(server_device_id))
+            .await
+            .expect("client connect"),
+    );
+    let (_server_endpoint, server_conn) = accept.await.expect("accept task");
+
+    const N: u64 = 200;
+    // Sender: for each id, attempt the send under a `Duration::ZERO` timeout that cancels
+    // at (or before) the ack await. Track which ids were *confirmed* written (the timeout
+    // resolved `Ok(Ok(()))`); those MUST all arrive. Cancelled ones may or may not arrive,
+    // but if any arrives it must still be intact and in order.
+    let sender_conn = Arc::clone(&client_conn);
+    let sender = tokio::spawn(async move {
+        let mut confirmed = Vec::new();
+        for id in 0..N {
+            let payload = to_cbor(&Ping { id }).expect("encode");
+            match tokio::time::timeout(
+                Duration::ZERO,
+                sender_conn.send_control(TYPE_PING, &payload),
+            )
+            .await
+            {
+                Ok(res) => {
+                    res.expect("confirmed send must not error");
+                    confirmed.push(id);
+                }
+                Err(_) => { /* cancelled at the ack await; frame may still be enqueued */ }
+            }
+            // A real frame after every cancelled one, fully awaited, to force the receiver
+            // to parse across the boundary where a partial-write regression would desync.
+            let payload = to_cbor(&Ping { id: 1_000_000 + id }).expect("encode");
+            sender_conn
+                .send_control(TYPE_PING, &payload)
+                .await
+                .expect("trailing fully-awaited send");
+            confirmed.push(1_000_000 + id);
+        }
+        confirmed
+    });
+
+    // Receiver: read every frame; assert each decodes (no desync) and the fully-awaited
+    // ids never go backwards (in-order, length-prefixing intact). Read until **every
+    // confirmed id** has arrived (cancelled ids may also arrive and interleave — they
+    // must not corrupt the stream, but their count must not let us stop early).
+    let total_expected = sender.await.expect("sender task");
+    let mut outstanding: std::collections::HashSet<u64> = total_expected.iter().copied().collect();
+    let mut last: Option<u64> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !outstanding.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "did not receive all confirmed frames — likely framing desync (cancel-safety regression)"
+        );
+        let (msg_type, body) =
+            tokio::time::timeout(Duration::from_secs(5), server_conn.recv_control())
+                .await
+                .expect("recv did not stall")
+                .expect("recv control (corrupt => framing desync)");
+        assert_eq!(msg_type, TYPE_PING);
+        // A corrupt/partial frame would make this CBOR decode fail.
+        let got: Ping = from_cbor(&body).expect("decode (corrupt => framing desync)");
+        // Trailing fully-awaited ids (>= 1_000_000) are strictly increasing and always
+        // present; use them as the ordering oracle. Cancelled ids interleave but never
+        // corrupt the stream.
+        if got.id >= 1_000_000 {
+            if let Some(prev) = last {
+                assert!(
+                    got.id > prev,
+                    "fully-awaited frames must arrive in order (got {} after {})",
+                    got.id,
+                    prev
+                );
+            }
+            last = Some(got.id);
+        }
+        outstanding.remove(&got.id);
+    }
+
+    // Drain cleanly so the last fully-awaited frame isn't truncated by an abrupt close.
+    client_conn.shutdown().await;
+    server_conn.close();
+}
