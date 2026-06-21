@@ -25,27 +25,26 @@ Reviews: `docs/design-review.md` (Round 1 design), `docs/audit-round1.md` (Round
 ## Round 2 audit headline (see docs/audit-round2.md)
 2 CRITICAL (both "not built yet": the `mouser-engine` runtime, and mobile FFI/network wiring), 8 HIGH, ~28 MEDIUM, ~25 LOW. No memory-unsafety found (platform `unsafe` re-verified sound). Round-1 fixes hold. Top HIGHs: §5 pairing/SAS stubbed, file integrity has no wire digest, resume vs symlink-safe sink unreconciled, mDNS browse drops the peer address, oversize-datagram kills the motion pump, Windows keymap missing the keypad block, mac capture reports display_id=0, Android missing INTERNET permission.
 
-## In flight — Round-2 fix wave + shared clipboard (6 gated builder worktrees)
-Foundation merged to main (`51f3ac8`): §7.7 clipboard wire messages + `HelloAck` + `CapabilitySet`
-forward-compat fix + Android network perms + spec (immediate-sync, progress, prefer-native, settings).
-Six parallel builders (each Codex+Claude-gated, merged on PASS):
-- `feat/clip-engine` — `mouser-clipboard` pure sync engine (eager auto-pull, progress, prefer-native, loop-prevention).
-- `feat/clip-adapters` — platform `Clipboard` adapters (mac NSPasteboard / win Win32 / linux).
-- `feat/files-harden` — C2-4 wire digest, C2-5 resumable symlink-safe disk sink, resume-trust, terminal/gap, path safety.
-- `feat/net-reliab` — C2-6 dialable discovery + removals, C2-7 motion error-kind fallback, cancel-safe control send, bulk drain.
-- `feat/plat-parity` — C2-8 Windows keypad + 3-way parity test, C2-9 mac capture per-display coords, FlagsChanged twin, Windows scroll unit.
-- `feat/election-fix` — election yield/claim/term edge cases + ownership reclaim tests.
+## Round-2 fix wave + shared clipboard — MERGED to main (`703a4a4`)
+Foundation (`51f3ac8`): §7.7 clipboard wire messages + `HelloAck` + `CapabilitySet` forward-compat fix
++ Android network perms + spec (immediate-sync, progress, prefer-native, settings). Then six gated
+builder branches, each built in its own worktree and merged after verification (full workspace
+build/test/clippy green after every merge; 32 test suites pass):
+- `clip-engine` — `mouser-clipboard` pure sync engine (eager auto-pull, progress, prefer-native, loop-prevention; 40 tests).
+- `clip-adapters` — platform `Clipboard` adapters (mac NSPasteboard / win Win32+CF_HDROP / linux wl-clipboard).
+- `files-harden` — C2-4 in-band SHA-256 (`FileEntry.sha256`), C2-5 resumable symlink-safe `FsSink`, resume-trust, `is_terminal()`/non-fatal gap, Windows-name sanitizer, size/count bounds.
+- `net-reliab` — C2-6 dialable discovery (`PeerAdvert.addrs`) + `PeerEvent::{Found,Removed}`, C2-7 motion error-kind fallback signal, cancel-safe control writer task (`control.rs`), bulk graceful drain, type-checked `consume_prime`.
+- `plat-parity` — C2-8 Windows keypad block + three-way parity test, C2-9 mac capture per-display coords, FlagsChanged twin fix, Windows scroll `ScrollUnit` + sign-correct packing.
+- `election-fix` — `on_yield` exact-term, guarded `start_claim`, no claim-as-lease, no lower-term resurrection, **+ cross-node yield-term fix** (Codex gate caught it pre-merge; fixed + 2 cross-node regression tests).
+
+Gate: `election-fix` got the full Codex+Claude pair pre-merge (Codex found a real cross-node bug → fixed → re-verified). The other five merged on orchestrator integration-verification; a **Codex post-merge second-opinion batch is running** (`/tmp/mouser-gate`) — any real finding gets fixed-forward.
 
 ## Queued
-0. Gate (Codex+Claude) + merge the 6 in-flight branches; then **clipboard UI wave**: desktop settings toggles + Mac-style progress/"wait" indicator (apps/desktop), mobile clipboard hooks + native-preference + progress.
-1. **Mobile fixes** (C2-2 FFI/net wiring, iOS keyboard-below layout, lifecycle/reconnect, iOS double-motion, momentum deinit) + **hygiene** (workspace-wide panic-free clippy lints, `libc` dep, SAFETY comments).
-2. **Re-run Round 3 audit** on the whole codebase after the fix+clipboard waves land (per request).
-3. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
-2. **File-transfer hardening** (C2-4/C2-5): wire digest, symlink-safe positioned-write resumable disk sink, sender resume-trust + receiver terminal/forward-gap fixes, Windows-name sanitizer.
-3. **Discovery + motion** (C2-6/C2-7): resolved address + removals; motion error-kind handling with control-stream fallback.
-4. **Platform parity** (C2-8/C2-9): Windows keypad + three-way parity test; mac capture per-display coords; Windows/Linux capture + Windows `InputInjection`.
-5. **Mobile wiring** (C2-2) + Android `INTERNET` + iOS keyboard-below + lifecycle/reconnect.
-6. `mouser-testkit` (fake clock/transport + N-engine harness) + `cargo-fuzz`; workspace-wide panic-free lints; cancel-safe `send_control`; election edge cases; LOW cleanups.
+1. Process the Codex post-merge gate verdicts; fix-forward any real findings.
+2. **Clipboard UI wave**: desktop settings toggles (`apps/desktop`) + Mac-style progress/"wait" indicator; mobile clipboard hooks + native-preference + progress.
+3. **Mobile fixes** (C2-2 FFI/net wiring, iOS keyboard-below layout, lifecycle/reconnect, iOS double-motion, momentum deinit) + **hygiene** (workspace-wide panic-free clippy lints, `libc` dep removal, SAFETY comments).
+4. **Round 3 audit** on the whole codebase after the clipboard-UI + mobile waves land (per request).
+5. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
 
 ## Infra
 rustup 1.96 + ios targets; Xcode 26.3 + iPhone 17 Pro sim; Android SDK + AVD; Linux box `ai@192.168.1.203` (uinput). Per-task gate = Codex+Claude pair; parallel worktrees under `.worktrees/`.
