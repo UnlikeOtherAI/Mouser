@@ -219,8 +219,18 @@ impl InteractiveConnection {
         recv.read_exact(&mut header)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
-        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let msg_type = u16::from_le_bytes([header[4], header[5]]);
+        // Decode the §0.2 header with checked slicing (no panicking index — §0.3
+        // panic-free decode discipline): len: u32 (LE) | type: u16 (LE) | ...
+        let len_bytes: [u8; 4] = header
+            .get(0..4)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| NetError::Frame("short control frame header".to_string()))?;
+        let type_bytes: [u8; 2] = header
+            .get(4..6)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| NetError::Frame("short control frame header".to_string()))?;
+        let len = u32::from_le_bytes(len_bytes);
+        let msg_type = u16::from_le_bytes(type_bytes);
         if !(4..=mouser_protocol::MAX_CONTROL_FRAME).contains(&len) {
             return Err(NetError::Frame(
                 "control frame length out of range".to_string(),
