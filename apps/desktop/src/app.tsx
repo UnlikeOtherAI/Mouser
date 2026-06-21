@@ -1,6 +1,7 @@
 import { useState } from "react";
+import { ClipboardProgress } from "./components/clipboard-progress";
 import { SideNav } from "./components/side-nav";
-import { NAV_ITEMS } from "./lib/mock-data";
+import { MOCK_CLIPBOARD_TRANSFERS, NAV_ITEMS } from "./lib/mock-data";
 import type { SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";
@@ -56,6 +57,7 @@ export function App(): React.JSX.Element {
           {renderSection(active)}
         </div>
       </main>
+      <ClipboardProgress transfers={MOCK_CLIPBOARD_TRANSFERS} />
     </div>
   );
 }
