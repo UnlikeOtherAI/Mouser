@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/mouser-protocol"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/UnlikeOtherAI/Mouser"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
