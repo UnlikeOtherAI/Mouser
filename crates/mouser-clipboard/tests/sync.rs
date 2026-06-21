@@ -5,8 +5,8 @@
 //! prevention, progress reporting, hash-mismatch drop, and the settings gates.
 
 use mouser_clipboard::{
-    content_hash, AppliedClip, ClipboardEngine, ClipboardError, ClipboardSettings, LocalRepr,
-    MemContentSource, SyncDirection, CONTROL_TEXT_CAP, MAX_DATA_CHUNK,
+    content_hash, transport_for, AppliedClip, ClipboardEngine, ClipboardError, ClipboardSettings,
+    LocalRepr, MemContentSource, SyncDirection, Transport, CONTROL_TEXT_CAP, MAX_DATA_CHUNK,
 };
 use mouser_protocol::{ClipFormat, ClipboardData, Os};
 
@@ -466,6 +466,229 @@ fn chunk_count_splits_at_max_data_chunk_boundary() {
     assert_eq!(chunks2[0].data.len(), MAX_DATA_CHUNK);
     assert_eq!(chunks2[1].data.len(), 1);
     assert!(!chunks2[0].last && chunks2[1].last);
+}
+
+#[test]
+fn format_disabled_mid_stream_drops_completed_payload() {
+    // §7.7: the receive gates are re-checked *on apply*. Start a PNG pull, disable the
+    // image gate after the content is in flight, deliver the final chunk — NO clip is
+    // applied (the setting change takes effect before the OS clipboard write).
+    let a = ClipboardEngine::new(dev(1), Os::Linux, ClipboardSettings::default());
+    let mut b = ClipboardEngine::new(dev(2), Os::Windows, ClipboardSettings::default());
+
+    // Multi-chunk PNG so there is an in-flight pull to interrupt.
+    let png = bytes(11, MAX_DATA_CHUNK + 4096);
+    let reps = vec![LocalRepr::new(ClipFormat::Png, png.clone())];
+    let offer = a.on_local_change(&reps).expect("offer");
+    let pull = b.on_offer(&offer, Os::Linux).expect("ok").expect("pull");
+    let chunks = a.on_pull(&pull, &source_for(&reps)).expect("on_pull");
+    assert!(chunks.len() >= 2, "need a multi-chunk pull to interrupt");
+
+    let hash = content_hash(ClipFormat::Png, &png);
+    // Deliver every chunk but the last; the pull is still in flight.
+    for c in &chunks[..chunks.len() - 1] {
+        assert!(b.on_data(c).expect("on_data").is_none());
+    }
+    assert!(b.is_pulling(&hash));
+
+    // The user turns images off mid-stream.
+    b.set_settings(ClipboardSettings {
+        sync_images: false,
+        ..ClipboardSettings::default()
+    });
+
+    // Final chunk arrives: hash verifies, but the gate is now off ⇒ dropped, not applied.
+    let last = &chunks[chunks.len() - 1];
+    assert_eq!(
+        b.on_data(last).expect("on_data ok"),
+        None,
+        "a format disabled mid-stream must drop the completed payload"
+    );
+    // Pending cleared and nothing was tagged applied (no OS write happened).
+    assert!(!b.is_pulling(&hash));
+    assert!(!b.was_applied(&hash));
+}
+
+#[test]
+fn master_off_mid_stream_drops_completed_payload() {
+    // Same as above but the master switch flips off mid-stream (can_receive() == false).
+    let a = ClipboardEngine::new(dev(1), Os::Linux, ClipboardSettings::default());
+    let mut b = ClipboardEngine::new(dev(2), Os::Windows, ClipboardSettings::default());
+    let png = bytes(12, MAX_DATA_CHUNK + 7);
+    let reps = vec![LocalRepr::new(ClipFormat::Png, png.clone())];
+    let offer = a.on_local_change(&reps).expect("offer");
+    let pull = b.on_offer(&offer, Os::Linux).expect("ok").expect("pull");
+    let chunks = a.on_pull(&pull, &source_for(&reps)).expect("on_pull");
+    let hash = content_hash(ClipFormat::Png, &png);
+    for c in &chunks[..chunks.len() - 1] {
+        assert!(b.on_data(c).expect("on_data").is_none());
+    }
+    b.set_settings(ClipboardSettings {
+        shared_clipboard: false,
+        ..ClipboardSettings::default()
+    });
+    assert_eq!(
+        b.on_data(&chunks[chunks.len() - 1]).expect("on_data ok"),
+        None,
+        "master-off mid-stream must drop the completed payload"
+    );
+    assert!(!b.was_applied(&hash));
+}
+
+#[test]
+fn new_offer_supersedes_outstanding_pull_from_same_origin() {
+    // §7.7: "A new Offer supersedes outstanding offers from that origin." Offer A (pull
+    // pending), then a NEW offer B from the same origin O. A's now-stale data must NOT
+    // apply; only B's does.
+    let a = ClipboardEngine::new(dev(1), Os::Linux, ClipboardSettings::default());
+    let mut b = ClipboardEngine::new(dev(2), Os::Windows, ClipboardSettings::default());
+
+    // First clipboard on O.
+    let reps_a = vec![LocalRepr::new(ClipFormat::Utf8Text, b"first copy".to_vec())];
+    let offer_a = a.on_local_change(&reps_a).expect("offer A");
+    let pull_a = b
+        .on_offer(&offer_a, Os::Linux)
+        .expect("ok")
+        .expect("pull A");
+    let hash_a = content_hash(ClipFormat::Utf8Text, b"first copy");
+    assert!(b.is_pulling(&hash_a));
+    // Produce A's data now (the answer is in flight) but DON'T deliver it yet.
+    let chunks_a = a.on_pull(&pull_a, &source_for(&reps_a)).expect("on_pull A");
+
+    // O's clipboard changes ⇒ a new offer B from the SAME origin supersedes A.
+    let reps_b = vec![LocalRepr::new(
+        ClipFormat::Utf8Text,
+        b"second copy".to_vec(),
+    )];
+    let offer_b = a.on_local_change(&reps_b).expect("offer B");
+    let pull_b = b
+        .on_offer(&offer_b, Os::Linux)
+        .expect("ok")
+        .expect("pull B");
+    let hash_b = content_hash(ClipFormat::Utf8Text, b"second copy");
+    // A's pull was dropped (superseded); only B's is in flight now.
+    assert!(!b.is_pulling(&hash_a), "stale same-origin pull superseded");
+    assert!(b.is_pulling(&hash_b));
+
+    // Delivering A's old data must NOT apply (its slot is gone ⇒ UnknownHash).
+    assert_eq!(
+        b.on_data(&chunks_a[0]),
+        Err(ClipboardError::UnknownHash),
+        "superseded data must not apply"
+    );
+    assert!(!b.was_applied(&hash_a));
+
+    // B's data applies normally.
+    let chunks_b = a.on_pull(&pull_b, &source_for(&reps_b)).expect("on_pull B");
+    let mut applied = None;
+    for c in &chunks_b {
+        if let Some(x) = b.on_data(c).expect("on_data B") {
+            applied = Some(x);
+        }
+    }
+    let applied = applied.expect("B applies");
+    assert_eq!(applied.bytes, b"second copy");
+}
+
+#[test]
+fn supersession_keeps_pulls_from_other_origins() {
+    // Supersession is per-origin: a new offer from O must not disturb an in-flight pull
+    // from a different origin P.
+    let o = ClipboardEngine::new(dev(1), Os::Linux, ClipboardSettings::default());
+    let p = ClipboardEngine::new(dev(3), Os::Linux, ClipboardSettings::default());
+    let mut b = ClipboardEngine::new(dev(2), Os::Windows, ClipboardSettings::default());
+
+    let reps_p = vec![LocalRepr::new(ClipFormat::Utf8Text, b"from P".to_vec())];
+    let offer_p = p.on_local_change(&reps_p).expect("offer P");
+    let _pull_p = b
+        .on_offer(&offer_p, Os::Linux)
+        .expect("ok")
+        .expect("pull P");
+    let hash_p = content_hash(ClipFormat::Utf8Text, b"from P");
+    assert!(b.is_pulling(&hash_p));
+
+    // A new offer from O supersedes only O's (none here) — P's pull survives.
+    let reps_o = vec![LocalRepr::new(ClipFormat::Utf8Text, b"from O".to_vec())];
+    let offer_o = o.on_local_change(&reps_o).expect("offer O");
+    let _pull_o = b
+        .on_offer(&offer_o, Os::Linux)
+        .expect("ok")
+        .expect("pull O");
+    assert!(b.is_pulling(&hash_p), "other-origin pull must survive");
+}
+
+#[test]
+fn small_png_routes_bulk_while_small_text_routes_control() {
+    // §7.7 routing is format-aware: a small PNG is bulk-destined (NOT a control one-shot)
+    // even though it fits the control cap, while small text rides the control stream.
+    let small = 4096usize;
+    assert!(small < CONTROL_TEXT_CAP, "the PNG must fit the control cap");
+
+    // The routing authority (transport_for) is the observable distinction: same small
+    // size, different plane purely because of the format.
+    assert_eq!(
+        transport_for(ClipFormat::Png, small),
+        Transport::Bulk,
+        "a small PNG is bulk-destined, never a control one-shot"
+    );
+    assert_eq!(
+        transport_for(ClipFormat::Utf8Text, small),
+        Transport::Control,
+        "small text rides the control stream"
+    );
+    // PNG is bulk even at exactly the cap; binary never one-shots.
+    assert_eq!(
+        transport_for(ClipFormat::Png, CONTROL_TEXT_CAP),
+        Transport::Bulk
+    );
+    // Text only one-shots up to the cap; over it goes bulk.
+    assert_eq!(
+        transport_for(ClipFormat::Html, CONTROL_TEXT_CAP),
+        Transport::Control
+    );
+    assert_eq!(
+        transport_for(ClipFormat::Html, CONTROL_TEXT_CAP + 1),
+        Transport::Bulk
+    );
+
+    // End-to-end: the small PNG still produces verifiable bulk chunks that round-trip.
+    let a = ClipboardEngine::new(dev(1), Os::Linux, ClipboardSettings::default());
+    let mut b = ClipboardEngine::new(dev(2), Os::Windows, ClipboardSettings::default());
+    let png = bytes(21, small);
+    let reps_png = vec![LocalRepr::new(ClipFormat::Png, png.clone())];
+    let offer = a.on_local_change(&reps_png).expect("offer png");
+    let pull = b
+        .on_offer(&offer, Os::Linux)
+        .expect("ok")
+        .expect("pull png");
+    let chunks = a
+        .on_pull(&pull, &source_for(&reps_png))
+        .expect("on_pull png");
+    assert_eq!(chunks[0].offset, 0);
+    assert!(chunks[chunks.len() - 1].last);
+    let mut applied = None;
+    for c in &chunks {
+        if let Some(x) = b.on_data(c).expect("on_data") {
+            applied = Some(x);
+        }
+    }
+    let applied = applied.expect("small png applies");
+    assert_eq!(applied.format, ClipFormat::Png);
+    assert_eq!(applied.bytes, png);
+
+    // Small text still rides as a single one-shot control message (unchanged behavior).
+    let mut b2 = ClipboardEngine::new(dev(4), Os::Windows, ClipboardSettings::default());
+    let reps_txt = vec![LocalRepr::new(ClipFormat::Utf8Text, b"tiny".to_vec())];
+    let offer_t = a.on_local_change(&reps_txt).expect("offer txt");
+    let pull_t = b2
+        .on_offer(&offer_t, Os::Linux)
+        .expect("ok")
+        .expect("pull txt");
+    let chunks_t = a
+        .on_pull(&pull_t, &source_for(&reps_txt))
+        .expect("on_pull txt");
+    assert_eq!(chunks_t.len(), 1);
+    assert!(chunks_t[0].last && chunks_t[0].offset == 0);
 }
 
 #[test]
