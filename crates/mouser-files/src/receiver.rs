@@ -50,22 +50,36 @@ pub enum Outbound {
     Done(FileDone),
 }
 
-/// Static configuration for a receiver: where files land and the (optional) expected
-/// per-file digests for the integrity gate.
+/// Static configuration for a receiver: where files land, the (optional) expected
+/// per-file digests for the integrity gate, and the admission bounds that cap how much
+/// an untrusted offer can ask the receiver to write (audit R2 — unbounded-disk DoS).
 pub struct ReceiverConfig {
     /// Directory every received file is confined to (§7.8 quarantine).
     pub quarantine: PathBuf,
     /// Optional expected SHA-256 per file index. `None` ⇒ size-only completion check.
+    /// An in-band `FileEntry.sha256` from the offer fills any `None` slot (C2-4); an
+    /// out-of-band value supplied here takes precedence and must match if both are set.
     pub expected_hashes: Vec<Option<Hash>>,
+    /// Max bytes any single offered file may declare. `None` ⇒ unbounded.
+    pub max_file_size: Option<u64>,
+    /// Max number of files a single offer may list. `None` ⇒ unbounded.
+    pub max_files: Option<usize>,
+    /// Max total bytes (sum of all files' `size`) a single offer may declare. `None` ⇒
+    /// unbounded.
+    pub max_total_bytes: Option<u64>,
 }
 
 impl ReceiverConfig {
-    /// Quarantine-only config (no expected hashes — completion gates on size alone).
+    /// Quarantine-only config (no expected hashes, no admission bounds — completion gates
+    /// on size alone). Add bounds with [`ReceiverConfig::with_limits`] for untrusted peers.
     #[must_use]
     pub fn new(quarantine: PathBuf) -> Self {
         Self {
             quarantine,
             expected_hashes: Vec::new(),
+            max_file_size: None,
+            max_files: None,
+            max_total_bytes: None,
         }
     }
 
@@ -73,6 +87,22 @@ impl ReceiverConfig {
     #[must_use]
     pub fn with_expected_hashes(mut self, hashes: Vec<Option<Hash>>) -> Self {
         self.expected_hashes = hashes;
+        self
+    }
+
+    /// Set the admission bounds (any `None` leaves that dimension unbounded). Checked in
+    /// [`Receiver::accept_offer`] *before* any sink is opened; an offer that exceeds a
+    /// bound is rejected with a `FileReject` and opens nothing.
+    #[must_use]
+    pub fn with_limits(
+        mut self,
+        max_file_size: Option<u64>,
+        max_files: Option<usize>,
+        max_total_bytes: Option<u64>,
+    ) -> Self {
+        self.max_file_size = max_file_size;
+        self.max_files = max_files;
+        self.max_total_bytes = max_total_bytes;
         self
     }
 }
@@ -106,8 +136,10 @@ impl<S: FileSink> Receiver<S> {
     /// resume offer is already complete (the held prefix satisfies every file) a terminal
     /// `FileDone` follows the `FileAccept` in the returned vector.
     ///
-    /// `make_sink` is where disk-backed receivers open the quarantine file (with
-    /// `create_new`, never following a symlink).
+    /// `make_sink` is where disk-backed receivers open the quarantine file (see
+    /// [`crate::fs_sink::FsSink`], which `lstat`s and refuses a pre-existing symlink). It
+    /// is only invoked after *every* file passes validation, so a rejected offer never
+    /// leaves a half-opened sink behind.
     pub fn accept_offer<F>(
         offer: &FileOffer,
         config: ReceiverConfig,
@@ -119,54 +151,59 @@ impl<S: FileSink> Receiver<S> {
         if offer.files.is_empty() {
             return Err(FileError::Protocol("offer lists no files".into()));
         }
-        let mut slots = Vec::with_capacity(offer.files.len());
-        let mut resume = Vec::new();
+        let reject = |reason: String| {
+            Ok((
+                Self::aborted(offer.transfer_id, config.quarantine.clone()),
+                vec![Outbound::Reject(FileReject {
+                    transfer_id: offer.transfer_id,
+                    reason,
+                })],
+            ))
+        };
 
+        // VALIDATE EVERYTHING before opening a single sink: admission bounds, then each
+        // file's name safety + integrity digest. A reject here opens (and leaves behind)
+        // nothing on disk (audit R2 — DoS bound + no orphan sinks on a rejected offer).
+        if let Some(reason) = check_limits(offer, &config) {
+            return reject(reason);
+        }
+        let mut plans = Vec::with_capacity(offer.files.len());
         for (i, entry) in offer.files.iter().enumerate() {
-            // Path safety FIRST — before any sink/disk touch. A bad name rejects the
-            // whole transfer rather than silently renaming (defence over convenience).
-            let safe_path = match resolve_in_quarantine(&config.quarantine, &entry.name) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Ok((
-                        Self::aborted(offer.transfer_id, config.quarantine),
-                        vec![Outbound::Reject(FileReject {
-                            transfer_id: offer.transfer_id,
-                            reason: format!("unsafe file name: {e}"),
-                        })],
-                    ));
-                }
-            };
+            match validate_entry(i, entry, &config) {
+                Ok(plan) => plans.push(plan),
+                Err(reason) => return reject(reason),
+            }
+        }
+
+        // Only now open the sinks (one per validated file) and read resume offsets.
+        let mut slots = Vec::with_capacity(plans.len());
+        let mut resume = Vec::new();
+        for (i, (safe_path, expected)) in plans.into_iter().enumerate() {
+            let entry = offer.files.get(i).ok_or(FileError::UnknownFileIndex(
+                u32::try_from(i).unwrap_or(u32::MAX),
+            ))?;
             let sink = make_sink(i, &safe_path)?;
             // A partial file LONGER than the declared `size` is corruption/mismatch (the
             // prefix on disk disagrees with what's being offered). Reject the transfer
             // rather than clamp to `size` and accept a too-long prefix as a clean resume.
             let existing = sink.existing_len();
             if existing > entry.size {
-                return Ok((
-                    Self::aborted(offer.transfer_id, config.quarantine),
-                    vec![Outbound::Reject(FileReject {
-                        transfer_id: offer.transfer_id,
-                        reason: format!(
-                            "file {i}: existing {existing} bytes exceed offered size {}",
-                            entry.size
-                        ),
-                    })],
+                return reject(format!(
+                    "file {i}: existing {existing} bytes exceed offered size {}",
+                    entry.size
                 ));
             }
-            let have = existing;
-            if have > 0 {
+            if existing > 0 {
                 let file_index = u32::try_from(i)
                     .map_err(|_| FileError::Protocol("file_index overflow".into()))?;
                 resume.push(ResumePoint {
                     file_index,
-                    offset: have,
+                    offset: existing,
                 });
             }
-            let expected = config.expected_hashes.get(i).copied().flatten();
             slots.push(Slot {
                 size: entry.size,
-                acked: have,
+                acked: existing,
                 complete: false,
                 sink,
                 expected,
@@ -230,13 +267,12 @@ impl<S: FileSink> Receiver<S> {
             })]);
         }
 
-        let end = chunk
-            .offset
-            .checked_add(chunk.data.len() as u64)
-            .ok_or(FileError::OffsetOutOfRange {
+        let end = chunk.offset.checked_add(chunk.data.len() as u64).ok_or(
+            FileError::OffsetOutOfRange {
                 file_index: chunk.file_index,
                 offset: chunk.offset,
-            })?;
+            },
+        )?;
         if end > slot.size {
             return Err(FileError::OffsetOutOfRange {
                 file_index: chunk.file_index,
@@ -245,29 +281,34 @@ impl<S: FileSink> Receiver<S> {
         }
 
         // Reliable+ordered per-transfer stream ⇒ chunks arrive in order. A chunk wholly
-        // at/below the ack point is a benign retransmit (drop, re-ack); a forward gap is
-        // a protocol violation on this transport.
-        if chunk.offset < slot.acked {
+        // at/below the ack point is a benign retransmit; a forward gap (`offset > acked`)
+        // is a sender that got ahead of us. Neither is fatal: re-ack the contiguous prefix
+        // we actually hold so the sender rewinds and retransmits from there (audit R2 —
+        // a forward gap must NOT tear the connection down).
+        if chunk.offset != slot.acked {
             return Ok(vec![Outbound::Ack(FileAck {
                 transfer_id: self.transfer_id,
                 file_index: chunk.file_index,
                 acked_through: slot.acked,
             })]);
         }
-        if chunk.offset > slot.acked {
-            return Err(FileError::OffsetOutOfRange {
-                file_index: chunk.file_index,
-                offset: chunk.offset,
-            });
-        }
 
-        slot.sink.write_at(slot.acked, &chunk.data)?;
-        slot.acked = end;
+        // A sink write failure is not recoverable for this file: abort the transfer and
+        // tell the peer on the wire (`FileDone{ok:false}`) rather than swallowing it or
+        // tearing the connection down (audit R2 — same terminal path as a hash mismatch).
+        let wrote = slot.sink.write_at(slot.acked, &chunk.data);
+        if wrote.is_ok() {
+            slot.acked = end;
+        }
+        // The `slot` borrow ends here, freeing `self` for `abort`/`finalize` calls.
+        if wrote.is_err() {
+            return Ok(vec![Outbound::Done(self.abort())]);
+        }
 
         let mut out = vec![Outbound::Ack(FileAck {
             transfer_id: self.transfer_id,
             file_index: chunk.file_index,
-            acked_through: slot.acked,
+            acked_through: end,
         })];
         if let Some(done) = self.finalize_completed_files()? {
             out.push(Outbound::Done(done));
@@ -350,4 +391,73 @@ impl<S: FileSink> Receiver<S> {
     pub fn is_aborted(&self) -> bool {
         self.aborted
     }
+
+    /// Whether this receiver has reached a terminal state — either every file completed
+    /// (`is_complete`) or the transfer aborted (`is_aborted`). A driver loops until this
+    /// is true so an aborted transfer doesn't spin forever (audit R2).
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.is_complete() || self.is_aborted()
+    }
+}
+
+/// Validate one offered file *without touching disk*: resolve its name inside the
+/// quarantine dir and settle its expected integrity digest. Returns the safe path and the
+/// digest to verify on completion, or `Err(reason)` (turned into a `FileReject`).
+///
+/// Digest precedence (C2-4): an out-of-band hash from the config wins; otherwise the
+/// offer's in-band `FileEntry.sha256` is adopted so completion is verified end-to-end. A
+/// malformed in-band digest (not 32 bytes) or one that disagrees with an out-of-band hash
+/// is rejected.
+fn validate_entry(
+    i: usize,
+    entry: &mouser_protocol::FileEntry,
+    config: &ReceiverConfig,
+) -> Result<(PathBuf, Option<Hash>), String> {
+    let safe_path = resolve_in_quarantine(&config.quarantine, &entry.name)
+        .map_err(|e| format!("unsafe file name: {e}"))?;
+    let out_of_band = config.expected_hashes.get(i).copied().flatten();
+    let in_band = match entry.sha256.as_deref().map(Hash::try_from) {
+        None => None,
+        Some(Ok(h)) => Some(h),
+        Some(Err(_)) => return Err(format!("file {i}: sha256 must be 32 bytes")),
+    };
+    if let (Some(a), Some(b)) = (out_of_band, in_band) {
+        if a != b {
+            return Err(format!("file {i}: offered sha256 disagrees with expected"));
+        }
+    }
+    Ok((safe_path, out_of_band.or(in_band)))
+}
+
+/// Check the offer against the config's admission bounds. Returns `Some(reason)` for the
+/// first violated bound (the receiver turns it into a `FileReject`), or `None` if the
+/// offer is admissible. Pure; touches no disk and opens no sink.
+fn check_limits(offer: &FileOffer, config: &ReceiverConfig) -> Option<String> {
+    if let Some(max) = config.max_files {
+        if offer.files.len() > max {
+            return Some(format!(
+                "offer lists {} files, exceeds max {max}",
+                offer.files.len()
+            ));
+        }
+    }
+    let mut total: u64 = 0;
+    for (i, entry) in offer.files.iter().enumerate() {
+        if let Some(max) = config.max_file_size {
+            if entry.size > max {
+                return Some(format!(
+                    "file {i}: size {} exceeds max file size {max}",
+                    entry.size
+                ));
+            }
+        }
+        total = total.saturating_add(entry.size);
+    }
+    if let Some(max) = config.max_total_bytes {
+        if total > max {
+            return Some(format!("total size {total} exceeds max {max}"));
+        }
+    }
+    None
 }

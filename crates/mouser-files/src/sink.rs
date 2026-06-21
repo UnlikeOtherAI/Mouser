@@ -6,9 +6,11 @@
 //! - [`FileSink`] — the **receiver** side: append validated contiguous bytes and, on
 //!   completion, report the SHA-256 of everything written (the integrity oracle).
 //!
-//! A real receiver sink opens its quarantine file with `create_new` so it never
-//! follows a pre-existing symlink (the on-disk half of §7.8's "no symlink follow";
-//! [`crate::path`] handles the name half purely).
+//! The production disk-backed implementation is [`crate::fs_sink::FsSink`]: it `lstat`s
+//! the target and refuses a pre-existing symlink (the on-disk half of §7.8's "no symlink
+//! follow"), writes at the chunk `offset` so resume/retransmit land correctly, and rolls
+//! a streaming SHA-256 it never re-reads the file to compute. [`crate::path`] handles the
+//! name-sanitization half purely, before the sink is ever opened.
 
 /// An I/O failure from a [`FileSource`] or [`FileSink`]. Kept stringly-typed so any
 /// backing store (memory, `std::fs`, a future async file) maps cleanly without leaking
