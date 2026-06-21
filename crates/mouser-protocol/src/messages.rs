@@ -4,12 +4,21 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::{AckStatus, ClipFormat};
+
 /// `[02] HelloAck` envelope type.
 pub const TYPE_HELLO_ACK: u16 = 0x02;
 /// `[04] BulkHello` envelope type (§7.1, §5 step 5).
 pub const TYPE_BULK_HELLO: u16 = 0x04;
 /// `[05] Ping` envelope type.
 pub const TYPE_PING: u16 = 0x05;
+
+/// `[50] ClipboardOffer` envelope type (§7.7).
+pub const TYPE_CLIPBOARD_OFFER: u16 = 0x50;
+/// `[51] ClipboardPull` envelope type (§7.7).
+pub const TYPE_CLIPBOARD_PULL: u16 = 0x51;
+/// `[52] ClipboardData` envelope type (§7.7).
+pub const TYPE_CLIPBOARD_DATA: u16 = 0x52;
 
 /// `[60] FileOffer` envelope type (§7.8).
 pub const TYPE_FILE_OFFER: u16 = 0x60;
@@ -42,6 +51,16 @@ pub struct BulkHello {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ping {
     pub id: u64,
+}
+
+/// `[02] HelloAck { status: AckStatus, reason?: str }` (§7.1) — the response to a
+/// `Hello`: `status` accepts/rejects/defers the session; `reason` is an optional
+/// human-readable note (present on reject/pending). `reason` is omitted when `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloAck {
+    pub status: AckStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One advertised file inside a [`FileOffer`] (§7.8): a sanitized-on-receipt `name`
@@ -112,4 +131,56 @@ pub struct FileAck {
 pub struct FileDone {
     pub transfer_id: u64,
     pub ok: bool,
+}
+
+/// One advertised clipboard representation inside a [`ClipboardOffer`] (§7.7): a
+/// `format`, the content `hash` (`SHA-256(canonical(format, bytes))`, the pull/dedup
+/// key and integrity check), and the total `size` in bytes (bounds the transfer and
+/// drives the progress indicator). `hash` encodes as a CBOR byte string (§0.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardEntry {
+    pub format: ClipFormat,
+    #[serde(with = "serde_bytes")]
+    pub hash: Vec<u8>,
+    pub size: u64,
+}
+
+/// `[50] ClipboardOffer { entries, origin }` (§7.7). Broadcast on the control stream
+/// when the local clipboard changes: it advertises every available representation so a
+/// peer can pull the one it wants. `origin` is the offering device's `device_id`; a
+/// locally-applied `(origin, hash)` is not re-offered (loop prevention). A new offer
+/// supersedes outstanding offers from the same origin. `origin` is a CBOR byte string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardOffer {
+    pub entries: Vec<ClipboardEntry>,
+    #[serde(with = "serde_bytes")]
+    pub origin: Vec<u8>,
+}
+
+/// `[51] ClipboardPull { hash, format }` (§7.7). A peer requests the bytes of one
+/// offered representation (by `hash`+`format`). With immediate-sync enabled, receivers
+/// auto-pull on offer so content is already in flight before the user pastes; the
+/// `hash` is a CBOR byte string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardPull {
+    #[serde(with = "serde_bytes")]
+    pub hash: Vec<u8>,
+    pub format: ClipFormat,
+}
+
+/// `[52] ClipboardData { hash, format, offset, data, last }` (§7.7). Carries clipboard
+/// bytes for a pulled `hash`. Small text formats ride the interactive control stream as
+/// a single message (`offset = 0`, `last = true`); `png`/over-cap payloads ride the bulk
+/// connection as ordered chunks (`data` ≤ 1 MiB, `offset` = byte offset, `last` on the
+/// final chunk). The puller verifies the reassembled bytes against `hash`. `hash`/`data`
+/// encode as CBOR byte strings (§0.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardData {
+    #[serde(with = "serde_bytes")]
+    pub hash: Vec<u8>,
+    pub format: ClipFormat,
+    pub offset: u64,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub last: bool,
 }

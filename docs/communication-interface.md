@@ -270,7 +270,37 @@ or any payload over the control cap rides the **bulk** connection on its own per
 chunks (`offset` = byte offset, `data` ≤ 1 MiB per chunk, `last = true` on the final chunk; the offer's
 `size` bounds the total). A new Offer supersedes outstanding offers from
 that origin; locally-applied clipboard is tagged `(origin,hash)` and not re-offered (loop prevention).
-Gated by mode (off/text-only/full) + permission. `ClipFormat` values in Appendix C.
+`ClipFormat` values in Appendix C.
+
+**Immediate sync (eager auto-pull).** When *shared clipboard* is enabled, a receiver does **not** wait
+for the user to paste: on receiving an `Offer` it immediately issues a `ClipboardPull` for the best
+representation it accepts (preference order, e.g. `png` > `rtf`/`html` > `utf8_text` for an image copy;
+`utf8_text` for text), so the content is *already in flight* before paste. Small text payloads arrive in one
+control-stream `ClipboardData` (instantly pasteable). Large payloads (`png`, anything over the control cap)
+stream over the bulk plane.
+
+**Progress / "wait" indicator.** For any representation that streams over the bulk plane, the receiver knows
+the total from the offer's `size` and reports progress (`acked = Σ data.len()` ÷ `size`) so the UI can show a
+Mac-style progress/wait indicator ("Pasting from <device>…") until `last = true` arrives and the hash
+verifies. Until then the local clipboard for that `hash` is *pending*; a paste attempt blocks on (or shows)
+that indicator rather than pasting partial bytes. A failed/aborted pull clears the pending state and the
+indicator shows the error.
+
+**Prefer-native between Apple devices.** When the *Prefer native clipboard on Apple devices* setting is on
+(default), Mouser **suppresses** its own clipboard sync for any peer pair that is both Apple
+(`os ∈ {macos, ios}` on **both** ends) and lets the OS Universal Clipboard (Handoff/Continuity) carry it —
+no `Offer`/`Pull` is exchanged with that peer, avoiding double-paste/conflicts. Suppression is **per peer
+pair**, not global: in a `macos + ios + windows` cluster, `macos↔ios` uses native while `macos↔windows` and
+`ios↔windows` still use Mouser. The owner advertises `os` at handshake (§7.1), so each side computes the
+rule symmetrically.
+
+**Settings (all in the Clipboard section; replicated per device, not cluster-wide).**
+`shared_clipboard` (master on/off) · `sync_text` · `sync_images` · `sync_files` (per-format gates) ·
+`max_auto_sync_bytes` (skip eager-pull above this; 0 = unlimited) · `prefer_native_apple` (default on) ·
+`direction` (bidirectional | send-only | receive-only). With the master off, no `Offer` is sent and inbound
+offers are ignored. These map to the legacy gate `mode (off/text-only/full)` and are enforced **on send**
+(don't offer a disabled format) **and on receipt** (don't pull/apply a disabled format), in core, before any
+platform clipboard write (§9).
 
 ### 7.8 File transfer (bulk connection)
 ```

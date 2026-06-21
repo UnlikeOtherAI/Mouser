@@ -28,7 +28,9 @@ pub use framing::{
     MAX_BULK_FRAME, MAX_CONTROL_FRAME,
 };
 pub use messages::{
-    BulkHello, FileAccept, FileAck, FileChunk, FileDone, FileEntry, FileOffer, FileReject, Ping,
-    ResumePoint, TYPE_BULK_HELLO, TYPE_FILE_ACCEPT, TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE,
-    TYPE_FILE_OFFER, TYPE_FILE_REJECT, TYPE_HELLO_ACK, TYPE_PING,
+    BulkHello, ClipboardData, ClipboardEntry, ClipboardOffer, ClipboardPull, FileAccept, FileAck,
+    FileChunk, FileDone, FileEntry, FileOffer, FileReject, HelloAck, Ping, ResumePoint,
+    TYPE_BULK_HELLO, TYPE_CLIPBOARD_DATA, TYPE_CLIPBOARD_OFFER, TYPE_CLIPBOARD_PULL,
+    TYPE_FILE_ACCEPT, TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE, TYPE_FILE_OFFER,
+    TYPE_FILE_REJECT, TYPE_HELLO_ACK, TYPE_PING,
 };

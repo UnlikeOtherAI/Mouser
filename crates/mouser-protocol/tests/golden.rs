@@ -3,11 +3,12 @@
 
 use mouser_protocol::{
     decode_datagram, decode_frame, encode_frame, encode_motion, encode_motion_rel, from_cbor,
-    to_cbor, AckStatus, BlockedReason, CapState, Capability, CapabilitySet, ClipFormat, Datagram,
-    FileAccept, FileAck, FileChunk, FileDone, FileEntry, FileOffer, FileReject, FocusKind,
-    GoodbyeReason, NotifyKind, Os, Ping, PointerMode, PointerMotion, PointerMotionRel, ResumePoint,
-    Role, ScrollUnit, TransferReason, TAG_POINTER_MOTION, TAG_POINTER_MOTION_REL, TYPE_FILE_CHUNK,
-    TYPE_PING,
+    to_cbor, AckStatus, BlockedReason, CapState, Capability, CapabilitySet, ClipFormat,
+    ClipboardData, ClipboardEntry, ClipboardOffer, ClipboardPull, Datagram, FileAccept, FileAck,
+    FileChunk, FileDone, FileEntry, FileOffer, FileReject, FocusKind, GoodbyeReason, HelloAck,
+    NotifyKind, Os, Ping, PointerMode, PointerMotion, PointerMotionRel, ResumePoint, Role,
+    ScrollUnit, TransferReason, TAG_POINTER_MOTION, TAG_POINTER_MOTION_REL, TYPE_CLIPBOARD_DATA,
+    TYPE_FILE_CHUNK, TYPE_PING,
 };
 use std::collections::BTreeSet;
 
@@ -299,4 +300,112 @@ fn file_chunk_golden_vector_encodes_data_as_byte_string() {
     assert_eq!(decoded.msg_type, TYPE_FILE_CHUNK);
     let round: FileChunk = from_cbor(decoded.payload).expect("decode");
     assert_eq!(round, chunk);
+}
+
+#[test]
+fn clipboard_messages_round_trip() {
+    // §7.7: Offer/Pull/Data all survive a CBOR encode/decode round-trip.
+    let offer = ClipboardOffer {
+        entries: vec![
+            ClipboardEntry {
+                format: ClipFormat::Utf8Text,
+                hash: vec![0xAB; 32],
+                size: 11,
+            },
+            ClipboardEntry {
+                format: ClipFormat::Png,
+                hash: vec![0xCD; 32],
+                size: 4_000_000,
+            },
+        ],
+        origin: vec![0x01; 32],
+    };
+    let back: ClipboardOffer = from_cbor(&to_cbor(&offer).expect("enc")).expect("dec");
+    assert_eq!(back, offer);
+
+    let pull = ClipboardPull {
+        hash: vec![0xCD; 32],
+        format: ClipFormat::Png,
+    };
+    let back: ClipboardPull = from_cbor(&to_cbor(&pull).expect("enc")).expect("dec");
+    assert_eq!(back, pull);
+
+    let data = ClipboardData {
+        hash: vec![0xCD; 32],
+        format: ClipFormat::Utf8Text,
+        offset: 0,
+        data: b"hello world".to_vec(),
+        last: true,
+    };
+    let back: ClipboardData = from_cbor(&to_cbor(&data).expect("enc")).expect("dec");
+    assert_eq!(back, data);
+}
+
+#[test]
+fn clipboard_data_encodes_payload_as_byte_string() {
+    // §0.1: `data` (and `hash`) are CBOR **byte strings**, not arrays of ints. The
+    // decisive bytes are `data` = `0x44 DE AD BE EF` (0x44 = byte-string of length 4).
+    let data = ClipboardData {
+        hash: vec![0x00; 4],
+        format: ClipFormat::Png,
+        offset: 0,
+        data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        last: true,
+    };
+    let encoded = to_cbor(&data).expect("encode");
+    // The 4-byte payload must appear as `0x44 DE AD BE EF` somewhere in the encoding.
+    let needle = [0x44, 0xDE, 0xAD, 0xBE, 0xEF];
+    assert!(
+        encoded.windows(needle.len()).any(|w| w == needle),
+        "ClipboardData.data must encode as a CBOR byte string (§0.1)"
+    );
+    // And it frames + deframes through the §0.2 envelope.
+    let frame = encode_frame(TYPE_CLIPBOARD_DATA, 0, &encoded).expect("frame");
+    let (decoded, consumed) = decode_frame(&frame).expect("deframe");
+    assert_eq!(consumed, frame.len());
+    assert_eq!(decoded.msg_type, TYPE_CLIPBOARD_DATA);
+    let round: ClipboardData = from_cbor(decoded.payload).expect("decode");
+    assert_eq!(round, data);
+}
+
+#[test]
+fn hello_ack_round_trips_with_and_without_reason() {
+    // §7.1: `reason` is optional and omitted when None.
+    let accepted = HelloAck {
+        status: AckStatus::Accepted,
+        reason: None,
+    };
+    let back: HelloAck = from_cbor(&to_cbor(&accepted).expect("enc")).expect("dec");
+    assert_eq!(back, accepted);
+
+    let rejected = HelloAck {
+        status: AckStatus::Rejected,
+        reason: Some("untrusted device".into()),
+    };
+    let back: HelloAck = from_cbor(&to_cbor(&rejected).expect("enc")).expect("dec");
+    assert_eq!(back, rejected);
+}
+
+#[test]
+fn capability_set_drops_unknown_and_out_of_range_members() {
+    // §0.1/§2 forward-compat: an unrecognized, out-of-`u16`, or negative member is
+    // **dropped**, never an error. Build the CBOR array [0, 1, 2, 99, 65536, -1] and
+    // assert it decodes to exactly {Keyboard, Mouse, Clipboard}.
+    let raw: Vec<i128> = vec![0, 1, 2, 99, 65536, -1];
+    let bytes = to_cbor(&raw).expect("encode array");
+    let set: CapabilitySet = from_cbor(&bytes).expect("forward-compat set decode");
+    let expected: BTreeSet<Capability> =
+        [Capability::Keyboard, Capability::Mouse, Capability::Clipboard]
+            .into_iter()
+            .collect();
+    assert_eq!(set.0, expected);
+}
+
+#[test]
+fn capability_set_rejects_non_integer_member() {
+    // A non-integer member is malformed (§0.1) — decode errors (distinct from an unknown
+    // integer, which is dropped above). Array ["x"] = 0x81 0x61 0x78.
+    let bytes = [0x81, 0x61, 0x78];
+    let r: Result<CapabilitySet, _> = from_cbor(&bytes);
+    assert!(r.is_err(), "non-integer capability member must error");
 }

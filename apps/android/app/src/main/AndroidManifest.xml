@@ -4,6 +4,15 @@
     <!-- Vibrator access for click/scroll-detent haptics (Haptics.kt). -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Required to open any socket to a peer (QUIC over UDP); without INTERNET the
+         OS throws SecurityException on socket creation (audit C2-10). NETWORK_STATE
+         is used for connectivity/liveness; the *_WIFI_MULTICAST_STATE lock is needed
+         to receive mDNS (_mouser._udp) multicast for peer discovery (§4). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"

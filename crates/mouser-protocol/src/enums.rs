@@ -180,10 +180,25 @@ impl serde::Serialize for CapabilitySet {
 
 impl<'de> serde::Deserialize<'de> for CapabilitySet {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Vec::<u16>::deserialize(deserializer)?;
-        Ok(CapabilitySet(
-            raw.into_iter().filter_map(Capability::from_u16).collect(),
-        ))
+        // §0.1/§2: an unrecognized member is **dropped**, never an error. Decode each
+        // element as a wide `i128` (like the scalar enums, H7) so a discriminant outside
+        // `u16` or a negative one maps to "unknown → drop" instead of failing the whole
+        // set; only a non-integer member is malformed and errors.
+        let raw = Vec::<ciborium::value::Value>::deserialize(deserializer)?;
+        let mut set = BTreeSet::new();
+        for value in raw {
+            // A non-integer member is malformed (§0.1 requires integer discriminants);
+            // an out-of-`u16`/negative/unknown-but-in-range integer is dropped.
+            let n = value.as_integer().map(i128::from).ok_or_else(|| {
+                <D::Error as serde::de::Error>::custom("capability discriminant must be an integer")
+            })?;
+            if let Ok(u) = u16::try_from(n) {
+                if let Some(cap) = Capability::from_u16(u) {
+                    set.insert(cap);
+                }
+            }
+        }
+        Ok(CapabilitySet(set))
     }
 }
 
