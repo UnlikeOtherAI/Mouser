@@ -34,8 +34,9 @@
 //!   size limit, and direction are enforced **on send** *and* **on receipt**.
 //!
 //! [`mouser-files`]: https://docs.rs/mouser-files
-
-#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+//!
+//! The runtime path is panic-free: `[workspace.lints.clippy]` denies
+//! `unwrap_used`/`panic`/`indexing_slicing` crate-wide.
 
 pub mod canonical;
 pub mod engine;

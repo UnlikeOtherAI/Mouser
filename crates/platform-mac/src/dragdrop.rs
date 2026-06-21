@@ -95,6 +95,9 @@ define_class!(
 impl MouserDragSource {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `this` is a freshly `alloc`'d, not-yet-initialized `MouserDragSource`
+        // whose ivars are set; `-[NSObject init]` is the designated initializer of the
+        // superclass and takes no arguments, returning the initialized `self`.
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -138,6 +141,10 @@ pub fn begin_file_drag(
         NSPoint::new(cursor.x - 1.0, cursor.y - 1.0),
         NSSize::new(2.0, 2.0),
     );
+    // SAFETY: `alloc` is a fresh, uninitialized `NSWindow` and this is its designated
+    // initializer; `frame` is a valid `NSRect`, and the style-mask / backing-store /
+    // defer arguments are valid enum/bool values. Runs on the main thread (`mtm`), as
+    // AppKit requires. The returned window is a fully initialized owned `Retained`.
     let window: Retained<NSWindow> = unsafe {
         let alloc = NSWindow::alloc(mtm);
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -209,6 +216,10 @@ fn read_file_urls_from(pasteboard: &NSPasteboard) -> Vec<PathBuf> {
     };
     for item in items.iter() {
         // Each item may expose the file URL as a string under public.file-url.
+        // SAFETY: `item` is a live `NSPasteboardItem` from the pasteboard and
+        // `NSPasteboardTypeFileURL` is a valid AppKit extern type constant;
+        // `-stringForType:` reads the value, returning an owned `Retained<NSString>`
+        // (`Some`) or nil (`None`) — no aliasing or lifetime obligations on us.
         if let Some(s) = unsafe { item.stringForType(NSPasteboardTypeFileURL) } {
             if let Some(path) = file_url_string_to_path(&s.to_string()) {
                 out.push(path);

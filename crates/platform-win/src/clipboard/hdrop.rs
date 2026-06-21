@@ -161,17 +161,20 @@ fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%' {
+            // Try to read the two hex digits after the `%` via checked gets; if
+            // either is missing or non-hex, fall through and emit the `%` literally.
+            if let (Some(h), Some(l)) = (
+                bytes.get(i + 1).and_then(|&d| (d as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|&d| (d as char).to_digit(16)),
+            ) {
                 out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i]);
+        out.push(b);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()

@@ -31,6 +31,10 @@
 //! the wire protocol's absolute `PointerMotion` space (§7.6).
 
 #![cfg(target_os = "macos")]
+// This crate keeps `unsafe` (CGEvent/AppKit C APIs) so it can't adopt
+// `[lints] workspace = true` (that would pull in `unsafe_code = "forbid"`).
+// Replicate the workspace panic-free clippy denies here instead (audit R2).
+#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod adapter;
 pub mod capture;

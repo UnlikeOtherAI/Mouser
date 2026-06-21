@@ -1,0 +1,8 @@
+# Tests are exempt from the workspace panic-free clippy denies
+# (`[workspace.lints.clippy]` in Cargo.toml: unwrap_used / panic /
+# indexing_slicing). Runtime code must stay panic-free, but `#[cfg(test)]`
+# code may use unwrap/expect/panic/indexing for terse, fail-loud assertions.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

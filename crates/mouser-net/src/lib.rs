@@ -22,7 +22,7 @@
 
 // §0.3 panic-free decode discipline: the decode/runtime path must never panic.
 // Decoders use checked slicing + `try_into` and return `NetError` instead.
-#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+// (The unwrap/panic/indexing denies come from `[workspace.lints.clippy]`.)
 
 pub mod bulk;
 mod control;

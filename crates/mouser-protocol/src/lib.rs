@@ -3,10 +3,9 @@
 //! `docs/communication-interface.md` (v2.5); two independently-built engines that
 //! agree on this crate can interoperate.
 //!
-//! The decode path is held to a no-panic discipline (see the crate-level lint
-//! denies below) so attacker-controlled bytes cannot crash an engine.
-
-#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+//! The decode path is held to a no-panic discipline (the workspace clippy lints
+//! deny `unwrap_used`/`panic`/`indexing_slicing`) so attacker-controlled bytes
+//! cannot crash an engine.
 
 pub mod codec;
 pub mod datagram;

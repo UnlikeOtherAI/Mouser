@@ -25,8 +25,9 @@
 //! - **Path safety** ([`path`]): the offered `name` is sanitized (separators stripped,
 //!   `..`/absolute/symlink rejected) and the file lands inside a caller-provided
 //!   quarantine dir — never outside it (`../../.ssh/authorized_keys` → rejected).
-
-#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+//!
+//! The runtime path is panic-free: `[workspace.lints.clippy]` denies
+//! `unwrap_used`/`panic`/`indexing_slicing` crate-wide.
 
 #[cfg(unix)]
 pub mod fs_sink;
