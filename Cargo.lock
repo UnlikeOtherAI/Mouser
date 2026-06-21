@@ -569,6 +569,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "mdns-sd",
+ "mouser-files",
  "mouser-protocol",
  "quinn",
  "rand_core 0.6.4",

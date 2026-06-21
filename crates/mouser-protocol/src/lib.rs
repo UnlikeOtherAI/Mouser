@@ -23,9 +23,12 @@ pub use enums::{
     AckStatus, BlockedReason, CapState, Capability, CapabilitySet, ClipFormat, FocusKind,
     GoodbyeReason, NotifyKind, Os, PointerMode, Role, ScrollUnit, TransferReason,
 };
-pub use framing::{decode_frame, encode_frame, Frame, FrameError, MAX_CONTROL_FRAME};
+pub use framing::{
+    decode_frame, encode_bulk_frame, encode_frame, encode_frame_capped, Frame, FrameError,
+    MAX_BULK_FRAME, MAX_CONTROL_FRAME,
+};
 pub use messages::{
-    FileAccept, FileAck, FileChunk, FileDone, FileEntry, FileOffer, FileReject, Ping, ResumePoint,
-    TYPE_FILE_ACCEPT, TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE, TYPE_FILE_OFFER,
-    TYPE_FILE_REJECT, TYPE_HELLO_ACK, TYPE_PING,
+    BulkHello, FileAccept, FileAck, FileChunk, FileDone, FileEntry, FileOffer, FileReject, Ping,
+    ResumePoint, TYPE_BULK_HELLO, TYPE_FILE_ACCEPT, TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE,
+    TYPE_FILE_OFFER, TYPE_FILE_REJECT, TYPE_HELLO_ACK, TYPE_PING,
 };

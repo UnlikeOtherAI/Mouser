@@ -102,6 +102,37 @@ pub fn device_id_from_cert(cert: &CertificateDer<'_>) -> Result<[u8; 32], NetErr
     Ok(Sha256::digest(spki).into())
 }
 
+/// Extract the raw 32-byte Ed25519 public key from a presented leaf certificate's
+/// SPKI. The leaf's public key **is** the device identity key (§3), so this is the
+/// verifying key for the §5 `channel_sig` proof — letting the bulk plane (`crate::bulk`)
+/// check the binding signature against the same key it pins, with no extra wire field.
+pub fn verifying_key_from_cert(
+    cert: &CertificateDer<'_>,
+) -> Result<ed25519_dalek::VerifyingKey, NetError> {
+    let spki = spki_from_cert(cert.as_ref())?;
+    // SPKI = SEQUENCE { AlgorithmIdentifier, subjectPublicKey BIT STRING }. Walk to the
+    // BIT STRING, drop its leading "unused bits" octet, and the remainder is the key.
+    let mut p = DerCursor::new(&spki);
+    p.enter_sequence()?; // SubjectPublicKeyInfo
+    p.skip_field()?; // algorithm AlgorithmIdentifier
+    let bit_string = p.read_field_raw()?; // subjectPublicKey BIT STRING (with TLV header)
+    // BIT STRING content is `<unused-bits octet><key bytes>`; for Ed25519 unused=0 and
+    // key is 32 bytes. The raw field still carries its tag+len, so locate the content.
+    let key = ed25519_bytes_from_bit_string(bit_string)?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key)
+        .map_err(|e| NetError::Identity(format!("bad Ed25519 key: {e}")))
+}
+
+/// Pull the trailing 32 key bytes out of a DER BIT STRING field (`03 LEN 00 <key>`).
+fn ed25519_bytes_from_bit_string(field: &[u8]) -> Result<[u8; 32], NetError> {
+    // Smallest valid encoding here is `03 21 00 <32 bytes>` = 35 bytes.
+    if field.len() < 3 || field.first().copied() != Some(0x03) {
+        return Err(bad_der());
+    }
+    let key = field.get(field.len() - 32..).ok_or(bad_der())?;
+    key.try_into().map_err(|_| bad_der())
+}
+
 /// Extract the DER `SubjectPublicKeyInfo` bytes from a DER certificate. Parses the
 /// X.509 `TBSCertificate` far enough to locate the `subjectPublicKeyInfo` field
 /// without pulling in a full ASN.1 dependency.
