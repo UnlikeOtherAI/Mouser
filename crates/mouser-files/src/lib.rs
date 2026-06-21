@@ -64,8 +64,6 @@ pub enum FileError {
     ChunkTooLarge(usize),
     /// A chunk/ack `offset` was past the file's declared `size`, or otherwise invalid.
     OffsetOutOfRange { file_index: u32, offset: u64 },
-    /// The reassembled file's SHA-256 did not match the expected digest (integrity).
-    HashMismatch { file_index: u32 },
     /// The offer/accept itself was malformed (e.g. duplicate file index, empty list).
     Protocol(String),
     /// A path-safety violation while resolving the offered `name` (see [`PathError`]).
@@ -82,9 +80,6 @@ impl core::fmt::Display for FileError {
             Self::ChunkTooLarge(n) => write!(f, "chunk {n} bytes exceeds 1 MiB cap"),
             Self::OffsetOutOfRange { file_index, offset } => {
                 write!(f, "offset {offset} out of range for file {file_index}")
-            }
-            Self::HashMismatch { file_index } => {
-                write!(f, "integrity hash mismatch for file {file_index}")
             }
             Self::Protocol(m) => write!(f, "file protocol: {m}"),
             Self::Path(e) => write!(f, "path: {e}"),

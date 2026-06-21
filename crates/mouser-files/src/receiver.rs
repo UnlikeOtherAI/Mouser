@@ -8,10 +8,17 @@
 //!   created; a traversal/unsafe name rejects the whole transfer (`FileReject`).
 //! - A chunk past the file's declared `size`, or larger than [`crate::MAX_CHUNK_SIZE`]
 //!   (1 MiB), is rejected *before* the bytes are written (no oversize allocation).
+//! - A partially-held file **longer** than the offer's declared `size` is corruption
+//!   (a prefix that disagrees with what's being offered), so it rejects the whole
+//!   transfer (`FileReject`) rather than clamping to `size` and accepting a too-long
+//!   prefix as if it resumed cleanly.
 //! - `FileAck.acked_through` is the **contiguous** committed prefix; resume restarts
 //!   exactly there.
 //! - On completion the reassembled SHA-256 is compared to the expected digest (when the
-//!   caller supplied one) — a mismatch fails the transfer with `FileDone{ok:false}`.
+//!   caller supplied one). A mismatch — or any per-file finalize failure — does **not**
+//!   commit the file as ok: it aborts the transfer locally *and* emits a
+//!   `FileDone{ok:false}` for the peer, so the sender learns via the wire (not just a
+//!   torn-down connection) and marks its side aborted.
 
 use std::path::{Path, PathBuf};
 
@@ -85,13 +92,19 @@ pub struct Receiver<S: FileSink> {
     quarantine: PathBuf,
     slots: Vec<Slot<S>>,
     done_emitted: bool,
+    /// Set once a `FileDone{ok:false}` has been emitted (integrity/finalize failure);
+    /// the transfer is terminally aborted and accepts no further chunks as progress.
+    aborted: bool,
 }
 
 impl<S: FileSink> Receiver<S> {
     /// Handle a `FileOffer`: sanitize each name, build a sink per file via `make_sink`
-    /// (passed the file index and the resolved safe path), and produce either a
-    /// `FileAccept` (with resume points for any partially-held files) or, on a
-    /// path-safety violation / sink error, a `FileReject` that aborts the transfer.
+    /// (passed the file index and the resolved safe path), and produce the messages to
+    /// send back. The first is normally a `FileAccept` (with resume points for any
+    /// partially-held files); on a path-safety violation, an over-long partial file, or
+    /// a sink error it is instead a single `FileReject` that aborts the transfer. When a
+    /// resume offer is already complete (the held prefix satisfies every file) a terminal
+    /// `FileDone` follows the `FileAccept` in the returned vector.
     ///
     /// `make_sink` is where disk-backed receivers open the quarantine file (with
     /// `create_new`, never following a symlink).
@@ -99,7 +112,7 @@ impl<S: FileSink> Receiver<S> {
         offer: &FileOffer,
         config: ReceiverConfig,
         mut make_sink: F,
-    ) -> Result<(Self, Outbound), FileError>
+    ) -> Result<(Self, Vec<Outbound>), FileError>
     where
         F: FnMut(usize, &Path) -> Result<S, crate::sink::SinkError>,
     {
@@ -117,15 +130,31 @@ impl<S: FileSink> Receiver<S> {
                 Err(e) => {
                     return Ok((
                         Self::aborted(offer.transfer_id, config.quarantine),
-                        Outbound::Reject(FileReject {
+                        vec![Outbound::Reject(FileReject {
                             transfer_id: offer.transfer_id,
                             reason: format!("unsafe file name: {e}"),
-                        }),
+                        })],
                     ));
                 }
             };
             let sink = make_sink(i, &safe_path)?;
-            let have = sink.existing_len().min(entry.size);
+            // A partial file LONGER than the declared `size` is corruption/mismatch (the
+            // prefix on disk disagrees with what's being offered). Reject the transfer
+            // rather than clamp to `size` and accept a too-long prefix as a clean resume.
+            let existing = sink.existing_len();
+            if existing > entry.size {
+                return Ok((
+                    Self::aborted(offer.transfer_id, config.quarantine),
+                    vec![Outbound::Reject(FileReject {
+                        transfer_id: offer.transfer_id,
+                        reason: format!(
+                            "file {i}: existing {existing} bytes exceed offered size {}",
+                            entry.size
+                        ),
+                    })],
+                ));
+            }
+            let have = existing;
             if have > 0 {
                 let file_index = u32::try_from(i)
                     .map_err(|_| FileError::Protocol("file_index overflow".into()))?;
@@ -149,14 +178,18 @@ impl<S: FileSink> Receiver<S> {
             quarantine: config.quarantine,
             slots,
             done_emitted: false,
+            aborted: false,
         };
-        // A resume offer for already-complete files may finish immediately.
-        recv.finalize_completed_files()?;
-        let accept = Outbound::Accept(FileAccept {
+        let mut out = vec![Outbound::Accept(FileAccept {
             transfer_id: offer.transfer_id,
             resume,
-        });
-        Ok((recv, accept))
+        })];
+        // A resume offer for already-complete files may finish immediately — surface the
+        // terminal `FileDone` (ok=true on success, ok=false on an integrity mismatch).
+        if let Some(done) = recv.finalize_completed_files()? {
+            out.push(Outbound::Done(done));
+        }
+        Ok((recv, out))
     }
 
     fn aborted(transfer_id: u64, quarantine: PathBuf) -> Self {
@@ -165,6 +198,7 @@ impl<S: FileSink> Receiver<S> {
             quarantine,
             slots: Vec::new(),
             done_emitted: true,
+            aborted: true,
         }
     }
 
@@ -172,6 +206,11 @@ impl<S: FileSink> Receiver<S> {
     pub fn on_chunk(&mut self, chunk: &FileChunk) -> Result<Vec<Outbound>, FileError> {
         if chunk.transfer_id != self.transfer_id {
             return Err(FileError::UnknownTransfer(chunk.transfer_id));
+        }
+        if self.aborted {
+            // Transfer already terminated (e.g. integrity failure): a `FileDone{ok:false}`
+            // was sent; ignore any further chunks rather than resurrecting the transfer.
+            return Ok(Vec::new());
         }
         if chunk.data.len() > MAX_CHUNK_SIZE {
             return Err(FileError::ChunkTooLarge(chunk.data.len()));
@@ -237,20 +276,26 @@ impl<S: FileSink> Receiver<S> {
     }
 
     /// Finalize any file that has reached its `size`, verifying the integrity hash when
-    /// an expected digest was supplied. Returns a `FileDone` once *all* files complete.
+    /// an expected digest was supplied.
+    ///
+    /// On success it returns a `FileDone{ok:true}` once *all* files complete. A SHA-256
+    /// mismatch — or a failure to finalize the sink — does **not** mark the file complete:
+    /// it aborts the transfer (so no corrupt file is committed as ok and no further chunk
+    /// counts as progress) and returns `FileDone{ok:false}` so the caller can send it to
+    /// the peer. The local [`FileError`] is *not* propagated for these cases; the abort is
+    /// reported on the wire instead of via a torn-down connection.
     fn finalize_completed_files(&mut self) -> Result<Option<FileDone>, FileError> {
-        for (i, slot) in self.slots.iter_mut().enumerate() {
+        for slot in &mut self.slots {
             if slot.complete || slot.acked < slot.size {
                 continue;
             }
-            let digest = slot.sink.finish()?;
-            if let Some(expected) = slot.expected {
-                if digest != expected {
-                    self.done_emitted = true;
-                    return Err(FileError::HashMismatch {
-                        file_index: u32::try_from(i).unwrap_or(u32::MAX),
-                    });
-                }
+            // A finish() error or a digest mismatch both mean "this file is not ok".
+            let ok = match slot.sink.finish() {
+                Ok(digest) => slot.expected.is_none_or(|expected| digest == expected),
+                Err(_) => false,
+            };
+            if !ok {
+                return Ok(Some(self.abort()));
             }
             slot.complete = true;
         }
@@ -262,6 +307,16 @@ impl<S: FileSink> Receiver<S> {
             }));
         }
         Ok(None)
+    }
+
+    /// Mark the transfer terminally aborted and build the `FileDone{ok:false}` to send.
+    fn abort(&mut self) -> FileDone {
+        self.aborted = true;
+        self.done_emitted = true;
+        FileDone {
+            transfer_id: self.transfer_id,
+            ok: false,
+        }
     }
 
     /// The quarantine directory this receiver writes into.
@@ -286,6 +341,13 @@ impl<S: FileSink> Receiver<S> {
     /// Whether every file has completed (and `FileDone{ok:true}` was produced).
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        !self.slots.is_empty() && self.slots.iter().all(|s| s.complete)
+        !self.aborted && !self.slots.is_empty() && self.slots.iter().all(|s| s.complete)
+    }
+
+    /// Whether the transfer was terminally aborted with a `FileDone{ok:false}` (an
+    /// integrity/finalize failure, or an over-long/unsafe offer that never opened sinks).
+    #[must_use]
+    pub fn is_aborted(&self) -> bool {
+        self.aborted
     }
 }

@@ -146,9 +146,12 @@ async fn run_receiver(
         Receiver::accept_offer(&offer, config, |_i, path| FsSink::create(path))
             .map_err(|e| e.to_string())?;
 
-    let accept = match out {
-        Outbound::Accept(a) => a,
-        Outbound::Reject(r) => return Err(format!("receiver rejected offer: {}", r.reason)),
+    // `accept_offer` returns the messages to send back: a `FileAccept` first (for any
+    // non-rejected offer), optionally followed by a terminal `FileDone` if a resume offer
+    // was already complete. A `FileReject` (alone) means the offer was refused.
+    let accept = match out.into_iter().next() {
+        Some(Outbound::Accept(a)) => a,
+        Some(Outbound::Reject(r)) => return Err(format!("receiver rejected offer: {}", r.reason)),
         other => return Err(format!("unexpected first outbound {other:?}")),
     };
     stream

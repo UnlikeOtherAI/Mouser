@@ -60,6 +60,15 @@ fn make_mem_sink(_idx: usize, _path: &Path) -> Result<MemSink, mouser_files::Sin
     Ok(MemSink::new())
 }
 
+/// Pull the `FileAccept` out of `accept_offer`'s outbound list (always the first message
+/// for a non-rejected offer); panics with the actual variant otherwise.
+fn expect_accept(out: Vec<Outbound>) -> mouser_protocol::FileAccept {
+    match out.into_iter().next() {
+        Some(Outbound::Accept(a)) => a,
+        other => panic!("expected Accept first, got {other:?}"),
+    }
+}
+
 #[test]
 fn full_multi_file_transfer_succeeds_with_hash() {
     let f0 = bytes(1, 600_000); // > one 256 KiB chunk
@@ -78,12 +87,9 @@ fn full_multi_file_transfer_succeeds_with_hash() {
 
     let expected = vec![Some(sha256(&f0)), Some(sha256(&f1)), Some(sha256(&f2))];
     let config = ReceiverConfig::new(PathBuf::from(Q)).with_expected_hashes(expected);
-    let (mut receiver, accept) =
+    let (mut receiver, out) =
         Receiver::accept_offer(&sender.offer(), config, make_mem_sink).expect("offer accepted");
-    let accept = match accept {
-        Outbound::Accept(a) => a,
-        other => panic!("expected Accept, got {other:?}"),
-    };
+    let accept = expect_accept(out);
     assert!(accept.resume.is_empty(), "fresh transfer has no resume points");
     sender.on_accept(&accept).expect("on_accept");
 
@@ -111,11 +117,9 @@ fn dropped_chunk_then_resume_completes_correctly() {
     )
     .expect("sender1");
     let config1 = ReceiverConfig::new(PathBuf::from(Q));
-    let (mut receiver1, accept1) =
+    let (mut receiver1, out1) =
         Receiver::accept_offer(&sender1.offer(), config1, make_mem_sink).expect("offer1");
-    if let Outbound::Accept(a) = &accept1 {
-        sender1.on_accept(a).expect("accept1");
-    }
+    sender1.on_accept(&expect_accept(out1)).expect("accept1");
 
     let mut committed: Vec<u8> = Vec::new();
     let mut delivered = 0;
@@ -149,12 +153,9 @@ fn dropped_chunk_then_resume_completes_correctly() {
         move |_i: usize, _p: &Path| Ok(MemSink::with_prefix(prefix.clone()));
     let config2 =
         ReceiverConfig::new(PathBuf::from(Q)).with_expected_hashes(vec![Some(sha256(&content))]);
-    let (mut receiver2, accept2) =
+    let (mut receiver2, out2) =
         Receiver::accept_offer(&sender2.offer(), config2, make_resuming_sink).expect("offer2");
-    let accept2 = match accept2 {
-        Outbound::Accept(a) => a,
-        other => panic!("expected Accept, got {other:?}"),
-    };
+    let accept2 = expect_accept(out2);
     assert_eq!(
         accept2.resume,
         vec![mouser_protocol::ResumePoint {
@@ -184,16 +185,17 @@ fn path_traversal_offer_is_rejected() {
         }],
     };
     let config = ReceiverConfig::new(PathBuf::from(Q));
-    let (_recv, out) = Receiver::accept_offer(&offer, config, |_, _| -> Result<MemSink, _> {
+    let (recv, out) = Receiver::accept_offer(&offer, config, |_, _| -> Result<MemSink, _> {
         panic!("sink must NOT be created for an unsafe name")
     })
     .expect("accept_offer returns a reject, not an error");
-    match out {
-        Outbound::Reject(r) => {
+    assert!(recv.is_aborted(), "an unsafe-name offer aborts the transfer");
+    match out.as_slice() {
+        [Outbound::Reject(r)] => {
             assert_eq!(r.transfer_id, 9);
             assert!(r.reason.contains("unsafe file name"), "reason: {}", r.reason);
         }
-        other => panic!("expected Reject, got {other:?}"),
+        other => panic!("expected a single Reject, got {other:?}"),
     }
 }
 
@@ -212,18 +214,16 @@ fn absolute_path_offer_is_rejected() {
             panic!("no sink for abs path")
         })
         .expect("ok");
-    assert!(matches!(out, Outbound::Reject(_)));
+    assert!(matches!(out.as_slice(), [Outbound::Reject(_)]));
 }
 
 #[test]
 fn oversize_chunk_is_rejected_before_write() {
     let mut sender = Sender::new(11, vec![("x".into(), MemSource::new(bytes(7, 16)))]).expect("s");
     let config = ReceiverConfig::new(PathBuf::from(Q));
-    let (mut receiver, accept) =
+    let (mut receiver, out) =
         Receiver::accept_offer(&sender.offer(), config, make_mem_sink).expect("offer");
-    if let Outbound::Accept(a) = accept {
-        sender.on_accept(&a).unwrap();
-    }
+    sender.on_accept(&expect_accept(out)).unwrap();
     // Forge a chunk larger than the 1 MiB cap (§0.3) — rejected without allocation.
     let huge = mouser_protocol::FileChunk {
         transfer_id: 11,
@@ -237,19 +237,94 @@ fn oversize_chunk_is_rejected_before_write() {
     );
 }
 
+/// A SHA-256 mismatch on the last chunk must surface as a `FileDone{ok:false}` on the
+/// wire (not a swallowed local error), the receiver must NOT report the file complete,
+/// and feeding that `FileDone` to the sender must mark *its* side aborted (§7.8).
 #[test]
-fn hash_mismatch_fails_the_transfer() {
+fn hash_mismatch_emits_filedone_not_ok_and_aborts_sender() {
     let content = bytes(99, 4_000);
-    let mut sender =
-        Sender::new(12, vec![("c.bin".into(), MemSource::new(content.clone()))]).expect("s");
+    let transfer_id = 12;
+    let mut sender = Sender::new(
+        transfer_id,
+        vec![("c.bin".into(), MemSource::new(content.clone()))],
+    )
+    .expect("s");
     // Tell the receiver to expect the WRONG digest → completion must fail.
     let wrong = sha256(b"not the content");
     let config = ReceiverConfig::new(PathBuf::from(Q)).with_expected_hashes(vec![Some(wrong)]);
-    let (mut receiver, accept) =
+    let (mut receiver, out) =
         Receiver::accept_offer(&sender.offer(), config, make_mem_sink).expect("offer");
-    if let Outbound::Accept(a) = accept {
-        sender.on_accept(&a).unwrap();
+    sender.on_accept(&expect_accept(out)).unwrap();
+
+    // Relay every chunk; collect the receiver's outbound messages (acks + the terminal
+    // done) without touching the sender, so we can inspect the exact wire message.
+    let mut done: Option<mouser_protocol::FileDone> = None;
+    while let Some(chunk) = sender.poll_chunk().expect("poll") {
+        for o in receiver.on_chunk(&chunk).expect("chunk") {
+            match o {
+                Outbound::Ack(ack) => sender.on_ack(&ack).expect("ack"),
+                Outbound::Done(d) => done = Some(d),
+                other => panic!("unexpected outbound {other:?}"),
+            }
+        }
     }
-    let err = drive_until_complete(&mut sender, &mut receiver).unwrap_err();
-    assert_eq!(err, FileError::HashMismatch { file_index: 0 });
+
+    // 1) The receiver produced a `FileDone{ok:false}` on the wire for this transfer.
+    assert_eq!(
+        done,
+        Some(mouser_protocol::FileDone {
+            transfer_id,
+            ok: false
+        }),
+        "a hash mismatch must emit FileDone{{ok:false}}"
+    );
+    // 2) The receiver did NOT commit the corrupt file as complete.
+    assert!(receiver.is_aborted(), "receiver aborts on mismatch");
+    assert!(!receiver.is_complete(), "a mismatched file is not 'complete'");
+    assert!(!receiver.states()[0].complete);
+    // 3) Further chunks are ignored rather than resurrecting the transfer.
+    let stray = mouser_protocol::FileChunk {
+        transfer_id,
+        file_index: 0,
+        offset: 0,
+        data: vec![0u8; 4],
+    };
+    assert!(receiver.on_chunk(&stray).expect("ignored").is_empty());
+
+    // 4) The sender, on receiving that FileDone, marks ITS side aborted (not complete).
+    sender.on_done(&done.unwrap()).expect("on_done");
+    assert!(sender.is_aborted(), "sender aborts on FileDone{{ok:false}}");
+    assert!(!sender.is_complete(), "an aborted sender is not complete");
+}
+
+/// A partial file on disk LONGER than the offer's declared `size` is corruption: the
+/// receiver must REJECT the whole transfer rather than clamp the resume offset to
+/// `size` and silently accept a too-long prefix.
+#[test]
+fn resume_with_existing_longer_than_size_is_rejected() {
+    let offer = FileOffer {
+        transfer_id: 77,
+        files: vec![mouser_protocol::FileEntry {
+            name: "grew.dat".into(),
+            size: 100,
+        }],
+    };
+    // The sink already holds MORE bytes than the offer claims (existing_len > size).
+    let bloated = bytes(5, 250);
+    let make_bloated = move |_i: usize, _p: &Path| Ok(MemSink::with_prefix(bloated.clone()));
+    let config = ReceiverConfig::new(PathBuf::from(Q));
+    let (recv, out) = Receiver::accept_offer(&offer, config, make_bloated).expect("ok");
+
+    assert!(recv.is_aborted(), "an over-long existing file aborts the transfer");
+    match out.as_slice() {
+        [Outbound::Reject(r)] => {
+            assert_eq!(r.transfer_id, 77);
+            assert!(
+                r.reason.contains("exceed offered size"),
+                "reason should explain the over-long prefix, got: {}",
+                r.reason
+            );
+        }
+        other => panic!("expected a single Reject for an over-long prefix, got {other:?}"),
+    }
 }
