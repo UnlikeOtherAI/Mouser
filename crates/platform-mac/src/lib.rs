@@ -43,7 +43,8 @@ pub mod keymap_capture;
 pub use adapter::{MacCapture, MacInjector};
 pub use capture::{install_listen_only_tap, CaptureError};
 pub use display_info::{
-    active_display_bounds, display_bounds, main_display_bounds, DisplayBounds,
+    active_display_bounds, display_bounds, display_for_global_point, main_display_bounds,
+    DisplayBounds,
 };
 pub use dragdrop::{
     begin_file_drag, read_dragged_file_urls, read_dragged_file_urls_from, write_file_urls,
@@ -56,4 +57,7 @@ pub use inject::{
 pub use keymap::{
     hid_usage_to_cgkeycode, mods_to_cgflags, mods_to_cgkeycodes, supported_hid_usages,
 };
-pub use keymap_capture::{cgkeycode_to_hid_usage, flags_changed_event};
+pub use keymap_capture::{
+    cgkeycode_to_hid_usage, cursor_moved_for_global, flags_changed_event, to_local_event,
+    ModifierState,
+};

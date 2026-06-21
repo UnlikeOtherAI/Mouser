@@ -154,6 +154,32 @@ pub fn hid_usage_to_scancode(usage: u16) -> Option<ScanCode> {
         0x51 => ScanCode::ext(0x50), // Down
         0x52 => ScanCode::ext(0x48), // Up
 
+        // Keypad (HID 0x53..=0x63, plus 0x67 KpEqual, 0x85 KpComma).
+        // PS/2 Set 1 make codes. The numeric/`.` keypad keys are the *plain*
+        // (non-extended) codes that the extended nav cluster (Insert/Home/…,
+        // KpSlash) re-uses with the E0 prefix — so the only collision-sensitive
+        // members here are KpSlash (0x54) and KpEnter (0x58), which ARE extended
+        // (E0 0x35 / E0 0x1C) to disambiguate from `/` (0x35) and Enter (0x1C).
+        0x53 => ScanCode::plain(0x45), // Num Lock
+        0x54 => ScanCode::ext(0x35),   // Keypad / (extended: shares `/` 0x35)
+        0x55 => ScanCode::plain(0x37), // Keypad *
+        0x56 => ScanCode::plain(0x4A), // Keypad -
+        0x57 => ScanCode::plain(0x4E), // Keypad +
+        0x58 => ScanCode::ext(0x1C),   // Keypad Enter (extended: shares Enter 0x1C)
+        0x59 => ScanCode::plain(0x4F), // Keypad 1 (shares End nav code, non-ext)
+        0x5A => ScanCode::plain(0x50), // Keypad 2 (Down)
+        0x5B => ScanCode::plain(0x51), // Keypad 3 (Page Down)
+        0x5C => ScanCode::plain(0x4B), // Keypad 4 (Left)
+        0x5D => ScanCode::plain(0x4C), // Keypad 5
+        0x5E => ScanCode::plain(0x4D), // Keypad 6 (Right)
+        0x5F => ScanCode::plain(0x47), // Keypad 7 (Home)
+        0x60 => ScanCode::plain(0x48), // Keypad 8 (Up)
+        0x61 => ScanCode::plain(0x49), // Keypad 9 (Page Up)
+        0x62 => ScanCode::plain(0x52), // Keypad 0 (Insert)
+        0x63 => ScanCode::plain(0x53), // Keypad . (Delete)
+        0x67 => ScanCode::plain(0x59), // Keypad =
+        0x85 => ScanCode::plain(0x7E), // Keypad , (Brazilian/ABNT2 numpad comma)
+
         // Modifiers (HID 0xE0..=0xE7).
         // Left-hand keys are plain; right-hand Ctrl/Alt and both GUI keys are
         // on the extended (E0) block.
@@ -223,6 +249,28 @@ pub fn hid_usage_to_vk(usage: u16) -> Option<u16> {
         0x51 => 0x28, // VK_DOWN
         0x52 => 0x26, // VK_UP
 
+        // Keypad (HID 0x53..=0x63, plus 0x67 KpEqual, 0x85 KpComma).
+        0x53 => 0x90, // VK_NUMLOCK
+        0x54 => 0x6F, // VK_DIVIDE
+        0x55 => 0x6A, // VK_MULTIPLY
+        0x56 => 0x6D, // VK_SUBTRACT
+        0x57 => 0x6B, // VK_ADD
+        0x58 => 0x0D, // VK_RETURN (Keypad Enter shares VK_RETURN; the extended
+        // scancode is what distinguishes it on the inject path)
+        0x59 => 0x61, // VK_NUMPAD1
+        0x5A => 0x62, // VK_NUMPAD2
+        0x5B => 0x63, // VK_NUMPAD3
+        0x5C => 0x64, // VK_NUMPAD4
+        0x5D => 0x65, // VK_NUMPAD5
+        0x5E => 0x66, // VK_NUMPAD6
+        0x5F => 0x67, // VK_NUMPAD7
+        0x60 => 0x68, // VK_NUMPAD8
+        0x61 => 0x69, // VK_NUMPAD9
+        0x62 => 0x60, // VK_NUMPAD0
+        0x63 => 0x6E, // VK_DECIMAL (Keypad .)
+        0x67 => 0x92, // VK_OEM_NEC_EQUAL (Keypad =)
+        0x85 => 0xC2, // VK_ABNT_C2 (Keypad , on Brazilian ABNT2)
+
         0xE0 => 0xA2, // VK_LCONTROL
         0xE1 => 0xA0, // VK_LSHIFT
         0xE2 => 0xA4, // VK_LMENU (Left Alt)
@@ -235,6 +283,32 @@ pub fn hid_usage_to_vk(usage: u16) -> Option<u16> {
         _ => return None,
     };
     Some(vk)
+}
+
+/// The exact set of HID usages this Windows table maps, sorted ascending.
+///
+/// Host-independent pure data (mirrors the `match` arms of
+/// [`hid_usage_to_scancode`] / [`hid_usage_to_vk`], which cover the same set), so
+/// the cross-platform parity test can run on any build host even though the real
+/// `SendInput` injection is Windows-only. Mirrored by
+/// `platform_mac::keymap::supported_hid_usages` and
+/// `platform_linux::keymap::supported_hid_usages`; a three-way parity test
+/// asserts all three are identical (no collisions, same coverage — audit
+/// H11/C2-8).
+#[must_use]
+pub fn supported_hid_usages() -> Vec<u16> {
+    let mut v: Vec<u16> = Vec::new();
+    v.extend(0x04u16..=0x39); // letters, number row, control, punctuation, caps
+    v.extend(0x3Au16..=0x45); // F1..F12
+    v.extend(0x49u16..=0x52); // nav cluster + arrows
+    v.extend(0x53u16..=0x63); // keypad block
+    v.push(0x67); // Keypad =
+    v.push(0x85); // Keypad ,
+    v.extend(0xE0u16..=0xE7); // modifiers
+                              // 0x32 (HID "Non-US #") has no portable mac/evdev counterpart in this set.
+    v.retain(|&u| u != 0x32);
+    v.sort_unstable();
+    v
 }
 
 #[cfg(test)]
@@ -283,5 +357,78 @@ mod tests {
     fn unknown_vk_is_none() {
         assert_eq!(hid_usage_to_vk(0xFFFF), None);
         assert_eq!(hid_usage_to_vk(0x00), None);
+    }
+
+    #[test]
+    fn keypad_scancodes_disambiguate_from_nav_cluster() {
+        // NumLock + the arithmetic/numeric keypad keys are PLAIN (non-extended);
+        // KpSlash and KpEnter are EXTENDED so they don't collide with `/`/Enter.
+        assert_eq!(hid_usage_to_scancode(0x53), Some(ScanCode::plain(0x45))); // NumLock
+        assert_eq!(hid_usage_to_scancode(0x54), Some(ScanCode::ext(0x35))); // Keypad /
+        assert_eq!(hid_usage_to_scancode(0x55), Some(ScanCode::plain(0x37))); // Keypad *
+        assert_eq!(hid_usage_to_scancode(0x57), Some(ScanCode::plain(0x4E))); // Keypad +
+        assert_eq!(hid_usage_to_scancode(0x58), Some(ScanCode::ext(0x1C))); // Keypad Enter
+        assert_eq!(hid_usage_to_scancode(0x62), Some(ScanCode::plain(0x52))); // Keypad 0
+        assert_eq!(hid_usage_to_scancode(0x63), Some(ScanCode::plain(0x53))); // Keypad .
+        assert_eq!(hid_usage_to_scancode(0x67), Some(ScanCode::plain(0x59))); // Keypad =
+        assert_eq!(hid_usage_to_scancode(0x85), Some(ScanCode::plain(0x7E))); // Keypad ,
+                                                                              // The plain numeric keypad codes mirror the extended nav cluster codes
+                                                                              // (same low byte, extended flag is what differs): Keypad 7 == Home code.
+        assert_eq!(hid_usage_to_scancode(0x5F).map(|s| s.code), Some(0x47));
+        assert!(!hid_usage_to_scancode(0x5F).unwrap().extended);
+        assert_eq!(hid_usage_to_scancode(0x4A), Some(ScanCode::ext(0x47))); // Home (extended twin)
+    }
+
+    #[test]
+    fn keypad_vks_are_mapped() {
+        assert_eq!(hid_usage_to_vk(0x53), Some(0x90)); // VK_NUMLOCK
+        assert_eq!(hid_usage_to_vk(0x54), Some(0x6F)); // VK_DIVIDE
+        assert_eq!(hid_usage_to_vk(0x62), Some(0x60)); // VK_NUMPAD0
+        assert_eq!(hid_usage_to_vk(0x60), Some(0x68)); // VK_NUMPAD8
+        assert_eq!(hid_usage_to_vk(0x63), Some(0x6E)); // VK_DECIMAL
+        assert_eq!(hid_usage_to_vk(0x58), Some(0x0D)); // Keypad Enter == VK_RETURN
+    }
+
+    #[test]
+    fn supported_set_is_sorted_and_nonempty() {
+        let v = supported_hid_usages();
+        assert!(!v.is_empty());
+        assert!(v.windows(2).all(|w| w[0] < w[1]));
+        assert!(v.contains(&0x3A)); // F1
+        assert!(v.contains(&0x4A)); // Home
+        assert!(v.contains(&0x53)); // NumLock
+        assert!(v.contains(&0x85)); // Keypad comma
+        assert!(!v.contains(&0x32)); // excluded Non-US #
+    }
+
+    #[test]
+    fn table_and_supported_set_agree() {
+        // Every advertised usage maps in BOTH the scancode and VK tables...
+        for u in supported_hid_usages() {
+            assert!(
+                hid_usage_to_scancode(u).is_some(),
+                "supported usage {u:#06x} has no scancode mapping"
+            );
+            assert!(
+                hid_usage_to_vk(u).is_some(),
+                "supported usage {u:#06x} has no VK mapping"
+            );
+        }
+        // ...and nothing outside the advertised set maps in either table.
+        let set = supported_hid_usages();
+        for u in 0x00u16..=0xFF {
+            if hid_usage_to_scancode(u).is_some() {
+                assert!(
+                    set.contains(&u),
+                    "scancode maps {u:#06x} but it is not in supported_hid_usages()"
+                );
+            }
+            if hid_usage_to_vk(u).is_some() {
+                assert!(
+                    set.contains(&u),
+                    "VK maps {u:#06x} but it is not in supported_hid_usages()"
+                );
+            }
+        }
     }
 }
