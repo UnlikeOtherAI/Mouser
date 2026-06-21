@@ -11,7 +11,10 @@
 //! keymap's pure-data surface and the stub below compile, so
 //! `cargo build -p platform-linux` succeeds everywhere.
 
+pub mod clipboard;
 pub mod keymap;
+
+pub use clipboard::LinuxClipboard;
 
 #[cfg(target_os = "linux")]
 pub mod adapter;

@@ -18,6 +18,10 @@ mouser-core = { path = "../mouser-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 input-linux = "0.7"
+# Wayland clipboard access, MIME-type oriented — maps directly to `ClipFormat`'s
+# wire MIME types (spec §7.7). The X11 path is covered by XWayland on modern
+# desktops; a future X11-native backend can be added behind the same trait.
+wl-clipboard-rs = "0.9"
 
 [[example]]
 name = "uinput_demo"

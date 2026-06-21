@@ -1,0 +1,325 @@
+//! Windows clipboard adapter — Win32-backed [`mouser_core::platform::Clipboard`].
+//!
+//! [`WinClipboard`] moves raw bytes to/from the system clipboard for a given
+//! [`ClipFormat`] using the classic Win32 clipboard API
+//! (`OpenClipboard`/`GetClipboardData`/`SetClipboardData`) over `HGLOBAL` memory.
+//! It does **no** canonicalization, hashing, dedup, or loop-prevention — per spec
+//! §7.7 that lives in the engine; this is a thin byte mover for one format.
+//!
+//! ## Format mapping (spec §7.7 / Appendix C)
+//! | `ClipFormat` | Win32 clipboard format                                  |
+//! |--------------|---------------------------------------------------------|
+//! | `Utf8Text`   | `CF_UNICODETEXT` (UTF-16LE on the clipboard; we transcode to/from UTF-8) |
+//! | `Html`       | registered `"HTML Format"` (the CF_HTML wrapper, bytes as-is) |
+//! | `Rtf`        | registered `"Rich Text Format"` (bytes as-is)         |
+//! | `Png`        | registered `"PNG"` (raw PNG byte stream)              |
+//! | `UriList`    | `CF_HDROP` ↔ a `text/uri-list` of `file://` URIs       |
+//!
+//! `Utf8Text` is the one format the clipboard stores in a different encoding than
+//! the wire: Windows uses UTF-16LE (`CF_UNICODETEXT`), so we transcode both ways.
+//! `Html`/`Rtf`/`Png` are opaque bytes carried verbatim. `UriList` bridges the wire
+//! `text/uri-list` (LF-separated `file://` URIs, spec §7.7) and the native
+//! `CF_HDROP` file-drop list; see [`hdrop`].
+//!
+//! ## Change detection
+//! [`WinClipboard::change_count`] returns `GetClipboardSequenceNumber`, which the OS
+//! bumps on every clipboard change. A poller compares it to the last seen value to
+//! learn the clipboard changed (spec §7.7); the value alone says nothing about what.
+//! `0` is returned when the process lacks `WINSTA_ACCESSCLIPBOARD` — treat a *stuck*
+//! `0` as "cannot observe" rather than "never changed".
+//!
+//! ## `unsafe`
+//! All Win32 calls are `unsafe`; each carries a `// SAFETY:` note. The RAII
+//! [`ClipboardSession`] guarantees `CloseClipboard` runs even on early return, and
+//! the `HGLOBAL` lock/unlock is balanced within a single function so no pointer
+//! escapes its `GlobalLock`/`GlobalUnlock` pair.
+
+#![cfg(target_os = "windows")]
+
+use mouser_core::platform::{ClipFormat, Clipboard, PlatformError, PlatformResult};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
+use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+
+mod hdrop;
+
+/// Win32-backed [`Clipboard`] over the system clipboard.
+///
+/// Zero-sized: the clipboard is a process-global OS resource, so there is no
+/// per-instance state.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WinClipboard;
+
+impl WinClipboard {
+    /// A clipboard adapter bound to the system clipboard.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// `GetClipboardSequenceNumber` — the OS clipboard change counter.
+    ///
+    /// Increments on every clipboard mutation. A poller treats any increase as
+    /// "the clipboard changed" (spec §7.7). Returns `0` if the station denies
+    /// clipboard access; callers should treat a persistently-zero value as
+    /// "unobservable", not "unchanged".
+    #[must_use]
+    pub fn change_count(&self) -> i64 {
+        // SAFETY: no arguments, no out-params; returns the current sequence number
+        // (or 0 without `WINSTA_ACCESSCLIPBOARD`). Always safe to call.
+        let n = unsafe { GetClipboardSequenceNumber() };
+        i64::from(n)
+    }
+}
+
+impl Clipboard for WinClipboard {
+    fn read(&self, format: ClipFormat) -> PlatformResult<Option<Vec<u8>>> {
+        let fmt = clipboard_format(format)?;
+        let _session = ClipboardSession::open()?;
+
+        // Absent format → `None` (not an error): the clipboard simply has no such rep.
+        // SAFETY: format is a valid registered/standard id; returns Ok only when present.
+        if unsafe { IsClipboardFormatAvailable(fmt) }.is_err() {
+            return Ok(None);
+        }
+
+        // SAFETY: the clipboard is open (held by `_session`); `GetClipboardData`
+        // returns a NON-owned handle valid until `CloseClipboard`, so we must copy
+        // its bytes out before the session drops. We never free this handle.
+        let handle = match unsafe { GetClipboardData(fmt) } {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return Ok(None),
+        };
+
+        let raw = read_hglobal_bytes(handle)?;
+        let decoded = match format {
+            ClipFormat::Utf8Text => utf16le_bytes_to_utf8(&raw),
+            ClipFormat::UriList => hdrop::hdrop_bytes_to_uri_list(handle)?,
+            _ => raw,
+        };
+        Ok(Some(decoded))
+    }
+
+    fn write(&self, format: ClipFormat, data: &[u8]) -> PlatformResult<()> {
+        let fmt = clipboard_format(format)?;
+
+        // Build the exact `HGLOBAL` payload Windows expects for this format *before*
+        // taking ownership of the clipboard, so a conversion error can't leave it empty.
+        let payload: Vec<u8> = match format {
+            ClipFormat::Utf8Text => {
+                let s = std::str::from_utf8(data).map_err(|e| -> PlatformError { Box::new(e) })?;
+                utf8_to_utf16le_bytes(s)
+            }
+            ClipFormat::UriList => hdrop::uri_list_to_hdrop_bytes(data)?,
+            _ => data.to_vec(),
+        };
+
+        let _session = ClipboardSession::open()?;
+        // SAFETY: clipboard is open; `EmptyClipboard` takes ownership for this process,
+        // a precondition for `SetClipboardData`.
+        unsafe { EmptyClipboard() }.map_err(boxed)?;
+
+        let hglobal = alloc_global(&payload)?;
+        // SAFETY: clipboard is open and emptied; on success Windows takes ownership of
+        // `hglobal` (we must NOT free it). `HGLOBAL`→`HANDLE` is a pointer newtype cast.
+        match unsafe { SetClipboardData(fmt, Some(HANDLE(hglobal.0))) } {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Ownership did not transfer; reclaim the block so it doesn't leak.
+                // SAFETY: `hglobal` is our still-owned, unlocked allocation.
+                let _ = unsafe { GlobalFree(Some(hglobal)) };
+                Err(boxed(e))
+            }
+        }
+    }
+}
+
+/// Box a `windows::core::Error` as a [`PlatformError`].
+fn boxed(e: windows::core::Error) -> PlatformError {
+    Box::new(e)
+}
+
+/// Resolve a [`ClipFormat`] to its numeric Win32 clipboard format id.
+///
+/// Standard ids (`CF_UNICODETEXT`, `CF_HDROP`) are constants; `Html`/`Rtf`/`Png`
+/// are *registered* formats whose ids are assigned by the OS at first use and stable
+/// for the session. A `0` from `RegisterClipboardFormatW` means registration failed.
+/// The clipboard APIs all take the format as a bare `u32`.
+fn clipboard_format(format: ClipFormat) -> PlatformResult<u32> {
+    let id = match format {
+        ClipFormat::Utf8Text => u32::from(CF_UNICODETEXT.0),
+        ClipFormat::UriList => u32::from(CF_HDROP.0),
+        ClipFormat::Html => register("HTML Format")?,
+        ClipFormat::Rtf => register("Rich Text Format")?,
+        ClipFormat::Png => register("PNG")?,
+    };
+    Ok(id)
+}
+
+/// Register (or look up) a named clipboard format, returning its id.
+fn register(name: &str) -> PlatformResult<u32> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call.
+    let id = unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) };
+    if id == 0 {
+        return Err(Box::new(ClipboardError::RegisterFailed(name.to_owned())));
+    }
+    Ok(id)
+}
+
+/// RAII guard around `OpenClipboard`/`CloseClipboard`.
+///
+/// Opening with a `None` owner associates the clipboard with the current task; the
+/// guard's `Drop` runs `CloseClipboard` even on an early `?` return, so the
+/// clipboard is never left open (which would lock every other app out of it).
+struct ClipboardSession;
+
+impl ClipboardSession {
+    /// Open the clipboard for this task.
+    fn open() -> PlatformResult<Self> {
+        // SAFETY: passing `None` is valid (associates with the current task). On
+        // failure (another process holds it) we return an error and do not close.
+        unsafe { OpenClipboard(None) }.map_err(boxed)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ClipboardSession {
+    fn drop(&mut self) {
+        // SAFETY: balanced with the successful `OpenClipboard` in `open`; ignore the
+        // result since `Drop` cannot propagate and there is no recovery.
+        let _ = unsafe { CloseClipboard() };
+    }
+}
+
+/// Copy the bytes of a clipboard `HGLOBAL` handle into an owned `Vec`.
+///
+/// The handle is locked to obtain a pointer + size, the bytes are copied, then the
+/// handle is unlocked. The handle itself is owned by the clipboard, not us.
+fn read_hglobal_bytes(handle: HANDLE) -> PlatformResult<Vec<u8>> {
+    let hglobal = HGLOBAL(handle.0);
+    // SAFETY: `hglobal` came from `GetClipboardData` and is valid while the clipboard
+    // is open; `GlobalSize` reads its allocation size.
+    let size = unsafe { GlobalSize(hglobal) };
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: locks the block, returning a readable pointer to `size` bytes (or null
+    // on failure). We read exactly `size` bytes and unlock before returning.
+    let ptr = unsafe { GlobalLock(hglobal) } as *const u8;
+    if ptr.is_null() {
+        return Err(Box::new(ClipboardError::LockFailed));
+    }
+    // SAFETY: `ptr` is valid for `size` bytes per the successful lock above; the
+    // source (clipboard memory) and destination (fresh Vec) do not overlap.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+    // SAFETY: balances the `GlobalLock` above on the same handle.
+    let _ = unsafe { GlobalUnlock(hglobal) };
+    Ok(bytes)
+}
+
+/// Allocate a moveable `HGLOBAL` and copy `bytes` into it (for `SetClipboardData`).
+///
+/// `SetClipboardData` requires `GMEM_MOVEABLE` memory and, on success, takes
+/// ownership of it. The block is unlocked before returning so the clipboard can
+/// relocate it.
+fn alloc_global(bytes: &[u8]) -> PlatformResult<HGLOBAL> {
+    // SAFETY: standard allocation request; returns a valid handle or an error.
+    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) }.map_err(boxed)?;
+    // SAFETY: just-allocated handle; lock to get a writable pointer to >= len bytes.
+    let ptr = unsafe { GlobalLock(hglobal) } as *mut u8;
+    if ptr.is_null() {
+        // SAFETY: reclaim the block we just allocated and still own (lock failed).
+        let _ = unsafe { GlobalFree(Some(hglobal)) };
+        return Err(Box::new(ClipboardError::LockFailed));
+    }
+    // SAFETY: `ptr` is valid for `bytes.len()` writes (alloc was `>= len`); regions
+    // do not overlap (fresh allocation vs caller's slice).
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+    // SAFETY: balances the lock; the handle remains valid and owned by us until
+    // `SetClipboardData` succeeds.
+    let _ = unsafe { GlobalUnlock(hglobal) };
+    Ok(hglobal)
+}
+
+/// Decode `CF_UNICODETEXT` clipboard bytes (UTF-16LE, possibly NUL-terminated) to
+/// UTF-8, stripping a trailing NUL. Lone surrogates become U+FFFD.
+fn utf16le_bytes_to_utf8(raw: &[u8]) -> Vec<u8> {
+    let units: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    String::from_utf16_lossy(&units).into_bytes()
+}
+
+/// Encode a UTF-8 string as `CF_UNICODETEXT` bytes: UTF-16LE with a trailing NUL,
+/// which Windows clipboard consumers expect.
+fn utf8_to_utf16le_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() * 2 + 2);
+    for u in s.encode_utf16() {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// Errors raised by the Windows clipboard adapter that aren't a raw `windows::Error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardError {
+    /// `RegisterClipboardFormatW` returned 0 for the named format.
+    RegisterFailed(String),
+    /// `GlobalLock` returned null (the handle could not be locked).
+    LockFailed,
+    /// A `text/uri-list` payload was not valid UTF-8.
+    InvalidUriList,
+}
+
+impl std::fmt::Display for ClipboardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RegisterFailed(n) => write!(f, "RegisterClipboardFormatW failed for {n:?}"),
+            Self::LockFailed => write!(f, "GlobalLock returned null"),
+            Self::InvalidUriList => write!(f, "text/uri-list payload was not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for ClipboardError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_roundtrip_strips_nul() {
+        let s = "héllo — ✓\nline2";
+        let wide = utf8_to_utf16le_bytes(s);
+        // Trailing NUL (2 bytes) present.
+        assert_eq!(&wide[wide.len() - 2..], &[0, 0]);
+        let back = utf16le_bytes_to_utf8(&wide);
+        assert_eq!(back, s.as_bytes());
+    }
+
+    #[test]
+    fn utf16_decode_handles_unterminated() {
+        // No trailing NUL: still decodes fully.
+        let s = "abc";
+        let wide: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(utf16le_bytes_to_utf8(&wide), s.as_bytes());
+    }
+
+    #[test]
+    fn utf16_decode_ignores_odd_trailing_byte() {
+        // An odd byte count can't form a full UTF-16 unit; it's dropped, not panicked.
+        let bytes = [0x41, 0x00, 0x42]; // "A" + stray 0x42
+        assert_eq!(utf16le_bytes_to_utf8(&bytes), b"A");
+    }
+}

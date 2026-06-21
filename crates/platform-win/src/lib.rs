@@ -44,6 +44,11 @@ pub mod inject;
 #[cfg(target_os = "windows")]
 pub use inject::{button, cursor_position, key, move_cursor, scroll, Button, InjectError};
 
+#[cfg(target_os = "windows")]
+pub mod clipboard;
+#[cfg(target_os = "windows")]
+pub use clipboard::{ClipboardError, WinClipboard};
+
 /// Non-Windows stub so the crate compiles on macOS / Linux hosts.
 ///
 /// The `SendInput` backend only exists on Windows; everywhere else this marker

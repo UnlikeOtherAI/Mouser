@@ -25,7 +25,7 @@ libc = "0.2"
 # require `unsafe`, which is why this crate does not adopt the workspace
 # `forbid(unsafe_code)` lint (see lib.rs).
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSArray", "NSGeometry", "NSObject"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSArray", "NSData", "NSGeometry", "NSObject"] }
 objc2-app-kit = { version = "0.3", features = [
   "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem",
   "NSDraggingSession", "NSWindow", "NSView", "NSResponder", "NSApplication",

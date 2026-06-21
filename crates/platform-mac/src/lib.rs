@@ -34,6 +34,7 @@
 
 pub mod adapter;
 pub mod capture;
+pub mod clipboard;
 pub mod display_info;
 pub mod dragdrop;
 pub mod inject;
@@ -42,9 +43,8 @@ pub mod keymap_capture;
 
 pub use adapter::{MacCapture, MacInjector};
 pub use capture::{install_listen_only_tap, CaptureError};
-pub use display_info::{
-    active_display_bounds, display_bounds, main_display_bounds, DisplayBounds,
-};
+pub use clipboard::{ClipboardWriteFailed, MacClipboard};
+pub use display_info::{active_display_bounds, display_bounds, main_display_bounds, DisplayBounds};
 pub use dragdrop::{
     begin_file_drag, read_dragged_file_urls, read_dragged_file_urls_from, write_file_urls,
     DragError, DragSession,
