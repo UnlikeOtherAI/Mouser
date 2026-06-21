@@ -45,10 +45,11 @@ build/test/clippy green after every merge; 32 test suites pass):
 - `ios-fixes` — portrait keyboard-below layout, scenePhase lifecycle/reconnect hooks, drag double-motion fix, momentum `deinit`, clipboard settings + wait-indicator views (xcodebuild iOS-sim **BUILD SUCCEEDED**).
 - `android-fixes` — `DefaultLifecycleObserver`/`LifecycleEventEffect`, monotonic gesture clock, dropped `material-icons-extended` + R8 on release, clipboard settings + progress composables (gradle assembleDebug/Release + unit tests pass).
 
+Hygiene merged (`559225c`): workspace-wide panic-free clippy denies (`[workspace.lints.clippy]` + per-crate adoption + `clippy.toml` test exemptions; 6 Windows indexing lints + Linux mutex poison-recovery fixed), `libc` removed, dragdrop SAFETY notes. **All Round-2 non-engine findings are now fixed; the shared clipboard is complete end-to-end.**
+
 ## Queued
-1. **Hygiene** (in flight): workspace-wide panic-free clippy lints (`[workspace.lints.clippy]` + per-crate adoption, fixing newly-surfaced lints), remove unused `libc` from platform-mac, add `// SAFETY:` to dragdrop.rs unsafe sites.
-2. **Round 3 audit** on the whole codebase (per request) — after hygiene lands.
-3. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
+1. **Round 3 audit** (in flight): 24-agent paired review (12 Opus + 12 Codex), weighted to the new clipboard surface (engine/adapters/UI) + verifying R2 fixes held; every finding orchestrator-verified → `docs/audit-round3.md`.
+2. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
 
 ## Infra
 rustup 1.96 + ios targets; Xcode 26.3 + iPhone 17 Pro sim; Android SDK + AVD; Linux box `ai@192.168.1.203` (uinput). Per-task gate = Codex+Claude pair; parallel worktrees under `.worktrees/`.
