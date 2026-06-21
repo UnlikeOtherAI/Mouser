@@ -83,8 +83,12 @@ fn main() {
     println!("  - overlay NSWindow/NSView + NSDraggingItem + NSDraggingSource built: yes (compiled & called)");
     println!("  - begin-drag call path reachable on the main thread: yes");
     println!("NEEDS A REAL GUI / TCC (NOT injectable headlessly):");
-    println!("  - the WindowServer actually TRACKING the drag and a DROP landing in Finder/desktop");
-    println!("  - a held hardware mouse button behind the session (synthetic NSEvent is not enough)");
+    println!(
+        "  - the WindowServer actually TRACKING the drag and a DROP landing in Finder/desktop"
+    );
+    println!(
+        "  - a held hardware mouse button behind the session (synthetic NSEvent is not enough)"
+    );
     println!("  - on the cross-machine inject side, TCC Accessibility for the receiving process");
 
     let _ = fs::remove_file(&path);

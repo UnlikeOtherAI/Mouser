@@ -39,6 +39,11 @@
 pub mod keymap;
 pub use keymap::{hid_usage_to_scancode, hid_usage_to_vk, supported_hid_usages, ScanCode};
 
+// `cfhtml` is the pure CF_HTML wrap/unwrap codec (no `windows` dependency). It is
+// always compiled so the CF_HTML round-trip is unit-tested on every host even
+// though the clipboard adapter that uses it is Windows-only.
+mod cfhtml;
+
 #[cfg(target_os = "windows")]
 pub mod inject;
 #[cfg(target_os = "windows")]
@@ -50,6 +55,14 @@ pub use inject::{
 pub mod clipboard;
 #[cfg(target_os = "windows")]
 pub use clipboard::{ClipboardError, WinClipboard};
+
+// Off-Windows, expose a `WinClipboard` stub implementing `mouser_core::Clipboard`
+// (mirrors `platform-linux`'s `LinuxClipboard` stub) so cross-platform code and
+// tests can name and exercise the type on every host.
+#[cfg(not(target_os = "windows"))]
+pub mod clipboard_stub;
+#[cfg(not(target_os = "windows"))]
+pub use clipboard_stub::WinClipboard;
 
 /// Non-Windows stub so the crate compiles on macOS / Linux hosts.
 ///

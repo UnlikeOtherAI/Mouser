@@ -225,9 +225,15 @@ pub fn mods_to_cgflags(mods: u16, cmd_ctrl_swap: bool) -> CGEventFlags {
 
     // Resolve which flag Ctrl vs Command each maps to under the optional swap.
     let (ctrl_flag, meta_flag) = if cmd_ctrl_swap {
-        (CGEventFlags::CGEventFlagCommand, CGEventFlags::CGEventFlagControl)
+        (
+            CGEventFlags::CGEventFlagCommand,
+            CGEventFlags::CGEventFlagControl,
+        )
     } else {
-        (CGEventFlags::CGEventFlagControl, CGEventFlags::CGEventFlagCommand)
+        (
+            CGEventFlags::CGEventFlagControl,
+            CGEventFlags::CGEventFlagCommand,
+        )
     };
 
     let mut flags = CGEventFlags::CGEventFlagNull;
