@@ -44,7 +44,7 @@ pub mod settings;
 pub mod source;
 
 pub use canonical::{canonical, content_hash, sha256};
-pub use engine::ClipboardEngine;
+pub use engine::{transport_for, ClipboardEngine, Transport};
 pub use reassembly::{Progress, Reassembly};
 pub use settings::{is_apple, prefer_native_suppresses, ClipboardSettings, SyncDirection};
 pub use source::{AppliedClip, ClipContentSource, LocalRepr, MemContentSource};
