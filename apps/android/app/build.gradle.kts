@@ -24,7 +24,11 @@ android {
             isMinifyEnabled = false
         }
         release {
-            isMinifyEnabled = false
+            // R8 on: shrink + obfuscate the release APK. We no longer pull
+            // material-icons-extended (audit R2 LOW: release bloat), so the icon
+            // set is small; R8 trims everything else unreachable too.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -64,13 +68,20 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+    // Lifecycle-aware Compose effects (LifecycleEventEffect / LifecycleStartEffect)
+    // used to pause the inertia/frame loop in the background and reconnect on resume
+    // (audit R2 HIGH: app lifecycle). Pinned to the same lifecycle train as -ktx.
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
+    // Only the ~50-glyph core icon set (BOM-managed). The full
+    // material-icons-extended artifact was dropped (audit R2 LOW: release bloat);
+    // the handful of non-core glyphs we need are local vectors in MouserIcons.kt.
+    implementation("androidx.compose.material:material-icons-core")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
