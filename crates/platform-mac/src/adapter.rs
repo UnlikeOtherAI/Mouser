@@ -12,13 +12,12 @@
 //!   adapter falls back to listen-only and reports `can_suppress() == false`
 //!   instead of pretending it swallowed input.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType, CallbackResult, EventField,
+    CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    CallbackResult, EventField,
 };
 use mouser_core::platform::{
     CaptureDecision, InputCapture, InputInjection, InputSink, LocalInputEvent, PlatformError,
@@ -27,7 +26,7 @@ use mouser_core::platform::{
 
 use crate::display_info::display_bounds;
 use crate::inject;
-use crate::keymap_capture::{cgkeycode_to_hid_usage, flags_changed_event};
+use crate::keymap_capture::{flags_changed_event, to_local_event, ModifierState};
 
 /// macOS input injector. Stateless; every call posts a fresh `CGEvent`.
 ///
@@ -42,7 +41,9 @@ impl MacInjector {
     /// Injector with the default (no) Cmd↔Ctrl swap.
     #[must_use]
     pub fn new() -> Self {
-        Self { cmd_ctrl_swap: false }
+        Self {
+            cmd_ctrl_swap: false,
+        }
     }
 
     /// Injector with the Cmd↔Ctrl swap preference set.
@@ -98,59 +99,6 @@ impl InputInjection for MacInjector {
             ScrollUnit::LogicalPixel => (dx, dy),
         };
         inject::scroll(dx, dy, pixel).map_err(boxed)
-    }
-}
-
-/// Translate a captured `CGEvent` into a [`LocalInputEvent`], or `None` for event
-/// types we don't forward.
-///
-/// Captured `mods` is reported as `0`: the engine derives modifier state from the
-/// observed modifier **key** transitions (HID 0xE0..=0xE7) it also receives.
-/// `FlagsChanged` is **not** handled here — modifier transitions need the
-/// previous-flags state held per-capture, so they are resolved in the tap
-/// callback via [`flags_changed_event`] (see [`make_callback`]).
-fn to_local_event(etype: CGEventType, event: &CGEvent) -> Option<LocalInputEvent> {
-    match etype {
-        CGEventType::MouseMoved
-        | CGEventType::LeftMouseDragged
-        | CGEventType::RightMouseDragged
-        | CGEventType::OtherMouseDragged => {
-            let p = event.location();
-            Some(LocalInputEvent::CursorMoved {
-                display_id: 0,
-                x: p.x as i32,
-                y: p.y as i32,
-            })
-        }
-        CGEventType::LeftMouseDown => Some(LocalInputEvent::Button { button: 0, down: true }),
-        CGEventType::LeftMouseUp => Some(LocalInputEvent::Button { button: 0, down: false }),
-        CGEventType::RightMouseDown => Some(LocalInputEvent::Button { button: 1, down: true }),
-        CGEventType::RightMouseUp => Some(LocalInputEvent::Button { button: 1, down: false }),
-        CGEventType::OtherMouseDown | CGEventType::OtherMouseUp => {
-            let n = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-            let down = matches!(etype, CGEventType::OtherMouseDown);
-            u8::try_from(n).ok().map(|button| LocalInputEvent::Button { button, down })
-        }
-        CGEventType::KeyDown | CGEventType::KeyUp => {
-            let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-            let usage = u16::try_from(keycode)
-                .ok()
-                .and_then(cgkeycode_to_hid_usage)?;
-            Some(LocalInputEvent::Key {
-                usage,
-                down: matches!(etype, CGEventType::KeyDown),
-                mods: 0,
-            })
-        }
-        CGEventType::ScrollWheel => {
-            let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
-            let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
-            Some(LocalInputEvent::Scroll {
-                dx: dx as i32,
-                dy: dy as i32,
-            })
-        }
-        _ => None,
     }
 }
 
@@ -218,41 +166,50 @@ fn decision_for(sink: &dyn InputSink, ev: LocalInputEvent) -> CallbackResult {
 /// Resolve a `FlagsChanged` event into a `Key` and forward it to the sink.
 ///
 /// macOS delivers modifier (Ctrl/Shift/Alt/Cmd) transitions as `FlagsChanged`,
-/// not KeyDown/KeyUp. Down vs up is the diff of this event's flags against the
-/// previous flags held in `prev_flags`; `prev_flags` is then advanced to the new
-/// value so the next transition diffs correctly. Returns the sink's decision so a
-/// suppress-capable tap can drop a modifier press; events we don't model
-/// (Fn/CapsLock, or a shared-flag release that left no net change) pass through.
+/// not KeyDown/KeyUp. Down vs up is derived from the per-keyCode held state in
+/// `state` (each `FlagsChanged` for a keyCode toggles it), so the release of one
+/// of two held left/right twins is reported correctly even though they share a
+/// single device-independent flag bit (audit FlagsChanged-twin). Returns the
+/// sink's decision so a suppress-capable tap can drop a modifier press; events we
+/// don't model (Fn/CapsLock) pass through and leave `state` untouched.
 fn handle_flags_changed(
     sink: &dyn InputSink,
     event: &CGEvent,
-    prev_flags: &AtomicU64,
+    state: &Mutex<ModifierState>,
 ) -> CallbackResult {
-    let next = event.get_flags();
-    let prev = CGEventFlags::from_bits_truncate(prev_flags.swap(next.bits(), Ordering::Relaxed));
     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-    let resolved = u16::try_from(keycode)
-        .ok()
-        .and_then(|kc| flags_changed_event(kc, prev, next));
+    let resolved = u16::try_from(keycode).ok().and_then(|kc| {
+        let mut guard = state.lock().expect("modifier-state mutex");
+        flags_changed_event(kc, &mut guard)
+    });
     match resolved {
-        Some((usage, down)) => decision_for(sink, LocalInputEvent::Key { usage, down, mods: 0 }),
+        Some((usage, down)) => decision_for(
+            sink,
+            LocalInputEvent::Key {
+                usage,
+                down,
+                mods: 0,
+            },
+        ),
         None => CallbackResult::Keep,
     }
 }
 
 /// Build the tap callback: forward to the sink, honor its [`CaptureDecision`].
 ///
-/// Modifier-key (`FlagsChanged`) transitions are stateful — down vs up is a diff
-/// against the previously observed `CGEventFlags`, tracked here per-capture in an
-/// atomic seeded to the empty flag set.
+/// Modifier-key (`FlagsChanged`) transitions are stateful — down vs up is the
+/// toggle of the changed key's per-keyCode held state, tracked here per-capture
+/// in a [`ModifierState`] behind a `Mutex` (the tap callback is `Fn`, so it needs
+/// interior mutability).
 fn make_callback(
     sink: Arc<dyn InputSink>,
-) -> impl Fn(core_graphics::event::CGEventTapProxy, CGEventType, &CGEvent) -> CallbackResult + Send + 'static
-{
-    let prev_flags = Arc::new(AtomicU64::new(CGEventFlags::CGEventFlagNull.bits()));
+) -> impl Fn(core_graphics::event::CGEventTapProxy, CGEventType, &CGEvent) -> CallbackResult
+       + Send
+       + 'static {
+    let mod_state = Arc::new(Mutex::new(ModifierState::new()));
     move |_proxy, etype, event| {
         if matches!(etype, CGEventType::FlagsChanged) {
-            return handle_flags_changed(sink.as_ref(), event, &prev_flags);
+            return handle_flags_changed(sink.as_ref(), event, &mod_state);
         }
         match to_local_event(etype, event) {
             Some(ev) => decision_for(sink.as_ref(), ev),
@@ -395,7 +352,11 @@ mod tests {
         // A modifier Key the engine wants swallowed maps to a tap Drop, and the
         // sink actually saw the event.
         let sink = RecordingSink::new(CaptureDecision::Suppress);
-        let key = LocalInputEvent::Key { usage: 0xE3, down: true, mods: 0 };
+        let key = LocalInputEvent::Key {
+            usage: 0xE3,
+            down: true,
+            mods: 0,
+        };
         assert!(matches!(decision_for(&sink, key), CallbackResult::Drop));
         assert_eq!(sink.seen.lock().expect("seen").as_slice(), &[key]);
     }
@@ -403,7 +364,11 @@ mod tests {
     #[test]
     fn passthrough_decision_keeps_the_event() {
         let sink = RecordingSink::new(CaptureDecision::PassThrough);
-        let key = LocalInputEvent::Key { usage: 0xE0, down: false, mods: 0 };
+        let key = LocalInputEvent::Key {
+            usage: 0xE0,
+            down: false,
+            mods: 0,
+        };
         assert!(matches!(decision_for(&sink, key), CallbackResult::Keep));
     }
 

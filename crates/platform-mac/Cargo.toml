@@ -33,9 +33,11 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 
 [dev-dependencies]
-# Keymap parity test (audit H11): compares the mac & linux HID-usage coverage.
-# The linux table's `supported_hid_usages` is host-independent pure data.
+# Keymap parity test (audit H11 / C2-8): compares the mac, linux & windows
+# HID-usage coverage. Each crate's `supported_hid_usages` is host-independent
+# pure data, so the three-way assertion runs on a macOS build host.
 platform-linux = { path = "../platform-linux" }
+platform-win = { path = "../platform-win" }
 
 [[example]]
 name = "inject_demo"

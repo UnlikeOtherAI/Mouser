@@ -37,12 +37,14 @@
 // `keymap` is pure logic with no platform deps — always compiled so the
 // Appendix B Windows table is testable on any host.
 pub mod keymap;
-pub use keymap::{hid_usage_to_scancode, hid_usage_to_vk, ScanCode};
+pub use keymap::{hid_usage_to_scancode, hid_usage_to_vk, supported_hid_usages, ScanCode};
 
 #[cfg(target_os = "windows")]
 pub mod inject;
 #[cfg(target_os = "windows")]
-pub use inject::{button, cursor_position, key, move_cursor, scroll, Button, InjectError};
+pub use inject::{
+    button, cursor_position, key, move_cursor, scroll, Button, InjectError, ScrollUnit,
+};
 
 /// Non-Windows stub so the crate compiles on macOS / Linux hosts.
 ///

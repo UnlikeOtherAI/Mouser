@@ -2847,6 +2847,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "platform-linux",
+ "platform-win",
 ]
 
 [[package]]

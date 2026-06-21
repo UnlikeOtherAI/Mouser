@@ -58,6 +58,26 @@ impl DisplayBounds {
         let ly = f64::from(y).clamp(0.0, (self.h - 1.0).max(0.0));
         (self.x + lx, self.y + ly)
     }
+
+    /// Whether a **global** CG point falls inside this display's rect.
+    ///
+    /// Half-open on the far edge (`x..x+w`, `y..y+h`) so a point exactly on the
+    /// boundary between two adjacent displays belongs to exactly one of them.
+    #[must_use]
+    pub fn contains_global(&self, gx: f64, gy: f64) -> bool {
+        gx >= self.x && gx < self.x + self.w && gy >= self.y && gy < self.y + self.h
+    }
+
+    /// Map a **global** CG point to this display's **display-local** logical
+    /// pixels (origin top-left, y-down), preserving sub-pixel precision.
+    ///
+    /// The inverse of [`Self::local_to_global`] without the integer cast — the
+    /// caller decides when to round/truncate (the capture path keeps the float as
+    /// long as it can before the wire's `i32`).
+    #[must_use]
+    pub fn global_to_local(&self, gx: f64, gy: f64) -> (f64, f64) {
+        (gx - self.x, gy - self.y)
+    }
 }
 
 /// Bounds of the main display.
@@ -89,6 +109,20 @@ pub fn display_bounds(display_id: u32) -> Option<DisplayBounds> {
     active_display_bounds()
         .into_iter()
         .find(|b| b.id == display_id)
+}
+
+/// The display whose rect contains a **global** CG point (capture-side attribution,
+/// audit C2-9), or `None` if no active display contains it.
+///
+/// Used by the capture path to turn a global cursor position into the wire's
+/// `(display_id, display-local x, y)` (§7.6 / Appendix A). A point that lands in
+/// no display (a momentary off-screen sample during hot-plug, or the seam past
+/// the far edge) returns `None`; the caller decides the fallback.
+#[must_use]
+pub fn display_for_global_point(gx: f64, gy: f64) -> Option<DisplayBounds> {
+    active_display_bounds()
+        .into_iter()
+        .find(|b| b.contains_global(gx, gy))
 }
 
 #[cfg(test)]
@@ -129,5 +163,47 @@ mod tests {
         assert_eq!(b.local_to_global(5000, 5000), (1920.0 + 1279.0, 1023.0));
         // Negative clamps to the origin.
         assert_eq!(b.local_to_global(-10, -10), (1920.0, 0.0));
+    }
+
+    #[test]
+    fn global_to_local_is_inverse_and_keeps_subpixel() {
+        let b = DisplayBounds {
+            id: 7,
+            x: 1920.0,
+            y: 0.0,
+            w: 1280.0,
+            h: 1024.0,
+        };
+        // Global origin -> display-local (0,0).
+        assert_eq!(b.global_to_local(1920.0, 0.0), (0.0, 0.0));
+        // Sub-pixel precision is preserved (no integer cast inside).
+        assert_eq!(b.global_to_local(2020.5, 50.25), (100.5, 50.25));
+    }
+
+    #[test]
+    fn contains_global_is_half_open_on_the_far_edge() {
+        let left = DisplayBounds {
+            id: 1,
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        };
+        let right = DisplayBounds {
+            id: 2,
+            x: 1920.0,
+            y: 0.0,
+            w: 1280.0,
+            h: 1024.0,
+        };
+        // Origin and an interior point belong to the left display.
+        assert!(left.contains_global(0.0, 0.0));
+        assert!(left.contains_global(1919.0, 1079.0));
+        // The seam x=1920 belongs to the right display only (half-open).
+        assert!(!left.contains_global(1920.0, 0.0));
+        assert!(right.contains_global(1920.0, 0.0));
+        // A point past both displays is in neither.
+        assert!(!left.contains_global(5000.0, 0.0));
+        assert!(!right.contains_global(5000.0, 0.0));
     }
 }

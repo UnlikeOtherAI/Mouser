@@ -236,22 +236,60 @@ fn button_flags(button: Button, down: bool) -> (MOUSE_EVENT_FLAGS, u32) {
     }
 }
 
-/// Scroll by wheel deltas (`dx` horizontal, `dy` vertical).
+/// Scroll-delta unit, mirroring the wire `ScrollUnit` (§7.5 / Appendix C) so this
+/// standalone skeleton needn't depend on `mouser-core`'s platform contract (the
+/// engine translates between the two, exactly as [`Button::from_wire`] mirrors the
+/// wire button codes).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScrollUnit {
+    /// `dx/dy` in 1/120-of-a-wheel-notch units (legacy wheel detents) — the
+    /// native `SendInput` wheel unit (`WHEEL_DELTA` = 120 per notch).
+    Detent120,
+    /// High-resolution / trackpad logical pixels.
+    LogicalPixel,
+}
+
+/// `WHEEL_DELTA`: one wheel notch, the unit `SendInput`'s wheel expects.
+const WHEEL_DELTA: i32 = 120;
+
+/// Pack a signed wheel delta into the `DWORD` `mouseData` field per the Win32
+/// wheel contract.
 ///
-/// Wire `Scroll` carries `dx/dy` in either `Detent120` or `LogicalPixel` units
-/// (§7.5). `SendInput`'s wheel is natively in `Detent120` units (`WHEEL_DELTA`
-/// = 120 per notch), so a `Detent120` value maps through unchanged; a
-/// `LogicalPixel` value should be converted by the caller. Vertical uses
-/// `MOUSEEVENTF_WHEEL`, horizontal `MOUSEEVENTF_HWHEEL`.
+/// `mouseData` holds a **signed** wheel amount (positive = forward / right,
+/// negative = backward / left; multiples of `WHEEL_DELTA`). The wheel delta is
+/// conventionally a `short`, so clamp into `i16` range first, then store the
+/// sign-extended `i32` as `u32` bits. This fixes the prior blind `delta as u32`,
+/// whose low 16 bits could flip the apparent sign for out-of-range
+/// (e.g. accumulated `LogicalPixel`) values.
+fn wheel_mouse_data(delta: i32) -> u32 {
+    let clamped = delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+    clamped as u32
+}
+
+/// Scroll by wheel deltas (`dx` horizontal, `dy` vertical) in the given
+/// [`ScrollUnit`].
+///
+/// `SendInput`'s wheel is natively in `Detent120` units (`WHEEL_DELTA` = 120 per
+/// notch), so a `Detent120` value maps through unchanged; a `LogicalPixel` value
+/// is converted to whole detents here (mirroring the mac/linux adapters'
+/// `Detent120` vs `LogicalPixel` handling — divide by `WHEEL_DELTA`). Vertical
+/// uses `MOUSEEVENTF_WHEEL`, horizontal `MOUSEEVENTF_HWHEEL`. The signed delta is
+/// packed sign-correctly via [`wheel_mouse_data`].
 ///
 /// # Errors
 /// [`InjectError::SendInput`] if an event was not queued.
-pub fn scroll(dx: i32, dy: i32) -> Result<(), InjectError> {
+pub fn scroll(dx: i32, dy: i32, unit: ScrollUnit) -> Result<(), InjectError> {
+    let (dx, dy) = match unit {
+        ScrollUnit::Detent120 => (dx, dy),
+        // Best-effort hi-res -> detents, matching platform-mac/linux. A
+        // sub-detent pixel delta truncates to 0 (no spurious notch).
+        ScrollUnit::LogicalPixel => (dx / WHEEL_DELTA, dy / WHEEL_DELTA),
+    };
     if dy != 0 {
         let mi = MOUSEINPUT {
             dx: 0,
             dy: 0,
-            mouseData: dy as u32,
+            mouseData: wheel_mouse_data(dy),
             dwFlags: MOUSEEVENTF_WHEEL,
             time: 0,
             dwExtraInfo: 0,
@@ -262,7 +300,7 @@ pub fn scroll(dx: i32, dy: i32) -> Result<(), InjectError> {
         let mi = MOUSEINPUT {
             dx: 0,
             dy: 0,
-            mouseData: dx as u32,
+            mouseData: wheel_mouse_data(dx),
             dwFlags: MOUSEEVENTF_HWHEEL,
             time: 0,
             dwExtraInfo: 0,
@@ -359,5 +397,41 @@ mod tests {
         assert_eq!(normalize_axis(9999, 0, 1920), 65535);
         // Negative origin (monitor left of primary): origin maps to 0.
         assert_eq!(normalize_axis(-1920, -1920, 1920), 0);
+    }
+
+    #[test]
+    fn wheel_mouse_data_is_sign_correct() {
+        // One notch forward / backward: the system reads mouseData as a signed
+        // wheel amount, so -120 must be the sign-extended bit pattern, not a
+        // truncated/garbage value.
+        assert_eq!(wheel_mouse_data(WHEEL_DELTA), 120);
+        assert_eq!(wheel_mouse_data(-WHEEL_DELTA), (-120_i32) as u32);
+        assert_eq!(wheel_mouse_data(-WHEEL_DELTA), 0xFFFF_FF88);
+        assert_eq!(wheel_mouse_data(0), 0);
+        // The low 16 bits of a negative one-notch delta read back as -120 when
+        // the kernel takes the wheel `short` — proving the sign survives.
+        assert_eq!(wheel_mouse_data(-WHEEL_DELTA) as i16, -120);
+    }
+
+    #[test]
+    fn wheel_mouse_data_clamps_to_i16_range() {
+        // A large (e.g. accumulated LogicalPixel) delta is clamped into the
+        // wheel's `short` range so its low word can't flip the apparent sign —
+        // the bug the prior blind `as u32` had.
+        assert_eq!(wheel_mouse_data(100_000), i16::MAX as u32);
+        assert_eq!(wheel_mouse_data(-100_000), (i16::MIN as i32) as u32);
+        // Still positive after clamp (would have been negative under truncation:
+        // 100_000 & 0xFFFF = 0x86A0, whose i16 is negative).
+        assert!((wheel_mouse_data(100_000) as i16) > 0);
+    }
+
+    #[test]
+    fn scroll_logical_pixels_convert_to_detents() {
+        // Sanity on the unit math (no SendInput call): 120 logical px = 1 detent,
+        // sub-detent truncates to 0. We exercise the same arithmetic scroll uses.
+        let to_detents = |d: i32| d / WHEEL_DELTA;
+        assert_eq!(to_detents(120), 1);
+        assert_eq!(to_detents(-240), -2);
+        assert_eq!(to_detents(60), 0);
     }
 }
