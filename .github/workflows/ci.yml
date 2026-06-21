@@ -26,3 +26,17 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all --all-features
+
+  ios-app:
+    name: ios app · xcodegen · xcodebuild
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+        working-directory: apps/ios
+      - name: Build iOS app (simulator)
+        run: xcodebuild -scheme Mouser -destination 'generic/platform=iOS Simulator' build
+        working-directory: apps/ios

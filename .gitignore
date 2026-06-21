@@ -23,6 +23,15 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 
+# Xcode / iOS (project is generated from project.yml via xcodegen)
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+# xcodebuild -derivedDataPath build output (any level)
+build/
+*.xcuserstate
+
 # Worktrees (mandated location, kept out of history)
 .worktrees/
 

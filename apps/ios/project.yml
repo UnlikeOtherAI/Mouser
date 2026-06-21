@@ -1,0 +1,59 @@
+name: Mouser
+options:
+  bundleIdPrefix: ai.unlikeother.mouser
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_ALLOWED: "NO"
+
+targets:
+  Mouser:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+    entitlements:
+      path: Sources/Mouser.entitlements
+      properties:
+        # Multicast entitlement — required alongside the Local Network usage
+        # string for mDNS/Bonjour discovery on iOS. See docs/tech-stack.md §6.
+        com.apple.developer.networking.multicast: true
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Mouser
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        # Local Network (mDNS/LAN) — required on iOS 14+ for the companion to
+        # discover and dial engines over Bonjour. See docs/tech-stack.md §6.
+        NSLocalNetworkUsageDescription: Mouser discovers and connects to your computers on the local network to control their mouse and keyboard.
+        NSBonjourServices:
+          - _mouser._udp
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # Portrait = touchpad + native keyboard (brief: Bed Mode); landscape =
+        # full-screen trackpad (requirement §1). Both orientations supported.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.unlikeother.mouser.companion
+        GENERATE_INFOPLIST_FILE: "NO"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
