@@ -9,14 +9,14 @@
 
 use std::time::Duration;
 
-use mouser_net::{Identity, InteractiveEndpoint, PinPolicy};
+use mouser_net::{DeviceIdentity, InteractiveEndpoint, PinPolicy};
 use mouser_protocol::{decode_frame, from_cbor, to_cbor, Datagram, Ping, PointerMotion, TYPE_PING};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interactive_connection_roundtrips_ping_and_motion() {
     // Both peers generate a permanent Ed25519 identity (§3).
-    let server_id = Identity::generate().expect("server identity");
-    let client_id = Identity::generate().expect("client identity");
+    let server_id = DeviceIdentity::generate();
+    let client_id = DeviceIdentity::generate();
     let server_device_id = server_id.device_id();
     let client_device_id = client_id.device_id();
 
@@ -122,12 +122,12 @@ async fn interactive_connection_roundtrips_ping_and_motion() {
 /// would make the connect below *succeed*, so this test fails loudly if pinning regresses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mismatched_pin_fails_handshake() {
-    let server_id = Identity::generate().expect("server identity");
-    let client_id = Identity::generate().expect("client identity");
+    let server_id = DeviceIdentity::generate();
+    let client_id = DeviceIdentity::generate();
     let client_device_id = client_id.device_id();
 
     // A third identity the server will NEVER present — the dialer pins this by mistake.
-    let wrong_id = Identity::generate().expect("wrong identity");
+    let wrong_id = DeviceIdentity::generate();
     let wrong_device_id = wrong_id.device_id();
     assert_ne!(
         wrong_device_id,
@@ -169,4 +169,138 @@ async fn mismatched_pin_fails_handshake() {
     );
 
     let _server = accept.await.expect("accept task");
+}
+
+/// A2 regression: the **acceptor** sends the first control frame and it must NOT
+/// deadlock. With the old lazy `open_bi`/`accept_bi`-on-first-I/O design, an acceptor
+/// whose first action is `send_control` would block forever (quinn requires the opener
+/// to write before the peer can `accept_bi`). The whole exchange is wrapped in a tight
+/// timeout so a regression fails loudly instead of hanging the suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceptor_sends_first_does_not_deadlock() {
+    let server_id = DeviceIdentity::generate();
+    let client_id = DeviceIdentity::generate();
+    let server_device_id = server_id.device_id();
+    let client_device_id = client_id.device_id();
+
+    let server = InteractiveEndpoint::bind_server(
+        &server_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::Pinned(client_device_id),
+    )
+    .expect("bind server");
+    let server_addr = server.local_addr().expect("server addr");
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+
+    // Acceptor (server) is the one that SENDS first.
+    let accept = tokio::spawn(async move {
+        let conn = server.accept_interactive().await.expect("accept");
+        let ping = Ping { id: 13 };
+        let payload = to_cbor(&ping).expect("encode ping");
+        conn.send_control(TYPE_PING, &payload)
+            .await
+            .expect("acceptor sends first");
+        (server, conn)
+    });
+
+    let client_conn = client
+        .connect_interactive(&client_id, server_addr, PinPolicy::Pinned(server_device_id))
+        .await
+        .expect("client connect");
+
+    // The initiator (client) receives the acceptor's first frame. If stream
+    // establishment were tied to first-I/O direction, this would hang — so bound it.
+    let (msg_type, body) = tokio::time::timeout(Duration::from_secs(5), client_conn.recv_control())
+        .await
+        .expect("acceptor-first must not deadlock (A2)")
+        .expect("recv control");
+    assert_eq!(msg_type, TYPE_PING);
+    let got: Ping = from_cbor(&body).expect("decode ping");
+    assert_eq!(got, Ping { id: 13 });
+
+    let (_server_endpoint, server_conn) = accept.await.expect("accept task");
+    server_conn.close();
+    client_conn.close();
+}
+
+/// A3 regression: `recv_control` must be cancel-safe. We repeatedly poll it under a
+/// 1ms timeout (the way the engine will, inside `tokio::select!`) while the peer drips
+/// a stream of frames. A dropped recv future that lost partially-read bytes would
+/// desync the length-prefixed framing and every subsequent frame would misparse — so
+/// if all frames arrive **in order with intact payloads**, cancel-safety holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recv_control_is_cancel_safe_under_timeout() {
+    use std::sync::Arc;
+
+    let server_id = DeviceIdentity::generate();
+    let client_id = DeviceIdentity::generate();
+    let server_device_id = server_id.device_id();
+    let client_device_id = client_id.device_id();
+
+    let server = InteractiveEndpoint::bind_server(
+        &server_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::Pinned(client_device_id),
+    )
+    .expect("bind server");
+    let server_addr = server.local_addr().expect("server addr");
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+
+    let accept = tokio::spawn(async move {
+        let conn = server.accept_interactive().await.expect("accept");
+        (server, conn)
+    });
+    let client_conn = Arc::new(
+        client
+            .connect_interactive(&client_id, server_addr, PinPolicy::Pinned(server_device_id))
+            .await
+            .expect("client connect"),
+    );
+    let (_server_endpoint, server_conn) = accept.await.expect("accept task");
+
+    const N: u64 = 200;
+    // Sender: drip N frames with distinct ids and small gaps, so the receiver's tight
+    // timeouts frequently cancel a read mid-frame.
+    let sender = tokio::spawn(async move {
+        for id in 0..N {
+            let payload = to_cbor(&Ping { id }).expect("encode");
+            server_conn
+                .send_control(TYPE_PING, &payload)
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+        server_conn
+    });
+
+    // Receiver: only ever recv under a 1ms timeout; many of these WILL cancel a recv
+    // future that has already buffered part of a frame.
+    let mut next_expected = 0u64;
+    let overall = tokio::time::Instant::now();
+    while next_expected < N {
+        assert!(
+            overall.elapsed() < Duration::from_secs(30),
+            "cancel-safe recv stalled — likely framing desync (A3 regression)"
+        );
+        match tokio::time::timeout(Duration::from_millis(1), client_conn.recv_control()).await {
+            Ok(res) => {
+                let (msg_type, body) = res.expect("recv control");
+                assert_eq!(msg_type, TYPE_PING);
+                let got: Ping = from_cbor(&body).expect("decode (corrupt => framing desync)");
+                assert_eq!(
+                    got,
+                    Ping { id: next_expected },
+                    "frames must arrive in order with intact payloads"
+                );
+                next_expected += 1;
+            }
+            Err(_) => continue, // timed out (cancelled) — buffer must survive intact
+        }
+    }
+
+    let server_conn = sender.await.expect("sender task");
+    server_conn.close();
+    client_conn.close();
 }
