@@ -65,7 +65,11 @@ fn main() {
     };
 
     if moved {
-        println!("RESULT: cursor_moved=yes (before {} -> after {})", fmt_pos(before), fmt_pos(after));
+        println!(
+            "RESULT: cursor_moved=yes (before {} -> after {})",
+            fmt_pos(before),
+            fmt_pos(after)
+        );
     } else {
         eprintln!(
             "RESULT: cursor_moved=no — before {} == after {}.\n\

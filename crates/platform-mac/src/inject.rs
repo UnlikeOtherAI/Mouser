@@ -85,13 +85,9 @@ pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
     CGDisplay::warp_mouse_cursor_position(point).map_err(InjectError::Warp)?;
 
     let source = event_source()?;
-    let moved = CGEvent::new_mouse_event(
-        source,
-        CGEventType::MouseMoved,
-        point,
-        CGMouseButton::Left,
-    )
-    .map_err(|()| InjectError::EventCreate)?;
+    let moved =
+        CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
+            .map_err(|()| InjectError::EventCreate)?;
     moved.post(CGEventTapLocation::HID);
     Ok(())
 }

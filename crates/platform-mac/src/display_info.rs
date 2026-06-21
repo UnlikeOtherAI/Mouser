@@ -42,12 +42,7 @@ impl DisplayBounds {
         let right = self.x + self.w - inset;
         let top = self.y + inset;
         let bottom = self.y + self.h - inset;
-        [
-            (left, top),
-            (right, top),
-            (right, bottom),
-            (left, bottom),
-        ]
+        [(left, top), (right, top), (right, bottom), (left, bottom)]
     }
 }
 
