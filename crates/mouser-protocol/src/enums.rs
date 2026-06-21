@@ -57,14 +57,16 @@ macro_rules! wire_enum {
 }
 
 /// Deserialize a wire enum's integer discriminant as `i128`, tolerating any width or
-/// sign. A non-integer CBOR item maps to a sentinel that matches no known variant, so
-/// the caller's `From<i128>` resolves it to `Unknown` (never an error) — §2 forward-
-/// compatibility. `i128::MIN` is the sentinel: no Appendix-C discriminant is negative.
+/// sign: an out-of-range or negative *integer* widens here and is mapped to `Unknown`
+/// by `From<i128>` (§2 forward-compatibility). A **non-integer** CBOR item is malformed
+/// — §0.1 requires an integer discriminant — so it is rejected as a decode error rather
+/// than silently becoming `Unknown`.
 fn wire_int<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i128, D::Error> {
     let value = ciborium::value::Value::deserialize(deserializer)?;
-    // `Integer` -> `i128` is infallible (CBOR ints fit in 128 bits); a non-integer
-    // item yields no `Integer`, so it falls through to the no-match sentinel.
-    Ok(value.as_integer().map_or(i128::MIN, i128::from))
+    value
+        .as_integer()
+        .map(i128::from)
+        .ok_or_else(|| <D::Error as serde::de::Error>::custom("enum discriminant must be an integer"))
 }
 
 wire_enum!(
@@ -234,10 +236,11 @@ mod tests {
     }
 
     #[test]
-    fn non_integer_maps_to_unknown() {
-        // A non-integer CBOR item (text "x" = 0x61 0x78) is not a valid discriminant
-        // but forward-compat forbids erroring → Unknown.
-        let v: AckStatus = from_cbor(&[0x61, 0x78]).expect("forward-compat decode");
-        assert_eq!(v, AckStatus::Unknown);
+    fn non_integer_is_rejected() {
+        // A non-integer CBOR item (text "x" = 0x61 0x78) is not an integer discriminant
+        // (§0.1) — it is malformed, so decode errors. This is distinct from an unknown
+        // *integer* discriminant, which maps to Unknown (tested above).
+        let r: Result<AckStatus, _> = from_cbor(&[0x61, 0x78]);
+        assert!(r.is_err(), "non-integer enum value must be a decode error");
     }
 }
