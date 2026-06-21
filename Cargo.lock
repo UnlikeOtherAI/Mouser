@@ -53,12 +53,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouser-core"
+version = "0.0.0"
+
+[[package]]
+name = "mouser-ffi"
+version = "0.0.0"
+
+[[package]]
+name = "mouser-net"
+version = "0.0.0"
+
+[[package]]
 name = "mouser-protocol"
 version = "0.0.0"
 dependencies = [
  "ciborium",
  "serde",
 ]
+
+[[package]]
+name = "mouser-testkit"
+version = "0.0.0"
+
+[[package]]
+name = "platform-linux"
+version = "0.0.0"
+
+[[package]]
+name = "platform-mac"
+version = "0.0.0"
 
 [[package]]
 name = "proc-macro2"

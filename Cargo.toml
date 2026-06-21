@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/mouser-protocol"]
+members = [
+  "crates/mouser-protocol",
+  "crates/mouser-core",
+  "crates/mouser-net",
+  "crates/mouser-testkit",
+  "crates/mouser-ffi",
+  "crates/platform-mac",
+  "crates/platform-linux",
+]
 
 [workspace.package]
 edition = "2021"
