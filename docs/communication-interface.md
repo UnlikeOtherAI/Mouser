@@ -1,11 +1,12 @@
-# Mouser — Communication Interface (Wire Protocol) — v2.2
+# Mouser — Communication Interface (Wire Protocol) — v2.5
 
 This is the contract that lets independently-built Mouser binaries interoperate.
 If two engines implement this document, they form a cluster.
 
-> v2 incorporated Round 1 ([design-review.md](design-review.md)); **v2.1** closes the
-> Round 2 gate findings (CBOR profile, enum discriminants, trust-store authority,
-> identity hash domain, bulk-connection auth, capability-state, layout revision).
+> Incorporates the Round 1 + Round 2 design reviews and gate rounds ([design-review.md](design-review.md)):
+> CBOR profile, enum discriminants, local-authority trust store, SPKI identity, bulk-connection auth,
+> capability-state, layout revision, ownership self-mint, clipboard transport-by-size, pointer-mode
+> signal, postcard-varint datagram encoding.
 
 ---
 
