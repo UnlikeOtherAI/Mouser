@@ -40,11 +40,15 @@ build/test/clippy green after every merge; 32 test suites pass):
 ### Gate (two rounds, all merged — `4be677a`)
 `election-fix` got the full Codex+Claude pair pre-merge (Codex found a real cross-node yield-term bug → fixed → re-verified). The other five merged on orchestrator integration-verification, then a **Codex post-merge second-opinion** FAILed all five with concrete follow-ups (the gate's value): files `on_ack` trusted impossible acks (HIGH), clip-engine `on_data` skipped receipt gates + no same-origin offer supersession, Windows `Html` lacked CF_HTML + empty-write garbage byte, mac capture `expect()` on poisoned locks, missing motion-fallback test. Four **fix branches** (`net-test`, `clip-engine-fix`, `files-fix`, `platform-fix`) addressed every verified finding with mutation-discriminated tests, were orchestrator-verified, and merged. A final Codex confirmation pass is running (`/tmp/mouser-gate2`). Net result: all Round-2 audit findings that don't require the engine are fixed; the shared clipboard core + platform adapters are in.
 
+## Clipboard UI + mobile R2 wave — MERGED to main (`70d5ebd`)
+- `clip-ui` — desktop Clipboard settings section (master/per-format/max-size/prefer-native/direction) + Mac-style wait/progress indicator (pnpm build+lint green; Playwright-CLI screenshots).
+- `ios-fixes` — portrait keyboard-below layout, scenePhase lifecycle/reconnect hooks, drag double-motion fix, momentum `deinit`, clipboard settings + wait-indicator views (xcodebuild iOS-sim **BUILD SUCCEEDED**).
+- `android-fixes` — `DefaultLifecycleObserver`/`LifecycleEventEffect`, monotonic gesture clock, dropped `material-icons-extended` + R8 on release, clipboard settings + progress composables (gradle assembleDebug/Release + unit tests pass).
+
 ## Queued
-1. **Clipboard UI wave**: desktop settings toggles (`apps/desktop`) + Mac-style progress/"wait" indicator wired to engine progress; mobile clipboard hooks + native-preference + progress.
-2. **Mobile fixes** (C2-2 FFI/net wiring, iOS keyboard-below layout, lifecycle/reconnect, iOS double-motion, momentum deinit) + **hygiene** (workspace-wide panic-free clippy lints, `libc` dep removal, SAFETY comments).
-3. **Round 3 audit** on the whole codebase after the clipboard-UI + mobile waves land (per request).
-4. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
+1. **Hygiene** (in flight): workspace-wide panic-free clippy lints (`[workspace.lints.clippy]` + per-crate adoption, fixing newly-surfaced lints), remove unused `libc` from platform-mac, add `// SAFETY:` to dragdrop.rs unsafe sites.
+2. **Round 3 audit** on the whole codebase (per request) — after hygiene lands.
+3. **Wave 2 — `mouser-engine` + `mouser-ipc`**: the runtime (heartbeat, auto-reconnect supervisor, receive-side auth + anti-replay, ack-timeout cursor-recovery, §5 pairing/SAS, bulk/StateSnapshot, Goodbye-on-sleep) — audit C2-1/C2-3, the #1 gap.
 
 ## Infra
 rustup 1.96 + ios targets; Xcode 26.3 + iPhone 17 Pro sim; Android SDK + AVD; Linux box `ai@192.168.1.203` (uinput). Per-task gate = Codex+Claude pair; parallel worktrees under `.worktrees/`.
