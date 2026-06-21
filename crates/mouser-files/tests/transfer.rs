@@ -6,7 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use mouser_files::{
-    sha256, FileError, MemSink, MemSource, Outbound, Receiver, ReceiverConfig, Sender,
+    sha256, FileError, FileSink, Hash, MemSink, MemSource, Outbound, Receiver, ReceiverConfig,
+    Sender, SinkError,
 };
 use mouser_protocol::FileOffer;
 
@@ -58,6 +59,41 @@ fn apply_to_sender(sender: &mut Sender<MemSource>, out: &Outbound) -> Result<(),
 
 fn make_mem_sink(_idx: usize, _path: &Path) -> Result<MemSink, mouser_files::SinkError> {
     Ok(MemSink::new())
+}
+
+/// A test-only [`FileSink`] that buffers every write but then **fails to finalize**.
+/// `existing_len()` is 0 (fresh), `write_at` succeeds, and `finish()` always returns an
+/// `Err(SinkError)` — exercising the `finish()`-failure arm of the receiver's finalize
+/// path (the same abort path as a hash mismatch, but reached via the sink rather than the
+/// digest comparison).
+#[derive(Default)]
+struct FailFinishSink {
+    bytes: Vec<u8>,
+}
+
+impl FileSink for FailFinishSink {
+    fn existing_len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+        if offset != self.existing_len() {
+            return Err(SinkError(format!(
+                "non-contiguous write at {offset}, have {}",
+                self.bytes.len()
+            )));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Hash, SinkError> {
+        Err(SinkError("simulated finish failure".into()))
+    }
+}
+
+fn make_fail_finish_sink(_idx: usize, _path: &Path) -> Result<FailFinishSink, SinkError> {
+    Ok(FailFinishSink::default())
 }
 
 /// Pull the `FileAccept` out of `accept_offer`'s outbound list (always the first message
@@ -281,6 +317,68 @@ fn hash_mismatch_emits_filedone_not_ok_and_aborts_sender() {
     // 2) The receiver did NOT commit the corrupt file as complete.
     assert!(receiver.is_aborted(), "receiver aborts on mismatch");
     assert!(!receiver.is_complete(), "a mismatched file is not 'complete'");
+    assert!(!receiver.states()[0].complete);
+    // 3) Further chunks are ignored rather than resurrecting the transfer.
+    let stray = mouser_protocol::FileChunk {
+        transfer_id,
+        file_index: 0,
+        offset: 0,
+        data: vec![0u8; 4],
+    };
+    assert!(receiver.on_chunk(&stray).expect("ignored").is_empty());
+
+    // 4) The sender, on receiving that FileDone, marks ITS side aborted (not complete).
+    sender.on_done(&done.unwrap()).expect("on_done");
+    assert!(sender.is_aborted(), "sender aborts on FileDone{{ok:false}}");
+    assert!(!sender.is_complete(), "an aborted sender is not complete");
+}
+
+/// A `sink.finish()` failure on the last chunk must surface as a `FileDone{ok:false}` on
+/// the wire (not a swallowed local error), the receiver must NOT report the file complete,
+/// and feeding that `FileDone` to the sender must mark *its* side aborted (§7.8). This is
+/// the finalize-failure twin of `hash_mismatch_emits_filedone_not_ok_and_aborts_sender`:
+/// it reaches the same abort path via the sink's `finish()` rather than a digest mismatch.
+#[test]
+fn finish_failure_emits_filedone_not_ok_and_aborts_sender() {
+    let content = bytes(123, 4_000);
+    let transfer_id = 13;
+    let mut sender = Sender::new(
+        transfer_id,
+        vec![("c.bin".into(), MemSource::new(content.clone()))],
+    )
+    .expect("s");
+    // No expected hash here: the abort must come purely from the sink's finish() failure,
+    // not the digest comparison — so this independently covers the finish()-error arm.
+    let config = ReceiverConfig::new(PathBuf::from(Q));
+    let (mut receiver, out) =
+        Receiver::accept_offer(&sender.offer(), config, make_fail_finish_sink).expect("offer");
+    sender.on_accept(&expect_accept(out)).unwrap();
+
+    // Relay every chunk; collect the receiver's outbound messages (acks + the terminal
+    // done) without touching the sender, so we can inspect the exact wire message.
+    let mut done: Option<mouser_protocol::FileDone> = None;
+    while let Some(chunk) = sender.poll_chunk().expect("poll") {
+        for o in receiver.on_chunk(&chunk).expect("chunk") {
+            match o {
+                Outbound::Ack(ack) => sender.on_ack(&ack).expect("ack"),
+                Outbound::Done(d) => done = Some(d),
+                other => panic!("unexpected outbound {other:?}"),
+            }
+        }
+    }
+
+    // 1) The receiver produced a `FileDone{ok:false}` on the wire for this transfer.
+    assert_eq!(
+        done,
+        Some(mouser_protocol::FileDone {
+            transfer_id,
+            ok: false
+        }),
+        "a finish() failure must emit FileDone{{ok:false}}"
+    );
+    // 2) The receiver did NOT commit the file as complete.
+    assert!(receiver.is_aborted(), "receiver aborts on finish() failure");
+    assert!(!receiver.is_complete(), "a finalize-failed file is not 'complete'");
     assert!(!receiver.states()[0].complete);
     // 3) Further chunks are ignored rather than resurrecting the transfer.
     let stray = mouser_protocol::FileChunk {
