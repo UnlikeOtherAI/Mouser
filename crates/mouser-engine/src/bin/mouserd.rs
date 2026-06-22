@@ -89,10 +89,16 @@ mod engine {
     }
 
     /// Run the daemon with the host's `injector` and `capture` adapters.
+    ///
+    /// Usage:
+    /// - `mouserd [source|target|auto]` — mDNS auto-discovery (default `auto`).
+    /// - `mouserd connect <host:port>`  — dial an explicit peer (no mDNS) and be the
+    ///   source/controller; useful when mDNS doesn't traverse the network.
+    /// - `mouserd probe <host:port>`    — connect, report the handshake, and exit
+    ///   WITHOUT capturing/injecting (a safe cross-machine transport check).
     pub fn run(injector: Arc<dyn InputInjection>, capture: Box<dyn InputCapture>) {
         let args: Vec<String> = std::env::args().collect();
-        // Usage: mouserd [source|target]  (default: auto)
-        let role = args.get(1).cloned().unwrap_or_else(|| "auto".to_string());
+        let arg1 = args.get(1).cloned().unwrap_or_else(|| "auto".to_string());
 
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -105,12 +111,96 @@ mod engine {
             }
         };
 
+        // Direct modes take an explicit peer address and bypass mDNS.
+        if arg1 == "probe" || arg1 == "connect" {
+            let Some(addr_str) = args.get(2).cloned() else {
+                eprintln!("mouserd: `{arg1}` needs <host:port>, e.g. mouserd {arg1} 192.168.1.230:49970");
+                std::process::exit(1);
+            };
+            let addr: SocketAddr = match addr_str.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("mouserd: bad address {addr_str}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            rt.block_on(async move {
+                let result = if arg1 == "probe" {
+                    probe(addr).await
+                } else {
+                    serve_direct(addr, injector, capture).await
+                };
+                if let Err(e) = result {
+                    eprintln!("mouserd: {e}");
+                    std::process::exit(1);
+                }
+            });
+            return;
+        }
+
         rt.block_on(async move {
-            if let Err(e) = serve(&role, injector, capture).await {
+            if let Err(e) = serve(&arg1, injector, capture).await {
                 eprintln!("mouserd: {e}");
                 std::process::exit(1);
             }
         });
+    }
+
+    /// Connect to an explicit peer (TrustOnFirstUse) and report the handshake, then
+    /// exit — a safe transport check that never captures or injects input.
+    async fn probe(addr: SocketAddr) -> Result<(), String> {
+        let me = DeviceIdentity::generate();
+        let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .map_err(|e| e.to_string())?;
+        eprintln!("mouserd: probing {addr} …");
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            endpoint.connect_interactive(&me, addr, PinPolicy::TrustOnFirstUse),
+        )
+        .await
+        .map_err(|_| format!("timed out connecting to {addr} (no Mouser peer there, or UDP blocked)"))?
+        .map_err(|e| e.to_string())?;
+        let alpn = conn
+            .negotiated_alpn()
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
+        eprintln!(
+            "mouserd: PROBE OK — handshake with {addr} completed; ALPN={alpn:?}; peer_device_id_present={}",
+            conn.peer_device_id().is_some()
+        );
+        conn.shutdown().await;
+        Ok(())
+    }
+
+    /// Source mode against an explicit peer address (direct dial, no mDNS): this host
+    /// becomes the controller (captures + forwards across the right edge).
+    async fn serve_direct(
+        addr: SocketAddr,
+        injector: Arc<dyn InputInjection>,
+        capture: Box<dyn InputCapture>,
+    ) -> Result<(), String> {
+        let me = DeviceIdentity::generate();
+        let my_id = me.device_id();
+        eprintln!("mouserd: device_id {}", me.device_id_base32());
+        let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .map_err(|e| e.to_string())?;
+        eprintln!("mouserd: dialing {addr} directly…");
+        let conn = endpoint
+            .connect_interactive(&me, addr, PinPolicy::TrustOnFirstUse)
+            .await
+            .map_err(|e| e.to_string())?;
+        let peer = conn.peer_device_id().ok_or("peer did not present a device_id")?;
+        eprintln!("mouserd: connected as source (controller)");
+        let core =
+            EngineCore::new_source(my_id, peer, EdgeLayout::side_by_side(1512, 982, 1920, 1080));
+        let runtime = Arc::new(RuntimeHandle::start(core, Arc::new(conn), injector));
+        let sink: Arc<dyn InputSink> = Arc::new(EngineSink {
+            runtime: Arc::clone(&runtime),
+        });
+        capture.start(sink).map_err(|e| e.to_string())?;
+        eprintln!("mouserd: capturing — move the cursor to the right edge to cross to the peer");
+        tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
+        let _ = capture.stop();
+        Ok(())
     }
 
     async fn serve(
