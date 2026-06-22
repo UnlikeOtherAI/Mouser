@@ -125,12 +125,13 @@ struct CompanionView: View {
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .environmentObject(lifecycle)
-        // Deterministic focus: the native keyboard belongs in portrait and must be
-        // gone in the full-screen landscape pad. Drive focus straight off the
-        // orientation — no timed DispatchQueue hack — on appear and on every
-        // orientation change.
+        // Deterministic focus: the keystroke keyboard only belongs in portrait AND
+        // only once connected — when disconnected it would cover the device picker
+        // (and there is nothing to type at). Drive focus straight off orientation +
+        // connection — no timed DispatchQueue hack — on appear, on orientation
+        // change, and on connect/disconnect.
         .onAppear {
-            keyboardFocused = !isLandscape
+            keyboardFocused = !isLandscape && mouser.isConnected
             // Start Bonjour/mDNS discovery of computers running mouserd on the LAN.
             browser.start()
             // Publish our own presence so desktops list the phone for pairing. The
@@ -149,11 +150,16 @@ struct CompanionView: View {
             autoReconnect(into: discovered)
         }
         .onChange(of: isLandscape) { _, nowLandscape in
-            keyboardFocused = !nowLandscape
+            keyboardFocused = !nowLandscape && mouser.isConnected
             // Kill any in-flight momentum glide across the orientation switch so a
             // CADisplayLink can't outlive the teardown of the old layout's
             // trackpad surface (audit R2 — momentum on orientation change).
             lifecycle.stopMomentum?()
+        }
+        // Bring the keystroke keyboard up the moment a connection lands (portrait
+        // only); drop it on disconnect so the device picker is reachable again.
+        .onChange(of: mouser.isConnected) { _, connected in
+            keyboardFocused = connected && !isLandscape
         }
         // App lifecycle: stop momentum + streaming on background, reconnect on
         // active (audit R2 — lifecycle/reconnect scaffolding).
