@@ -127,7 +127,10 @@ impl<'a> DerCursor<'a> {
     /// Descend into the SEQUENCE at the cursor, retargeting the cursor at its contents.
     fn enter_sequence(&mut self) -> Result<(), NetError> {
         let (_tag, content_start, content_end) = self.read_tlv()?;
-        self.buf = self.buf.get(content_start..content_end).ok_or_else(bad_der)?;
+        self.buf = self
+            .buf
+            .get(content_start..content_end)
+            .ok_or_else(bad_der)?;
         self.pos = 0;
         Ok(())
     }
@@ -136,7 +139,10 @@ impl<'a> DerCursor<'a> {
     /// advancing this cursor past the whole field.
     fn enter_field_sequence(&mut self) -> Result<DerCursor<'a>, NetError> {
         let (_tag, content_start, content_end) = self.read_tlv()?;
-        let inner = self.buf.get(content_start..content_end).ok_or_else(bad_der)?;
+        let inner = self
+            .buf
+            .get(content_start..content_end)
+            .ok_or_else(bad_der)?;
         self.pos = content_end;
         Ok(DerCursor::new(inner))
     }

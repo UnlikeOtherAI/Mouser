@@ -268,7 +268,8 @@ impl SharedState {
     /// Replace the cluster-wide input preferences.
     pub fn set_input_prefs(&mut self, prefs: &InputPrefs) -> StateResult<()> {
         let obj = self.map_child(ROOT, K_INPUT_PREFS)?;
-        self.doc.put(&obj, K_EDGE_DWELL_MS, prefs.edge_dwell_ms as u64)?;
+        self.doc
+            .put(&obj, K_EDGE_DWELL_MS, prefs.edge_dwell_ms as u64)?;
         self.doc.put(&obj, K_LOCK_ON_DRAG, prefs.lock_on_drag)?;
         self.doc.put(&obj, K_CURSOR_ACCEL, prefs.cursor_accel)?;
         self.doc.put(&obj, K_CMD_CTRL_SWAP, prefs.cmd_ctrl_swap)?;
@@ -345,8 +346,8 @@ impl SharedState {
     pub fn apply_changes(&mut self, changes: &[Vec<u8>]) -> StateResult<()> {
         let mut decoded = Vec::with_capacity(changes.len());
         for bytes in changes {
-            let change = Change::from_bytes(bytes.clone())
-                .map_err(|e| StateError::Decode(e.to_string()))?;
+            let change =
+                Change::from_bytes(bytes.clone()).map_err(|e| StateError::Decode(e.to_string()))?;
             decoded.push(change);
         }
         self.doc.apply_changes(decoded)?;
@@ -371,9 +372,7 @@ impl SharedState {
     fn map_child(&mut self, parent: ObjId, key: &str) -> StateResult<ObjId> {
         match self.doc.get(&parent, key)? {
             Some((Value::Object(ObjType::Map), id)) => Ok(id),
-            Some((Value::Object(_), _)) => {
-                Err(StateError::Schema(format!("{key} is not a map")))
-            }
+            Some((Value::Object(_), _)) => Err(StateError::Schema(format!("{key} is not a map"))),
             _ => Ok(self.doc.put_object(&parent, key, ObjType::Map)?),
         }
     }
@@ -381,9 +380,7 @@ impl SharedState {
     fn ensure_map(&mut self, parent: &ObjId, key: &str) -> StateResult<ObjId> {
         match self.doc.get(parent, key)? {
             Some((Value::Object(ObjType::Map), id)) => Ok(id),
-            Some((Value::Object(_), _)) => {
-                Err(StateError::Schema(format!("{key} is not a map")))
-            }
+            Some((Value::Object(_), _)) => Err(StateError::Schema(format!("{key} is not a map"))),
             _ => Ok(self.doc.put_object(parent, key, ObjType::Map)?),
         }
     }
@@ -391,9 +388,7 @@ impl SharedState {
     fn opt_map_child<O: AsRef<ObjId>>(&self, parent: O, key: &str) -> StateResult<Option<ObjId>> {
         match self.doc.get(parent.as_ref(), key)? {
             Some((Value::Object(ObjType::Map), id)) => Ok(Some(id)),
-            Some((Value::Object(_), _)) => {
-                Err(StateError::Schema(format!("{key} is not a map")))
-            }
+            Some((Value::Object(_), _)) => Err(StateError::Schema(format!("{key} is not a map"))),
             _ => Ok(None),
         }
     }
@@ -401,9 +396,7 @@ impl SharedState {
     fn opt_list_child(&self, parent: &ObjId, key: &str) -> StateResult<Option<ObjId>> {
         match self.doc.get(parent, key)? {
             Some((Value::Object(ObjType::List), id)) => Ok(Some(id)),
-            Some((Value::Object(_), _)) => {
-                Err(StateError::Schema(format!("{key} is not a list")))
-            }
+            Some((Value::Object(_), _)) => Err(StateError::Schema(format!("{key} is not a list"))),
             _ => Ok(None),
         }
     }

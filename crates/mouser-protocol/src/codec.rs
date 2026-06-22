@@ -48,11 +48,17 @@ const INDEFINITE_ARRAY: u8 = 0x9F;
 /// positives; *nested* indefinite-length containers are out of scope (a full
 /// structural walk would be required and is not cheap).
 pub fn from_cbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
-    if matches!(bytes.first(), Some(&INDEFINITE_MAP) | Some(&INDEFINITE_ARRAY)) {
-        return Err(CodecError::Decode("indefinite-length top-level item".to_string()));
+    if matches!(
+        bytes.first(),
+        Some(&INDEFINITE_MAP) | Some(&INDEFINITE_ARRAY)
+    ) {
+        return Err(CodecError::Decode(
+            "indefinite-length top-level item".to_string(),
+        ));
     }
     let mut cursor = std::io::Cursor::new(bytes);
-    let value = ciborium::from_reader(&mut cursor).map_err(|e| CodecError::Decode(e.to_string()))?;
+    let value =
+        ciborium::from_reader(&mut cursor).map_err(|e| CodecError::Decode(e.to_string()))?;
     // `Cursor::position` is the count of bytes consumed by the first item. Any bytes
     // remaining in the slice are trailing garbage and must be rejected.
     if (cursor.position() as usize) != bytes.len() {

@@ -190,14 +190,22 @@ mod tests {
     #[test]
     fn peer_socket_addr_pairs_first_address_with_iport() {
         let mut advert = local_advert(&DeviceIdentity::generate(), "Peer", 51820);
-        assert_eq!(peer_socket_addr(&advert), None, "no address yet → not dialable");
+        assert_eq!(
+            peer_socket_addr(&advert),
+            None,
+            "no address yet → not dialable"
+        );
         advert.addrs = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))];
         assert_eq!(
             peer_socket_addr(&advert),
             Some(SocketAddr::from(([192, 168, 1, 50], 51820))),
         );
         advert.iport = 0;
-        assert_eq!(peer_socket_addr(&advert), None, "no interactive port → not dialable");
+        assert_eq!(
+            peer_socket_addr(&advert),
+            None,
+            "no interactive port → not dialable"
+        );
     }
 
     #[test]

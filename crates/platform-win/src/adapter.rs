@@ -419,7 +419,9 @@ fn teardown(run: &mut CaptureRun) {
 }
 
 /// Spawn the passive cursor-poll thread. Returns its stop flag and join handle.
-fn start_passive_poll(sink: Arc<dyn InputSink>) -> PlatformResult<(Arc<AtomicBool>, JoinHandle<()>)> {
+fn start_passive_poll(
+    sink: Arc<dyn InputSink>,
+) -> PlatformResult<(Arc<AtomicBool>, JoinHandle<()>)> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
     let handle = std::thread::Builder::new()
@@ -720,10 +722,7 @@ fn hook_message(wparam: WPARAM) -> Option<u32> {
 }
 
 fn is_key_message(message: u32) -> bool {
-    matches!(
-        message,
-        WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
-    )
+    matches!(message, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP)
 }
 
 fn keyboard_event_from_parts(message: u32, scan_code: u32, flags: u32) -> Option<LocalInputEvent> {
@@ -1352,11 +1351,16 @@ mod tests {
         q.push_back(QueuedCaptureEvent::CursorPoint { x: 2, y: 2 });
         drop_one_for_overflow(&mut q);
         assert!(
-            matches!(q.front(), Some(QueuedCaptureEvent::Event(LocalInputEvent::Key { .. }))),
+            matches!(
+                q.front(),
+                Some(QueuedCaptureEvent::Event(LocalInputEvent::Key { .. }))
+            ),
             "front transition kept"
         );
         assert_eq!(
-            q.iter().filter(|e| queued_capture_event_is_cursor(e)).count(),
+            q.iter()
+                .filter(|e| queued_capture_event_is_cursor(e))
+                .count(),
             1,
             "exactly one cursor evicted"
         );

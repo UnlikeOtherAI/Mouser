@@ -55,7 +55,8 @@ pub(super) async fn serve(
         .unwrap_or_default();
     let advert = discovery::local_advert(&me, &hostname(), iport);
     let mdns = Discovery::new().map_err(|e| e.to_string())?;
-    mdns.advertise(&advert, &host_ip).map_err(|e| e.to_string())?;
+    mdns.advertise(&advert, &host_ip)
+        .map_err(|e| e.to_string())?;
     eprintln!(
         "mouserd: advertising {}:{iport} as {}",
         if host_ip.is_empty() { "auto" } else { &host_ip },
@@ -71,19 +72,25 @@ pub(super) async fn serve(
     // Bring up the local IPC link so the desktop UI can see/drive the engine. The bridge
     // reads the shared registry for its snapshots; failure to bind it is non-fatal (the
     // daemon still runs headless), so we warn and carry on.
-    let bridge = match IpcBridge::start(store.clone(), my_b32.clone(), hostname(), registry.clone())
-        .await
-    {
-        Ok(bridge) => Some(bridge),
-        Err(e) => {
-            eprintln!("mouserd: IPC unavailable ({e}); running headless");
-            None
-        }
-    };
+    let bridge =
+        match IpcBridge::start(store.clone(), my_b32.clone(), hostname(), registry.clone()).await {
+            Ok(bridge) => Some(bridge),
+            Err(e) => {
+                eprintln!("mouserd: IPC unavailable ({e}); running headless");
+                None
+            }
+        };
 
     // Wait for the first connection to form (auto-dial, accept, or IPC Connect).
     let Some((conn, can_control)) = next_connection(
-        store, &endpoint, &me, my_id, &my_b32, &registry, role, bridge.as_ref(),
+        store,
+        &endpoint,
+        &me,
+        my_id,
+        &my_b32,
+        &registry,
+        role,
+        bridge.as_ref(),
     )
     .await
     else {
@@ -207,7 +214,10 @@ async fn dial_connect_request(
     let addr = match request.addr {
         Some(addr) => addr,
         None => registry_addr_for(registry, &peer_id).await.ok_or_else(|| {
-            format!("peer {} not currently discoverable", format_device_id(&peer_id))
+            format!(
+                "peer {} not currently discoverable",
+                format_device_id(&peer_id)
+            )
         })?,
     };
     eprintln!("mouserd: dialing {addr} (IPC connect)");
@@ -223,7 +233,10 @@ async fn registry_addr_for(registry: &PeerRegistry, peer_id: &DeviceId) -> Optio
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut changes = registry.subscribe();
     loop {
-        if let Some(addr) = registry.find(peer_id).and_then(|p| discovery::peer_socket_addr(&p)) {
+        if let Some(addr) = registry
+            .find(peer_id)
+            .and_then(|p| discovery::peer_socket_addr(&p))
+        {
             return Some(addr);
         }
         let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;

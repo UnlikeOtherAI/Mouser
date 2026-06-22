@@ -75,7 +75,10 @@ fn alias_and_input_prefs_round_trip() {
     let mut s = SharedState::new();
     let id = dev(3);
     s.set_alias(&id, "Battlestation").expect("set alias");
-    assert_eq!(s.alias(&id).expect("alias").as_deref(), Some("Battlestation"));
+    assert_eq!(
+        s.alias(&id).expect("alias").as_deref(),
+        Some("Battlestation")
+    );
 
     let prefs = InputPrefs {
         edge_dwell_ms: 120,
@@ -107,7 +110,8 @@ fn layout_round_trip_and_rev_bump() {
     assert_eq!(s.layout_editor_hex(), device_id_hex(&editor));
 
     // A second edit bumps the rev monotonically.
-    s.set_layout(&d, &editor, &[mon(1, 0, 0)]).expect("set layout 2");
+    s.set_layout(&d, &editor, &[mon(1, 0, 0)])
+        .expect("set layout 2");
     assert_eq!(s.layout_rev(), 2);
 }
 
@@ -130,10 +134,19 @@ fn snapshot_round_trips() {
     let bytes = s.snapshot();
     let loaded = SharedState::load(&bytes).expect("load");
 
-    assert_eq!(loaded.device(&a).expect("device"), s.device(&a).expect("device"));
-    assert_eq!(loaded.layout(&b).expect("layout"), s.layout(&b).expect("layout"));
+    assert_eq!(
+        loaded.device(&a).expect("device"),
+        s.device(&a).expect("device")
+    );
+    assert_eq!(
+        loaded.layout(&b).expect("layout"),
+        s.layout(&b).expect("layout")
+    );
     assert_eq!(loaded.layout_rev(), s.layout_rev());
-    assert_eq!(loaded.alias(&a).expect("alias"), s.alias(&a).expect("alias"));
+    assert_eq!(
+        loaded.alias(&a).expect("alias"),
+        s.alias(&a).expect("alias")
+    );
     assert_eq!(loaded.heads(), s.heads());
 }
 
@@ -168,7 +181,8 @@ fn independent_edits_converge() {
         },
     )
     .expect("b device");
-    b.set_layout(&db, &db, &[mon(7, 1920, 0)]).expect("b layout");
+    b.set_layout(&db, &db, &[mon(7, 1920, 0)])
+        .expect("b layout");
 
     exchange(&mut a, &mut b);
 
@@ -238,7 +252,8 @@ fn higher_rev_wins_over_lower_rev() {
     // a edits twice (rev 2), b once (rev 1) with the LARGER editor id.
     a.set_layout(&target, &dev(1), &[mon(1, 0, 0)]).expect("a1");
     a.set_layout(&target, &dev(1), &[mon(2, 0, 0)]).expect("a2");
-    b.set_layout(&target, &dev(255), &[mon(3, 0, 0)]).expect("b1");
+    b.set_layout(&target, &dev(255), &[mon(3, 0, 0)])
+        .expect("b1");
 
     assert_eq!(a.layout_rev(), 2);
     assert_eq!(b.layout_rev(), 1);
@@ -259,14 +274,15 @@ fn changes_apply_in_any_order() {
     // changes whose deps are unmet and applies them once parents arrive).
     let mut source = SharedState::new();
     let d = dev(11);
-    source.set_device(
-        &d,
-        &DeviceInfo {
-            name: "one".into(),
-            os: "linux".into(),
-        },
-    )
-    .expect("c1");
+    source
+        .set_device(
+            &d,
+            &DeviceInfo {
+                name: "one".into(),
+                os: "linux".into(),
+            },
+        )
+        .expect("c1");
     source.set_layout(&d, &d, &[mon(1, 0, 0)]).expect("c2");
     source.set_layout(&d, &d, &[mon(2, 0, 0)]).expect("c3");
 

@@ -63,10 +63,9 @@ macro_rules! wire_enum {
 /// than silently becoming `Unknown`.
 fn wire_int<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i128, D::Error> {
     let value = ciborium::value::Value::deserialize(deserializer)?;
-    value
-        .as_integer()
-        .map(i128::from)
-        .ok_or_else(|| <D::Error as serde::de::Error>::custom("enum discriminant must be an integer"))
+    value.as_integer().map(i128::from).ok_or_else(|| {
+        <D::Error as serde::de::Error>::custom("enum discriminant must be an integer")
+    })
 }
 
 wire_enum!(

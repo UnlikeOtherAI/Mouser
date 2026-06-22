@@ -17,11 +17,11 @@
 //! - [`Role::Target`] injects input it receives while it is the owner; it does not
 //!   capture. (Both roles run [`EngineCore::on_control`]/[`on_motion`]/[`on_tick`].)
 
+use mouser_core::platform::{CaptureMode, LocalInputEvent, ScrollUnit as CoreScrollUnit};
 use mouser_core::{
     ownership::{Ownership, OwnershipUpdate},
     DeviceId,
 };
-use mouser_core::platform::{CaptureMode, LocalInputEvent, ScrollUnit as CoreScrollUnit};
 use mouser_protocol::{
     from_cbor, to_cbor, Datagram, FocusKind, Goodbye, GoodbyeReason, Heartbeat, KeyEvent,
     OwnershipAck, OwnershipTransfer, Ping, PointerButton, PointerMotion, Pong, Scroll, ScrollUnit,
@@ -65,17 +65,38 @@ pub struct EdgeLayout {
 impl EdgeLayout {
     /// A symmetric side-by-side layout with the peer on the right.
     pub fn side_by_side(width: i32, height: i32, peer_width: i32, peer_height: i32) -> Self {
-        Self { width, height, peer_width, peer_height, edge: Edge::Right }
+        Self {
+            width,
+            height,
+            peer_width,
+            peer_height,
+            edge: Edge::Right,
+        }
     }
 }
 
 /// A concrete injection the runtime applies via [`mouser_core::platform::InputInjection`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Inject {
-    MoveCursor { display_id: u32, x: i32, y: i32 },
-    Button { button: u8, down: bool },
-    Key { usage: u16, down: bool, mods: u16 },
-    Scroll { dx: i32, dy: i32, unit: CoreScrollUnit },
+    MoveCursor {
+        display_id: u32,
+        x: i32,
+        y: i32,
+    },
+    Button {
+        button: u8,
+        down: bool,
+    },
+    Key {
+        usage: u16,
+        down: bool,
+        mods: u16,
+    },
+    Scroll {
+        dx: i32,
+        dy: i32,
+        unit: CoreScrollUnit,
+    },
 }
 
 /// What the capture adapter should do with the local event just processed.
@@ -285,12 +306,23 @@ impl EngineCore {
                     owner_epoch: self.epoch(),
                     ctr,
                 });
-                vec![Action::SendControl(TYPE_KEY_EVENT, payload), Action::Capture(CaptureDecision::Suppress)]
+                vec![
+                    Action::SendControl(TYPE_KEY_EVENT, payload),
+                    Action::Capture(CaptureDecision::Suppress),
+                ]
             }
             LocalInputEvent::Button { button, down } => {
                 let ctr = self.next_ctr();
-                let payload = encode(&PointerButton { button, down, owner_epoch: self.epoch(), ctr });
-                vec![Action::SendControl(TYPE_POINTER_BUTTON, payload), Action::Capture(CaptureDecision::Suppress)]
+                let payload = encode(&PointerButton {
+                    button,
+                    down,
+                    owner_epoch: self.epoch(),
+                    ctr,
+                });
+                vec![
+                    Action::SendControl(TYPE_POINTER_BUTTON, payload),
+                    Action::Capture(CaptureDecision::Suppress),
+                ]
             }
             LocalInputEvent::Scroll { dx, dy } => {
                 let ctr = self.next_ctr();
@@ -301,7 +333,10 @@ impl EngineCore {
                     owner_epoch: self.epoch(),
                     ctr,
                 });
-                vec![Action::SendControl(TYPE_SCROLL, payload), Action::Capture(CaptureDecision::Suppress)]
+                vec![
+                    Action::SendControl(TYPE_SCROLL, payload),
+                    Action::Capture(CaptureDecision::Suppress),
+                ]
             }
         }
     }
@@ -320,8 +355,16 @@ impl EngineCore {
             Some((px, py)) => (x - px, y - py),
             None => (0, 0),
         };
-        self.peer_x = clamp(self.peer_x + dx, 0, self.layout.peer_width.saturating_sub(1).max(0));
-        self.peer_y = clamp(self.peer_y + dy, 0, self.layout.peer_height.saturating_sub(1).max(0));
+        self.peer_x = clamp(
+            self.peer_x + dx,
+            0,
+            self.layout.peer_width.saturating_sub(1).max(0),
+        );
+        self.peer_y = clamp(
+            self.peer_y + dy,
+            0,
+            self.layout.peer_height.saturating_sub(1).max(0),
+        );
         // Crossing back: the peer cursor hit the near edge moving toward us.
         if self.crosses_back(dx) {
             return self.reclaim_local();
@@ -334,7 +377,10 @@ impl EngineCore {
             x: self.peer_x,
             y: self.peer_y,
         };
-        vec![Action::SendMotion(motion), Action::Capture(CaptureDecision::Suppress)]
+        vec![
+            Action::SendMotion(motion),
+            Action::Capture(CaptureDecision::Suppress),
+        ]
     }
 
     /// Does `(x, y)` reach the edge the peer sits on?
@@ -351,7 +397,9 @@ impl EngineCore {
     fn crosses_back(&self, delta_along: i32) -> bool {
         match self.layout.edge {
             Edge::Right => self.peer_x <= 0 && delta_along < 0,
-            Edge::Left => self.peer_x >= self.layout.peer_width.saturating_sub(1) && delta_along > 0,
+            Edge::Left => {
+                self.peer_x >= self.layout.peer_width.saturating_sub(1) && delta_along > 0
+            }
             // Vertical edges use the y delta; kept simple for v1 (x delta proxy unused).
             Edge::Bottom => self.peer_y <= 0,
             Edge::Top => self.peer_y >= self.layout.peer_height.saturating_sub(1),
@@ -368,7 +416,11 @@ impl EngineCore {
         self.peer_x = match self.layout.edge {
             Edge::Right => 0,
             Edge::Left => self.layout.peer_width.saturating_sub(1).max(0),
-            _ => clamp(self.peer_x, 0, self.layout.peer_width.saturating_sub(1).max(0)),
+            _ => clamp(
+                self.peer_x,
+                0,
+                self.layout.peer_width.saturating_sub(1).max(0),
+            ),
         };
         self.peer_y = clamp(y, 0, self.layout.peer_height.saturating_sub(1).max(0));
         let transfer = encode(&OwnershipTransfer {
@@ -378,14 +430,23 @@ impl EngineCore {
             reason: TransferReason::EdgeCross,
         });
         let seq = self.next_seq();
-        let motion = PointerMotion { owner_epoch: epoch, seq, display_id: 0, x: self.peer_x, y: self.peer_y };
+        let motion = PointerMotion {
+            owner_epoch: epoch,
+            seq,
+            display_id: 0,
+            x: self.peer_x,
+            y: self.peer_y,
+        };
         // SetCaptureMode goes first: the runtime escalates to ActiveForward (installs
         // suppressing hooks) before we start suppressing/forwarding this crossing.
         vec![
             Action::SetCaptureMode(CaptureMode::ActiveForward),
             Action::SendControl(TYPE_OWNERSHIP_TRANSFER, transfer),
             Action::SendMotion(motion),
-            Action::OwnerChanged { owner: self.peer, epoch },
+            Action::OwnerChanged {
+                owner: self.peer,
+                epoch,
+            },
             Action::Capture(CaptureDecision::Suppress),
         ]
     }
@@ -433,13 +494,22 @@ impl EngineCore {
         let Ok(t) = from_cbor::<OwnershipTransfer>(payload) else {
             return Vec::new();
         };
-        let Some(owner) = to_id(&t.to) else { return Vec::new() };
-        match self.ownership.observe_with_reason(owner, t.owner_epoch, t.reason) {
+        let Some(owner) = to_id(&t.to) else {
+            return Vec::new();
+        };
+        match self
+            .ownership
+            .observe_with_reason(owner, t.owner_epoch, t.reason)
+        {
             OwnershipUpdate::Accepted { owner, epoch } => {
                 self.guard = ReplayGuard::default();
                 self.reset_out();
                 self.misses = 0;
-                let ack = encode(&OwnershipAck { owner_epoch: epoch, accepted: true, reason: None });
+                let ack = encode(&OwnershipAck {
+                    owner_epoch: epoch,
+                    accepted: true,
+                    reason: None,
+                });
                 let mut actions = vec![
                     Action::SendControl(TYPE_OWNERSHIP_ACK, ack),
                     Action::OwnerChanged { owner, epoch },
@@ -468,23 +538,36 @@ impl EngineCore {
     }
 
     fn on_key(&mut self, payload: &[u8]) -> Vec<Action> {
-        let Ok(k) = from_cbor::<KeyEvent>(payload) else { return Vec::new() };
+        let Ok(k) = from_cbor::<KeyEvent>(payload) else {
+            return Vec::new();
+        };
         if !self.is_owner() || !self.guard.accept_ctr(k.owner_epoch, k.ctr, self.epoch()) {
             return Vec::new();
         }
-        vec![Action::Inject(Inject::Key { usage: k.usage, down: k.down, mods: k.mods })]
+        vec![Action::Inject(Inject::Key {
+            usage: k.usage,
+            down: k.down,
+            mods: k.mods,
+        })]
     }
 
     fn on_button(&mut self, payload: &[u8]) -> Vec<Action> {
-        let Ok(b) = from_cbor::<PointerButton>(payload) else { return Vec::new() };
+        let Ok(b) = from_cbor::<PointerButton>(payload) else {
+            return Vec::new();
+        };
         if !self.is_owner() || !self.guard.accept_ctr(b.owner_epoch, b.ctr, self.epoch()) {
             return Vec::new();
         }
-        vec![Action::Inject(Inject::Button { button: b.button, down: b.down })]
+        vec![Action::Inject(Inject::Button {
+            button: b.button,
+            down: b.down,
+        })]
     }
 
     fn on_scroll(&mut self, payload: &[u8]) -> Vec<Action> {
-        let Ok(s) = from_cbor::<Scroll>(payload) else { return Vec::new() };
+        let Ok(s) = from_cbor::<Scroll>(payload) else {
+            return Vec::new();
+        };
         if !self.is_owner() || !self.guard.accept_ctr(s.owner_epoch, s.ctr, self.epoch()) {
             return Vec::new();
         }
@@ -492,12 +575,18 @@ impl EngineCore {
             ScrollUnit::Detent120 => CoreScrollUnit::Detent120,
             _ => CoreScrollUnit::LogicalPixel,
         };
-        vec![Action::Inject(Inject::Scroll { dx: s.dx, dy: s.dy, unit })]
+        vec![Action::Inject(Inject::Scroll {
+            dx: s.dx,
+            dy: s.dy,
+            unit,
+        })]
     }
 
     fn on_ping(&mut self, payload: &[u8]) -> Vec<Action> {
         self.misses = 0;
-        let Ok(p) = from_cbor::<Ping>(payload) else { return Vec::new() };
+        let Ok(p) = from_cbor::<Ping>(payload) else {
+            return Vec::new();
+        };
         vec![Action::SendControl(TYPE_PONG, encode(&Pong { id: p.id }))]
     }
 
@@ -512,11 +601,17 @@ impl EngineCore {
 
     /// Process a pointer-motion datagram from the peer.
     pub fn on_motion(&mut self, datagram: Datagram) -> Vec<Action> {
-        let Datagram::Motion(m) = datagram else { return Vec::new() };
+        let Datagram::Motion(m) = datagram else {
+            return Vec::new();
+        };
         if !self.is_owner() || !self.guard.accept_seq(m.owner_epoch, m.seq, self.epoch()) {
             return Vec::new();
         }
-        vec![Action::Inject(Inject::MoveCursor { display_id: m.display_id, x: m.x, y: m.y })]
+        vec![Action::Inject(Inject::MoveCursor {
+            display_id: m.display_id,
+            x: m.x,
+            y: m.y,
+        })]
     }
 
     /// Advance time one heartbeat interval (~1 s). Emits our heartbeat and, on the
@@ -524,7 +619,10 @@ impl EngineCore {
     pub fn on_tick(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         self.hb_seq = self.hb_seq.saturating_add(1);
-        actions.push(Action::SendControl(TYPE_HEARTBEAT, encode(&Heartbeat { seq: self.hb_seq })));
+        actions.push(Action::SendControl(
+            TYPE_HEARTBEAT,
+            encode(&Heartbeat { seq: self.hb_seq }),
+        ));
         self.misses = self.misses.saturating_add(1);
         if self.role == Role::Source && !self.is_owner() && self.misses >= HEARTBEAT_MISS_LIMIT {
             actions.extend(self.reclaim_local());

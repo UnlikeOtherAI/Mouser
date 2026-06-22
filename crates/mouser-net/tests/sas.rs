@@ -57,7 +57,11 @@ async fn both_ends_derive_identical_six_digit_sas() {
     );
 
     // It is exactly six decimal digits.
-    assert_eq!(client_sas.len(), 6, "SAS must be 6 digits, got {client_sas:?}");
+    assert_eq!(
+        client_sas.len(),
+        6,
+        "SAS must be 6 digits, got {client_sas:?}"
+    );
     assert!(
         client_sas.chars().all(|c| c.is_ascii_digit()),
         "SAS must be all decimal digits, got {client_sas:?}"

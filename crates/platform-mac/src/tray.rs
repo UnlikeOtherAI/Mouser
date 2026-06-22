@@ -209,7 +209,11 @@ mod tests {
         let labels: Vec<&str> = states.iter().copied().map(state_label).collect();
         for l in &labels {
             assert!(!l.is_empty(), "label must be non-empty");
-            assert_eq!(l.chars().count(), 1, "label should be a single glyph: {l:?}");
+            assert_eq!(
+                l.chars().count(),
+                1,
+                "label should be a single glyph: {l:?}"
+            );
         }
         // All four glyphs differ from one another.
         for i in 0..labels.len() {

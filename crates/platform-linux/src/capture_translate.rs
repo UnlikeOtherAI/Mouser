@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn relative_motion_integrates_and_clamps() {
         let c = VirtualCursor::new(100, 100); // starts centered at (50, 50)
-        // Move right by 20.
+                                              // Move right by 20.
         assert_eq!(
             to_local_event(EventKind::Relative, REL_X, 20, &c),
             Some(LocalInputEvent::CursorMoved {

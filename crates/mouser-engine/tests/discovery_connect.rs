@@ -17,9 +17,12 @@ async fn mdns_discovery_drives_quic_connect() {
     let dialer_id = DeviceIdentity::generate();
 
     // Acceptor: bind a server, then advertise its REAL bound port over mDNS.
-    let acceptor =
-        InteractiveEndpoint::bind_server(&acceptor_id, mouser_net::loopback_addr(), PinPolicy::TrustOnFirstUse)
-            .expect("bind acceptor");
+    let acceptor = InteractiveEndpoint::bind_server(
+        &acceptor_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::TrustOnFirstUse,
+    )
+    .expect("bind acceptor");
     let iport = acceptor.local_addr().expect("acceptor addr").port();
     let advert = discovery::local_advert(&acceptor_id, "Acceptor", iport);
     let _advertiser = Advertiser::advertise_loopback(&advert).expect("advertise");
@@ -53,7 +56,8 @@ async fn mdns_discovery_drives_quic_connect() {
     let addr = discovery::peer_socket_addr(&peer).expect("resolved a dialable addr from mDNS");
 
     // Dial the discovered address, pinning the discovered id (§3).
-    let client = InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
     let dialer_conn = client
         .connect_interactive(&dialer_id, addr, PinPolicy::Pinned(acceptor_id.device_id()))
         .await

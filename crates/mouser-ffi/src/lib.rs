@@ -215,15 +215,20 @@ impl MobileClient {
         // Synchronous at the boundary: bind the endpoint and drive the async dial on the
         // held runtime. quinn's `Endpoint::client` must be created inside a tokio runtime
         // context, so the bind happens inside `block_on` too (not just the dial).
-        let connection = self.rt.block_on(async {
-            // Ephemeral client-only QUIC endpoint (no listener; the phone dials out).
-            let endpoint = InteractiveEndpoint::bind_client(mouser_net::loopback_addr())
-                .map_err(|e| MobileError::Bind { detail: e.to_string() })?;
-            endpoint
-                .connect_interactive(identity, addr, PinPolicy::Pinned(peer_id))
-                .await
-                .map_err(|e| MobileError::Connect { detail: e.to_string() })
-        })?;
+        let connection =
+            self.rt.block_on(async {
+                // Ephemeral client-only QUIC endpoint (no listener; the phone dials out).
+                let endpoint = InteractiveEndpoint::bind_client(mouser_net::loopback_addr())
+                    .map_err(|e| MobileError::Bind {
+                        detail: e.to_string(),
+                    })?;
+                endpoint
+                    .connect_interactive(identity, addr, PinPolicy::Pinned(peer_id))
+                    .await
+                    .map_err(|e| MobileError::Connect {
+                        detail: e.to_string(),
+                    })
+            })?;
         let connection = Arc::new(connection);
 
         // Source-mode engine: the peer sits to our "right" in a large virtual space, so
@@ -251,14 +256,21 @@ impl MobileClient {
         // the virtual peer cursor off the entry edge so a later leftward delta doesn't
         // trip the back-cross reclaim (`Edge::Right` reclaims at peer_x <= 0 && dx < 0).
         let center = VIRTUAL_SPAN / 2;
-        runtime.feed_local(LocalInputEvent::CursorMoved { display_id: 0, x: 0, y: center });
+        runtime.feed_local(LocalInputEvent::CursorMoved {
+            display_id: 0,
+            x: 0,
+            y: center,
+        });
         runtime.feed_local(LocalInputEvent::CursorMoved {
             display_id: 0,
             x: SEED_STEP,
             y: center,
         });
 
-        *guard = Some(Session { runtime, _connection: connection });
+        *guard = Some(Session {
+            runtime,
+            _connection: connection,
+        });
         Ok(())
     }
 
@@ -320,7 +332,9 @@ fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, MobileError> {
     use std::net::ToSocketAddrs;
     (host, port)
         .to_socket_addrs()
-        .map_err(|e| MobileError::Connect { detail: e.to_string() })?
+        .map_err(|e| MobileError::Connect {
+            detail: e.to_string(),
+        })?
         .next()
         .ok_or_else(|| MobileError::Connect {
             detail: format!("no address for {host}:{port}"),
@@ -441,19 +455,25 @@ mod tests {
         });
 
         phone
-            .connect(server_addr.ip().to_string(), server_addr.port(), target_id_b32)
+            .connect(
+                server_addr.ip().to_string(),
+                server_addr.port(),
+                target_id_b32,
+            )
             .expect("phone connects");
         assert!(phone.is_connected());
 
         // Forward a key; the target must inject it over the real QUIC connection.
         phone.send_key(0x04, true, 0);
 
-        let got = target_rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), rec_rx.recv()).await
-        });
+        let got = target_rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), rec_rx.recv()).await });
         assert_eq!(
             got.ok().flatten(),
-            Some(Recorded::Key { usage: 0x04, down: true }),
+            Some(Recorded::Key {
+                usage: 0x04,
+                down: true
+            }),
             "the forwarded key was injected on the target over QUIC",
         );
 

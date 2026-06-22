@@ -353,7 +353,10 @@ fn edge_cross_escalates_to_active_forward_first() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     let a = e.on_local_input(cursor(99, 40));
     assert!(
-        matches!(a.first(), Some(Action::SetCaptureMode(CaptureMode::ActiveForward))),
+        matches!(
+            a.first(),
+            Some(Action::SetCaptureMode(CaptureMode::ActiveForward))
+        ),
         "the capture escalates to ActiveForward before suppressing/forwarding the crossing"
     );
     assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
@@ -369,7 +372,10 @@ fn reclaim_by_crossing_back_drops_to_passive_edge() {
     // Move the (suppressed) cursor back across the near edge → reclaim locally.
     let a = e.on_local_input(cursor(98, 40));
     assert!(
-        matches!(a.first(), Some(Action::SetCaptureMode(CaptureMode::PassiveEdge))),
+        matches!(
+            a.first(),
+            Some(Action::SetCaptureMode(CaptureMode::PassiveEdge))
+        ),
         "reclaim drops suppressing capture back to passive edge sensing first"
     );
     assert!(e.is_owner());

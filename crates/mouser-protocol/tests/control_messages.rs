@@ -4,10 +4,10 @@
 
 use mouser_protocol::{
     decode_frame, encode_frame, from_cbor, to_cbor, BlockedReason, CapState, Capability,
-    CapabilitySet, CapabilityState, FocusKind, FocusState, Goodbye, GoodbyeReason, Heartbeat, Hello,
-    KeyEvent, Os, OwnershipAck, OwnershipRequest, OwnershipTransfer, PairingResult, PointerButton,
-    PointerMode, PointerModeReq, Pong, Role, Scroll, ScrollUnit, TransferReason, TYPE_KEY_EVENT,
-    TYPE_PAIRING_RESULT, TYPE_PONG,
+    CapabilitySet, CapabilityState, FocusKind, FocusState, Goodbye, GoodbyeReason, Heartbeat,
+    Hello, KeyEvent, Os, OwnershipAck, OwnershipRequest, OwnershipTransfer, PairingResult,
+    PointerButton, PointerMode, PointerModeReq, Pong, Role, Scroll, ScrollUnit, TransferReason,
+    TYPE_KEY_EVENT, TYPE_PAIRING_RESULT, TYPE_PONG,
 };
 use std::collections::BTreeSet;
 
@@ -36,14 +36,19 @@ fn session_and_liveness_messages_roundtrip() {
         session_id: 0xDEAD_BEEF,
         channel_sig: vec![0x11; 64],
     });
-    assert_canonical(&PairingResult { accepted: true, reason: None });
+    assert_canonical(&PairingResult {
+        accepted: true,
+        reason: None,
+    });
     assert_canonical(&PairingResult {
         accepted: false,
         reason: Some("SAS mismatch".to_string()),
     });
     assert_canonical(&Pong { id: 7 });
     assert_canonical(&Heartbeat { seq: 42 });
-    assert_canonical(&Goodbye { reason: GoodbyeReason::Sleep });
+    assert_canonical(&Goodbye {
+        reason: GoodbyeReason::Sleep,
+    });
 }
 
 #[test]
@@ -54,7 +59,11 @@ fn ownership_messages_roundtrip() {
         layout_rev: 3,
         reason: TransferReason::EdgeCross,
     });
-    assert_canonical(&OwnershipAck { owner_epoch: 5, accepted: true, reason: None });
+    assert_canonical(&OwnershipAck {
+        owner_epoch: 5,
+        accepted: true,
+        reason: None,
+    });
     assert_canonical(&OwnershipAck {
         owner_epoch: 5,
         accepted: false,
@@ -75,13 +84,27 @@ fn ownership_messages_roundtrip() {
         from: vec![0x04; 32],
         reason: TransferReason::UiSelect,
     });
-    assert_canonical(&PointerModeReq { owner_epoch: 7, mode: PointerMode::Relative });
+    assert_canonical(&PointerModeReq {
+        owner_epoch: 7,
+        mode: PointerMode::Relative,
+    });
 }
 
 #[test]
 fn input_messages_roundtrip() {
-    assert_canonical(&KeyEvent { usage: 0x04, down: true, mods: 0, owner_epoch: 1, ctr: 2 });
-    assert_canonical(&PointerButton { button: 1, down: false, owner_epoch: 1, ctr: 9 });
+    assert_canonical(&KeyEvent {
+        usage: 0x04,
+        down: true,
+        mods: 0,
+        owner_epoch: 1,
+        ctr: 2,
+    });
+    assert_canonical(&PointerButton {
+        button: 1,
+        down: false,
+        owner_epoch: 1,
+        ctr: 9,
+    });
     assert_canonical(&Scroll {
         dx: -3,
         dy: 120,
@@ -107,23 +130,40 @@ fn pong_golden_vector() {
 fn pairing_result_omits_none_reason() {
     // `reason: None` must drop the key entirely (skip_serializing_if): a 1-entry map
     // {"accepted": true} = A1 68 "accepted" F5.
-    let bytes = to_cbor(&PairingResult { accepted: true, reason: None }).expect("encode");
+    let bytes = to_cbor(&PairingResult {
+        accepted: true,
+        reason: None,
+    })
+    .expect("encode");
     assert_eq!(
         bytes,
         [0xA1, 0x68, 0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x65, 0x64, 0xF5],
         "None reason must be omitted, not encoded as null"
     );
     // Present reason adds a second key, so the map header becomes A2.
-    let with_reason =
-        to_cbor(&PairingResult { accepted: true, reason: Some("x".to_string()) }).expect("encode");
-    assert_eq!(with_reason.first(), Some(&0xA2), "two keys when reason present");
+    let with_reason = to_cbor(&PairingResult {
+        accepted: true,
+        reason: Some("x".to_string()),
+    })
+    .expect("encode");
+    assert_eq!(
+        with_reason.first(),
+        Some(&0xA2),
+        "two keys when reason present"
+    );
 }
 
 #[test]
 fn key_event_golden_vector_field_order() {
     // Locks the §7.5 field order as CBOR map keys: usage, down, mods, owner_epoch, ctr.
-    let payload =
-        to_cbor(&KeyEvent { usage: 4, down: true, mods: 0, owner_epoch: 1, ctr: 2 }).expect("enc");
+    let payload = to_cbor(&KeyEvent {
+        usage: 4,
+        down: true,
+        mods: 0,
+        owner_epoch: 1,
+        ctr: 2,
+    })
+    .expect("enc");
     assert_eq!(
         payload,
         [
@@ -142,7 +182,16 @@ fn key_event_golden_vector_field_order() {
     assert_eq!(consumed, frame.len());
     assert_eq!(decoded.msg_type, TYPE_KEY_EVENT);
     let round: KeyEvent = from_cbor(decoded.payload).expect("decode");
-    assert_eq!(round, KeyEvent { usage: 4, down: true, mods: 0, owner_epoch: 1, ctr: 2 });
+    assert_eq!(
+        round,
+        KeyEvent {
+            usage: 4,
+            down: true,
+            mods: 0,
+            owner_epoch: 1,
+            ctr: 2
+        }
+    );
 }
 
 #[test]

@@ -334,7 +334,8 @@ fn apply_tray_icon_visibility(app: &tauri::AppHandle, visible: bool) -> Result<(
         } else {
             tauri::ActivationPolicy::Regular
         };
-        app.set_activation_policy(policy).map_err(|e| e.to_string())?;
+        app.set_activation_policy(policy)
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(())

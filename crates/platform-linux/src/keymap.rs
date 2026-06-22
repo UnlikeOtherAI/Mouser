@@ -227,7 +227,7 @@ pub fn supported_hid_usages() -> Vec<u16> {
     v.push(0x67); // Keypad =
     v.push(0x85); // Keypad ,
     v.extend(0xE0u16..=0xE7); // modifiers
-    // 0x32 (HID "Non-US #") has no portable mac/evdev counterpart in this set.
+                              // 0x32 (HID "Non-US #") has no portable mac/evdev counterpart in this set.
     v.retain(|&u| u != 0x32);
     v.sort_unstable();
     v

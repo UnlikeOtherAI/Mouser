@@ -79,7 +79,10 @@ impl IpcBridge {
         let server = Server::bind(build_snapshot(&shared))
             .await
             .map_err(|e| e.to_string())?;
-        eprintln!("mouserd: IPC listening at {}", server.socket_path().display());
+        eprintln!(
+            "mouserd: IPC listening at {}",
+            server.socket_path().display()
+        );
         let publisher = server.publisher();
 
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();

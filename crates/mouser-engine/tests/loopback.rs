@@ -59,14 +59,14 @@ struct SpyCapture {
 
 impl SpyCapture {
     fn history(&self) -> Vec<CaptureMode> {
-        self.history.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn current(&self) -> CaptureMode {
-        self.history()
-            .last()
-            .copied()
-            .unwrap_or(CaptureMode::Off)
+        self.history().last().copied().unwrap_or(CaptureMode::Off)
     }
 }
 
@@ -141,7 +141,8 @@ async fn source_drives_target_over_quic() {
     )
     .expect("bind server");
     let server_addr = server.local_addr().expect("server addr");
-    let client = InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
 
     let accept = tokio::spawn(async move {
         let conn = server.accept_interactive().await.expect("accept");
@@ -173,18 +174,29 @@ async fn source_drives_target_over_quic() {
     );
 
     // 1. Cross the right edge → source grants ownership to the target.
-    source_rt.feed_local(LocalInputEvent::CursorMoved { display_id: 0, x: 99, y: 40 });
+    source_rt.feed_local(LocalInputEvent::CursorMoved {
+        display_id: 0,
+        x: 99,
+        y: 40,
+    });
     assert!(!source_rt.is_owner(), "source handed input to the target");
 
     // 2. Forward a key press; the target should inject it once it owns input.
-    source_rt.feed_local(LocalInputEvent::Key { usage: 0x04, down: true, mods: 0 });
+    source_rt.feed_local(LocalInputEvent::Key {
+        usage: 0x04,
+        down: true,
+        mods: 0,
+    });
 
     // The forwarded key must be injected on the target over the real connection.
     let mut got_key = false;
     let mut got_move = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(5), rec_rx.recv()).await {
-            Ok(Some(Recorded::Key { usage: 0x04, down: true })) => {
+            Ok(Some(Recorded::Key {
+                usage: 0x04,
+                down: true,
+            })) => {
                 got_key = true;
                 break;
             }
@@ -195,7 +207,10 @@ async fn source_drives_target_over_quic() {
         }
     }
 
-    assert!(got_key, "the forwarded key was injected on the target over QUIC");
+    assert!(
+        got_key,
+        "the forwarded key was injected on the target over QUIC"
+    );
     let _ = got_move; // motion rides the lossy datagram plane; not asserted
 
     source_rt.shutdown();
@@ -277,7 +292,11 @@ async fn source_capture_escalates_only_on_edge_cross() {
     );
 
     // Cursor moving on its own screen keeps it passive (no escalation).
-    source_rt.feed_local(LocalInputEvent::CursorMoved { display_id: 0, x: 50, y: 50 });
+    source_rt.feed_local(LocalInputEvent::CursorMoved {
+        display_id: 0,
+        x: 50,
+        y: 50,
+    });
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert!(
         !spy.history().contains(&CaptureMode::ActiveForward),
@@ -286,7 +305,11 @@ async fn source_capture_escalates_only_on_edge_cross() {
     );
 
     // Crossing the edge hands ownership to the peer → escalate to ActiveForward.
-    source_rt.feed_local(LocalInputEvent::CursorMoved { display_id: 0, x: 99, y: 40 });
+    source_rt.feed_local(LocalInputEvent::CursorMoved {
+        display_id: 0,
+        x: 99,
+        y: 40,
+    });
     await_mode(&spy, CaptureMode::ActiveForward).await;
 
     source_rt.shutdown();
