@@ -83,6 +83,12 @@ dependencies {
     // the handful of non-core glyphs we need are local vectors in MouserIcons.kt.
     implementation("androidx.compose.material:material-icons-core")
 
+    // JNA is the runtime uniffi-Kotlin links the generated `mouser_ffi.kt` bindings
+    // against (Native.register over libmouser_ffi.so, bundled per-ABI in jniLibs).
+    // The `@aar` artifact is required on Android: it ships the JNA native dispatch
+    // .so's inside the AAR so they're packaged into the APK.
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")

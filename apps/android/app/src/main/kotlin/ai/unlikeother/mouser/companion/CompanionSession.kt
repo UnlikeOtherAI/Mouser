@@ -29,7 +29,7 @@ import androidx.lifecycle.LifecycleOwner
  * [DefaultLifecycleObserver] and — for the frame loop specifically — by a
  * Compose `LifecycleEventEffect` in [CompanionScreen].
  */
-class CompanionSession {
+class CompanionSession(private val mouser: MouserClient? = null) {
 
     /**
      * True while the app is in the foreground (resumed). The touchpad's inertia
@@ -40,9 +40,9 @@ class CompanionSession {
         private set
 
     /**
-     * True once a control connection to the active peer is up. Mock-only today
-     * (always false) — flipped by the FFI/net layer once it exists; the UI reads
-     * it to show a "reconnecting…" affordance after a resume.
+     * True once a control connection to the active peer is up. Reflects the
+     * [MouserClient]'s native session when one is wired; the UI reads it to show a
+     * "reconnecting…" affordance after a resume.
      */
     var isConnected by mutableStateOf(false)
         private set
@@ -57,10 +57,11 @@ class CompanionSession {
      */
     fun onResume() {
         isForeground = true
-        Log.d(TAG, "resume → (FFI todo) reconnect + resume streaming")
-        // TODO(mouser-ffi): session.reconnect(); session.resumeStreaming()
-        //   reconnect() walks the supervised backoff and, on success, sets
-        //   isConnected = true and re-issues request_ownership if we held it.
+        // Reflect the native session state on resume. A supervised reconnect (walking
+        // the backoff and re-issuing request_ownership) is a follow-up; connect is
+        // explicit (host/port) today, mirroring iOS / the mouser-ffi scope note.
+        isConnected = mouser?.isConnected ?: false
+        Log.d(TAG, "resume → isConnected=$isConnected")
     }
 
     /**
@@ -73,10 +74,13 @@ class CompanionSession {
      */
     fun onStop() {
         isForeground = false
-        Log.d(TAG, "stop → stop frame loop + (FFI todo) stop streaming + yield ownership")
-        // TODO(mouser-ffi): session.stopStreaming(); session.yieldOwnership()
-        //   yieldOwnership() sends Goodbye{Sleep}/relinquishes the active cursor
-        //   so a peer can reclaim it while we're backgrounded (spec §7.1).
+        // Tear down the native session so a backgrounded device doesn't strand the
+        // cluster's active cursor: disconnect closes the QUIC connection (the engine's
+        // Drop sends a graceful CONNECTION_CLOSE), relinquishing ownership (spec §7.1).
+        // A lighter-weight Goodbye{Sleep}+resume-reconnect path is a follow-up.
+        mouser?.disconnect()
+        isConnected = false
+        Log.d(TAG, "stop → stop frame loop + disconnect (yield ownership)")
     }
 
     /**

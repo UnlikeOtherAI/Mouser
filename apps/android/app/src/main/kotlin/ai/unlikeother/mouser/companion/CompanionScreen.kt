@@ -60,14 +60,23 @@ import androidx.compose.foundation.text.KeyboardOptions
  * [CompanionSession.isForeground] so it genuinely stops while backgrounded.
  */
 @Composable
-fun CompanionScreen(haptics: Haptics?, session: CompanionSession = remember { CompanionSession() }) {
+fun CompanionScreen(
+    haptics: Haptics?,
+    session: CompanionSession = remember { CompanionSession() },
+    mouser: MouserClient = remember { MouserClient() }
+) {
     var selected by remember { mutableStateOf(Device.MAC) }
     var tab by remember { mutableStateOf(CompanionTab.TOUCHPAD) }
     // Clipboard UI state (mock today; bound to ClipboardEngine once the FFI lands —
     // see ClipboardUiState). Hoisted here so the host owns it across tab switches.
     val clipboard = remember { ClipboardUiState() }
-    val onEvent: (TouchpadEvent) -> Unit = remember(haptics) {
-        { event -> haptics?.feedback(event) }
+    // Every recognised gesture drives local haptics AND, while connected, forwards
+    // over the wire through the mouser-ffi bridge (sendPointerMoved/button/scroll).
+    val onEvent: (TouchpadEvent) -> Unit = remember(haptics, mouser) {
+        { event ->
+            haptics?.feedback(event)
+            mouser.onEvent(event)
+        }
     }
 
     // Compose-side lifecycle hooks (the activity also observes at process scope).
@@ -94,6 +103,7 @@ fun CompanionScreen(haptics: Haptics?, session: CompanionSession = remember { Co
                 selected = selected,
                 onSelect = { selected = it },
                 onEvent = onEvent,
+                onKey = mouser::sendCharacter,
                 isForeground = session.isForeground,
                 tab = tab,
                 onTabChange = { tab = it },
@@ -129,6 +139,7 @@ private fun PortraitLayout(
     selected: Device,
     onSelect: (Device) -> Unit,
     onEvent: (TouchpadEvent) -> Unit,
+    onKey: (Char) -> Unit,
     isForeground: Boolean,
     tab: CompanionTab,
     onTabChange: (CompanionTab) -> Unit,
@@ -149,7 +160,8 @@ private fun PortraitLayout(
                 selected = selected,
                 onSelect = onSelect,
                 onEvent = onEvent,
-                isForeground = isForeground
+                isForeground = isForeground,
+                onKey = onKey
             )
             // Mac-style wait indicator (mock transfer) + the §7.7 settings section.
             CompanionTab.CLIPBOARD -> ClipboardScreen(
@@ -166,7 +178,8 @@ private fun ColumnScope.TouchpadTab(
     selected: Device,
     onSelect: (Device) -> Unit,
     onEvent: (TouchpadEvent) -> Unit,
-    isForeground: Boolean
+    isForeground: Boolean,
+    onKey: (Char) -> Unit
 ) {
     TouchpadSurface(
         deviceName = selected.displayName,
@@ -181,7 +194,7 @@ private fun ColumnScope.TouchpadTab(
     Spacer(modifier = Modifier.height(12.dp))
     DeviceSelectorRow(selected = selected, onSelect = onSelect)
     Spacer(modifier = Modifier.height(12.dp))
-    CaptureField()
+    CaptureField(onKey = onKey)
 }
 
 /** Two-tab segmented switch between the touchpad and the clipboard screen. */
@@ -220,7 +233,7 @@ private fun TabSwitcher(current: CompanionTab, onSelect: (CompanionTab) -> Unit)
  * `KeyEvent`s, architecture §9). Parity with iOS `captureField`.
  */
 @Composable
-private fun CaptureField() {
+private fun CaptureField(onKey: (Char) -> Unit) {
     var value by remember { mutableStateOf(TextFieldValue("")) }
     val focusRequester = remember { FocusRequester() }
 
@@ -252,7 +265,16 @@ private fun CaptureField() {
             }
             BasicTextField(
                 value = value,
-                onValueChange = { value = it },
+                onValueChange = { next ->
+                    // Forward each newly appended character as a HID keystroke over
+                    // the wire (no-op while disconnected). Only growth is treated as
+                    // typing; edits/deletes don't emit. The field itself stays a thin
+                    // capture surface — its text isn't the source of truth.
+                    if (next.text.length > value.text.length) {
+                        next.text.substring(value.text.length).forEach(onKey)
+                    }
+                    value = next
+                },
                 singleLine = true,
                 cursorBrush = SolidColor(MouserColors.Live),
                 textStyle = LocalTextStyle.current.copy(

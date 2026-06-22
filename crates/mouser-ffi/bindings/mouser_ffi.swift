@@ -867,12 +867,12 @@ public enum MobileError: Swift.Error, Equatable, Hashable, Foundation.LocalizedE
     /**
      * Binding the local QUIC endpoint or resolving its address failed.
      */
-    case Bind(message: String
+    case Bind(detail: String
     )
     /**
      * The QUIC dial / pinned-TLS handshake to the peer failed.
      */
-    case Connect(message: String
+    case Connect(detail: String
     )
 
     
@@ -907,10 +907,10 @@ public struct FfiConverterTypeMobileError: FfiConverterRustBuffer {
         case 2: return .AlreadyConnected
         case 3: return .NotConnected
         case 4: return .Bind(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
         case 5: return .Connect(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -936,14 +936,14 @@ public struct FfiConverterTypeMobileError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
         
         
-        case let .Bind(message):
+        case let .Bind(detail):
             writeInt(&buf, Int32(4))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         
-        case let .Connect(message):
+        case let .Connect(detail):
             writeInt(&buf, Int32(5))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         }
     }

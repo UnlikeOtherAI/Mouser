@@ -21,7 +21,11 @@ import androidx.compose.ui.Modifier
  */
 class MainActivity : ComponentActivity() {
 
-    private val session = CompanionSession()
+    // Single native bridge for the process. Owned here (not in the Compose tree) so
+    // it survives recompositions/orientation changes and its tokio runtime + QUIC
+    // connection live for the activity's lifetime.
+    private val mouser = MouserClient()
+    private val session = CompanionSession(mouser)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,7 +42,7 @@ class MainActivity : ComponentActivity() {
                         .fillMaxSize()
                         .background(MouserColors.Background)
                 ) {
-                    CompanionScreen(haptics = haptics, session = session)
+                    CompanionScreen(haptics = haptics, session = session, mouser = mouser)
                 }
             }
         }

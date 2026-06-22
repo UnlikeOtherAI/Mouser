@@ -66,11 +66,14 @@ pub enum MobileError {
     #[error("not connected")]
     NotConnected,
     /// Binding the local QUIC endpoint or resolving its address failed.
-    #[error("bind failed: {message}")]
-    Bind { message: String },
+    // Field is `detail`, not `message`: uniffi's Kotlin codegen renders a struct
+    // error variant field named `message` as a property that shadows
+    // `Throwable.message`, which fails to compile (overload-resolution ambiguity).
+    #[error("bind failed: {detail}")]
+    Bind { detail: String },
     /// The QUIC dial / pinned-TLS handshake to the peer failed.
-    #[error("connect failed: {message}")]
-    Connect { message: String },
+    #[error("connect failed: {detail}")]
+    Connect { detail: String },
 }
 
 /// The phone never injects: it is a pure controller, not a handoff *target*. The
@@ -191,11 +194,11 @@ impl MobileClient {
         let connection = self.rt.block_on(async {
             // Ephemeral client-only QUIC endpoint (no listener; the phone dials out).
             let endpoint = InteractiveEndpoint::bind_client(mouser_net::loopback_addr())
-                .map_err(|e| MobileError::Bind { message: e.to_string() })?;
+                .map_err(|e| MobileError::Bind { detail: e.to_string() })?;
             endpoint
                 .connect_interactive(identity, addr, PinPolicy::Pinned(peer_id))
                 .await
-                .map_err(|e| MobileError::Connect { message: e.to_string() })
+                .map_err(|e| MobileError::Connect { detail: e.to_string() })
         })?;
         let connection = Arc::new(connection);
 
@@ -288,10 +291,10 @@ fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, MobileError> {
     use std::net::ToSocketAddrs;
     (host, port)
         .to_socket_addrs()
-        .map_err(|e| MobileError::Connect { message: e.to_string() })?
+        .map_err(|e| MobileError::Connect { detail: e.to_string() })?
         .next()
         .ok_or_else(|| MobileError::Connect {
-            message: format!("no address for {host}:{port}"),
+            detail: format!("no address for {host}:{port}"),
         })
 }
 
