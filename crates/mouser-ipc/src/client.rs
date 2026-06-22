@@ -9,16 +9,24 @@
 use std::path::Path;
 
 use tokio::io::{ReadHalf, WriteHalf};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use crate::codec::{read_message, write_message, IpcError};
 use crate::dto::{Command, ServerMessage, Snapshot};
 use crate::path::default_socket_path;
 
+#[cfg(unix)]
+type IpcClientStream = UnixStream;
+#[cfg(windows)]
+type IpcClientStream = NamedPipeClient;
+
 /// A connected IPC client (UI side).
 pub struct Client {
-    read_half: ReadHalf<UnixStream>,
-    write_half: WriteHalf<UnixStream>,
+    read_half: ReadHalf<IpcClientStream>,
+    write_half: WriteHalf<IpcClientStream>,
 }
 
 impl Client {
@@ -29,7 +37,7 @@ impl Client {
 
     /// Connect to the daemon at an explicit socket path (tests pass a temp path).
     pub async fn connect_at(socket_path: impl AsRef<Path>) -> Result<Self, IpcError> {
-        let stream = UnixStream::connect(socket_path.as_ref()).await?;
+        let stream = connect_stream(socket_path.as_ref()).await?;
         let (read_half, write_half) = tokio::io::split(stream);
         Ok(Self {
             read_half,
@@ -59,4 +67,16 @@ impl Client {
         self.send_command(&Command::GetSnapshot).await?;
         self.next_snapshot().await
     }
+}
+
+#[cfg(unix)]
+async fn connect_stream(socket_path: &Path) -> Result<IpcClientStream, IpcError> {
+    UnixStream::connect(socket_path).await.map_err(IpcError::Io)
+}
+
+#[cfg(windows)]
+async fn connect_stream(socket_path: &Path) -> Result<IpcClientStream, IpcError> {
+    ClientOptions::new()
+        .open(socket_path.as_os_str())
+        .map_err(IpcError::Io)
 }

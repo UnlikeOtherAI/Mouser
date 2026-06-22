@@ -19,7 +19,9 @@ pub mod server;
 
 pub use client::Client;
 pub use codec::{read_message, write_message, IpcError, MAX_FRAME};
-pub use dto::{Command, ConnectionDto, ConnectionStateDto, DeviceDto, PeerDto, ServerMessage, Snapshot};
+pub use dto::{
+    Command, ConnectionDto, ConnectionStateDto, DeviceDto, PeerDto, ServerMessage, Snapshot,
+};
 pub use path::{default_socket_path, SOCKET_FILE};
 pub use server::{Publisher, Server};
 
@@ -29,13 +31,7 @@ mod loopback_tests {
     use std::time::Duration;
 
     fn temp_socket_path(tag: &str) -> std::path::PathBuf {
-        let mut dir = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        dir.push(format!("mouser-ipc-{tag}-{}-{nanos}.sock", std::process::id()));
-        dir
+        path::test_socket_path(tag)
     }
 
     fn sample_snapshot() -> Snapshot {

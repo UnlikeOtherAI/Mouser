@@ -11,12 +11,20 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::codec::{read_message, write_message, IpcError};
 use crate::dto::{Command, ServerMessage, Snapshot};
 use crate::path::default_socket_path;
+
+#[cfg(unix)]
+type IpcServerStream = UnixStream;
+#[cfg(windows)]
+type IpcServerStream = NamedPipeServer;
 
 /// A cheap, cloneable handle to publish snapshots without touching the [`Server`].
 ///
@@ -52,21 +60,22 @@ impl Server {
         Self::bind_at(default_socket_path(), initial).await
     }
 
-    /// Bind the IPC server at an explicit socket path (tests pass a temp path).
+    /// Bind the IPC server at an explicit socket/pipe path (tests pass a temp path).
     ///
     /// A stale socket file from a previous run is removed first so re-binding after a
-    /// crash succeeds (Unix sockets do not auto-unlink).
+    /// crash succeeds on Unix sockets (named pipes have no filesystem entry).
     pub async fn bind_at(
         socket_path: impl Into<PathBuf>,
         initial: Snapshot,
     ) -> Result<Self, IpcError> {
         let socket_path = socket_path.into();
+        #[cfg(unix)]
         match std::fs::remove_file(&socket_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(IpcError::Io(e)),
         }
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = IpcListener::bind(socket_path.clone())?;
         let (snapshot_tx, _snapshot_rx) = watch::channel(initial);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -113,19 +122,60 @@ impl Drop for Server {
             task.abort();
         }
         // Unlink the socket so a later bind on the same path is clean.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(unix)]
+struct IpcListener {
+    inner: UnixListener,
+}
+
+#[cfg(unix)]
+impl IpcListener {
+    fn bind(path: PathBuf) -> Result<Self, IpcError> {
+        Ok(Self {
+            inner: UnixListener::bind(path)?,
+        })
+    }
+
+    async fn accept(&mut self) -> Result<IpcServerStream, std::io::Error> {
+        self.inner.accept().await.map(|(stream, _addr)| stream)
+    }
+}
+
+#[cfg(windows)]
+struct IpcListener {
+    pipe_name: PathBuf,
+    pending: NamedPipeServer,
+}
+
+#[cfg(windows)]
+impl IpcListener {
+    fn bind(pipe_name: PathBuf) -> Result<Self, IpcError> {
+        let pending = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(pipe_name.as_os_str())?;
+        Ok(Self { pipe_name, pending })
+    }
+
+    async fn accept(&mut self) -> Result<IpcServerStream, std::io::Error> {
+        self.pending.connect().await?;
+        let next = ServerOptions::new().create(self.pipe_name.as_os_str())?;
+        Ok(std::mem::replace(&mut self.pending, next))
     }
 }
 
 /// Accept connections forever, spawning a per-client task for each.
 async fn accept_loop(
-    listener: UnixListener,
+    mut listener: IpcListener,
     snapshot_tx: watch::Sender<Snapshot>,
     command_tx: mpsc::UnboundedSender<Command>,
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 let rx = snapshot_tx.subscribe();
                 let command_tx = command_tx.clone();
                 tokio::spawn(serve_client(stream, rx, command_tx));
@@ -140,11 +190,11 @@ async fn accept_loop(
 
 /// Serve one UI client: push snapshots (current + every change) and read its commands.
 async fn serve_client(
-    stream: UnixStream,
+    stream: IpcServerStream,
     mut snapshot_rx: watch::Receiver<Snapshot>,
     command_tx: mpsc::UnboundedSender<Command>,
 ) {
-    let (read_half, mut write_half) = stream.into_split();
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
 
     // Push the snapshot the client sees on connect.
     {
@@ -157,7 +207,6 @@ async fn serve_client(
         }
     }
 
-    let mut read_half = read_half;
     loop {
         tokio::select! {
             // The daemon published a newer snapshot — forward it.
