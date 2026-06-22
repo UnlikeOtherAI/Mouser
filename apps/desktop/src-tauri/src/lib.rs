@@ -10,6 +10,11 @@
 //! still require the engine; the UI shows an honest "no peers yet" state.
 
 use serde::Serialize;
+use tauri::{
+    menu::MenuBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, WindowEvent,
+};
 
 /// Compile-time OS kind, matching the frontend `OsKind` union.
 const OS_KIND: &str = if cfg!(target_os = "macos") {
@@ -42,6 +47,11 @@ struct LocalDevice {
     os: String,
     monitors: Vec<MonitorInfo>,
 }
+
+const MAIN_WINDOW_LABEL: &str = "main";
+const TRAY_SHOW: &str = "show";
+const TRAY_HIDE: &str = "hide";
+const TRAY_QUIT: &str = "quit";
 
 /// Returns the real local device: friendly name, OS, and the physical monitor
 /// layout reported by the windowing system (positions and sizes converted from
@@ -87,6 +97,60 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
     })
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.hide();
+    }
+}
+
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text(TRAY_SHOW, "Show Mouser")
+        .text(TRAY_HIDE, "Hide")
+        .separator()
+        .text(TRAY_QUIT, "Quit")
+        .build()?;
+    let icon = app.default_window_icon().cloned();
+
+    let mut tray = TrayIconBuilder::with_id("mouser")
+        .menu(&menu)
+        .tooltip("Mouser")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_SHOW => show_main_window(app),
+            TRAY_HIDE => hide_main_window(app),
+            TRAY_QUIT => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => show_main_window(tray.app_handle()),
+            _ => {}
+        });
+
+    if let Some(icon) = icon {
+        tray = tray.icon(icon);
+    }
+
+    tray.build(app)?;
+    Ok(())
+}
+
 /// Builds and runs the Tauri application.
 ///
 /// Kept in the library (not `main.rs`) so the same entry point can be reused by
@@ -96,6 +160,18 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            install_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == MAIN_WINDOW_LABEL {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![local_device])
         .run(tauri::generate_context!())
         .expect("error while running Mouser desktop shell");
