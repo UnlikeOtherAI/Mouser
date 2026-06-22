@@ -13,6 +13,8 @@ struct TouchpadView: View {
     /// True in portrait (shorter readout, idle hint); false in landscape (full
     /// readout, edge-to-edge surface).
     var compact: Bool = true
+    /// The engine bridge; when connected, the trackpad forwards input to the peer.
+    var client: MouserClient? = nil
 
     private var connected: Bool { deviceName != nil }
 
@@ -51,7 +53,10 @@ struct TouchpadView: View {
                 }
             }
         }
-        .onAppear { Haptics.shared.warmUp() }
+        .onAppear {
+            Haptics.shared.warmUp()
+            state.client = client
+        }
     }
 
     /// Inset overlays by the safe-area amount (with a sensible minimum) so the

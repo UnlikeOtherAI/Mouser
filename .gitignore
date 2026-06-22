@@ -31,6 +31,8 @@ DerivedData/
 # xcodebuild -derivedDataPath build output (any level)
 build/
 *.xcuserstate
+# Generated mouser-ffi XCFramework (~90 MB; built by apps/ios/build-ffi.sh)
+apps/ios/Frameworks/
 
 # Worktrees (mandated location, kept out of history)
 .worktrees/

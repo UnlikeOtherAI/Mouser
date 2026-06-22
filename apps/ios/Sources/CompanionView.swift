@@ -22,6 +22,7 @@ struct CompanionView: View {
     @StateObject private var keyboard = KeyboardObserver()
     @StateObject private var lifecycle = AppLifecycle()
     @StateObject private var clipboard = ClipboardModel()
+    @StateObject private var mouser = MouserClient()
     @State private var showClipboardSettings = false
 
     /// Landscape on iPhone collapses the height into `.compact`; that is our
@@ -56,6 +57,11 @@ struct CompanionView: View {
         // active (audit R2 — lifecycle/reconnect scaffolding).
         .onChange(of: scenePhase) { _, phase in
             lifecycle.handle(phase.asLifecyclePhase)
+            // Yield ownership + close the connection when backgrounded (a graceful
+            // Goodbye), matching the Android lifecycle.
+            if phase == .background {
+                mouser.disconnect()
+            }
         }
         // Clipboard settings hook (UI/view-model only; no networking yet).
         .sheet(isPresented: $showClipboardSettings) {
@@ -107,7 +113,7 @@ struct CompanionView: View {
         // BELOW the touchpad rather than floating over it. The touchpad takes all
         // remaining height above.
         VStack(spacing: 12) {
-            TouchpadView(deviceName: peers.selected?.name, compact: true)
+            TouchpadView(deviceName: peers.selected?.name, compact: true, client: mouser)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             clipboardChrome
@@ -138,7 +144,7 @@ struct CompanionView: View {
         // while keeping the readout/badge inside the safe area, so we do NOT
         // ignore safe area here — that lets the inner GeometryReader still report
         // the notch insets the overlays need.
-        TouchpadView(deviceName: peers.selected?.name, compact: false)
+        TouchpadView(deviceName: peers.selected?.name, compact: false, client: mouser)
             .accessibilityIdentifier("landscape.fullpad")
     }
 

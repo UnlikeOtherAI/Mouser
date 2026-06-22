@@ -68,9 +68,19 @@ final class TrackpadState: ObservableObject {
     /// just after a tap clearly show which event happened.
     @Published var eventFlash = false
 
+    /// When connected, gestures are forwarded to the peer over the engine
+    /// (`mouser-ffi`). `nil` (or disconnected) keeps the touchpad a local preview.
+    weak var client: MouserClient?
+
     func report(_ kind: TrackpadEventKind) {
         lastEvent = kind
         eventFlash = true
+        // Forward discrete clicks to the controlled peer (left=0, right=1).
+        switch kind {
+        case .leftClick: client?.click(0)
+        case .rightClick: client?.click(1)
+        default: break
+        }
         // Decay the flash; cosmetic only.
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -83,12 +93,14 @@ final class TrackpadState: ObservableObject {
         cumulativeMove.width += delta.width
         cumulativeMove.height += delta.height
         lastEvent = .move
+        client?.move(delta)
     }
 
     func registerScroll(_ delta: CGSize, momentum: Bool) {
         scrollDelta = delta
         isMomentum = momentum
         lastEvent = momentum ? .momentum : .scroll
+        client?.scroll(delta)
     }
 
     func resetTransient() {

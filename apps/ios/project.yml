@@ -20,6 +20,16 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
+    dependencies:
+      # The Rust engine bridge (mouser-ffi). Static lib in an XCFramework, so it is
+      # linked, not embedded. Built by build-ffi.sh (gitignored, ~90 MB), which the
+      # pre-build script below also runs so `xcodebuild` is self-sufficient.
+      - framework: Frameworks/MouserFFI.xcframework
+        embed: false
+    preBuildScripts:
+      - script: bash "${PROJECT_DIR}/build-ffi.sh"
+        name: Build mouser-ffi XCFramework
+        basedOnDependencyAnalysis: false
     entitlements:
       path: Sources/Mouser.entitlements
       properties:
