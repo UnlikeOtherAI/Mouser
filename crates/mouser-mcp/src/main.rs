@@ -165,7 +165,11 @@ async fn health() -> &'static str {
 }
 
 /// Handle one POSTed JSON-RPC message over HTTP, mirroring the stdio dispatch.
-async fn mcp_post(State(token): State<Arc<Option<String>>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn mcp_post(
+    State(token): State<Arc<Option<String>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if !authorized(&token, &headers) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
