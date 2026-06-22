@@ -1,1 +1,430 @@
-//! mouser-ffi — placeholder; implementation in progress.
+//! mouser-ffi — the mobile FFI bridge (uniffi) that lets a phone act as a pure
+//! **source/controller** for a Mouser peer engine over QUIC.
+//!
+//! A phone has no keyboard/mouse to *capture* and never *injects* (it is not a
+//! handoff target), so this crate reuses the already-tested [`mouser_engine`] in
+//! **source** mode with a no-op injector and drives it from synthetic input events
+//! the Swift/Kotlin UI feeds in (taps, drags, on-screen keyboard). The protocol,
+//! transport, pinning, anti-replay, and heartbeat logic are NOT reimplemented here —
+//! this is a thin synchronous façade over [`RuntimeHandle`].
+//!
+//! ## Ownership model (why the phone hands input to the peer)
+//! [`mouser_engine::EngineCore`] forwards keyboard/button/scroll/motion to the peer
+//! only while the peer — not this node — owns input (a source captures locally while
+//! it owns its own screen, and forwards once the cursor has crossed to the peer). A
+//! phone is *always* remote-driving, so right after connecting we feed one edge-cross
+//! so the engine grants ownership to the peer; from then on every event the UI sends
+//! is forwarded over the wire. See [`MobileClient::connect`].
+//!
+//! ## Scope (deliberate non-goals — follow-ups, not bugs)
+//! - **Discovery is out of this FFI.** iOS mDNS must use native `NWBrowser` (the Rust
+//!   `mdns-sd` raw multicast needs the special iOS multicast entitlement), so
+//!   [`MobileClient::connect`] takes an explicit `host`/`port` that Swift obtains from
+//!   `NWBrowser`.
+//! - Full Xcode integration, on-device install, SAS pairing UI, and Android/Kotlin
+//!   wiring are follow-ups. This crate compiles for `aarch64-apple-ios` and produces
+//!   Swift/Kotlin bindings via `uniffi-bindgen`.
+
+// This crate keeps uniffi's `unsafe extern "C"` scaffolding, so it can't adopt
+// `[lints] workspace = true` (that would pull in `unsafe_code = "forbid"`).
+// Replicate the workspace panic-free clippy denies here instead (mirrors the
+// platform-* adapters). Test code is exempt via `#[cfg(test)]`.
+#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+
+use std::sync::{Arc, Mutex};
+
+use mouser_core::platform::{InputInjection, LocalInputEvent, PlatformResult, ScrollUnit};
+use mouser_engine::discovery::decode_device_id;
+use mouser_engine::{EdgeLayout, EngineCore, RuntimeHandle};
+use mouser_net::{DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PinPolicy};
+
+uniffi::setup_scaffolding!();
+
+/// Logical-pixel size handed to the source layout. The phone reports cursor *motion*
+/// (deltas) and the engine clamps the virtual peer cursor into this box; it is made
+/// large so ordinary movement never accidentally hits the far clamp. The peer clamps
+/// absolute coordinates to its real display on receipt (spec §7.6), so the exact value
+/// here only bounds the engine's internal virtual cursor.
+const VIRTUAL_SPAN: i32 = 1 << 20;
+
+/// Step used to push the virtual peer cursor off the entry edge after the initial
+/// edge-cross, so a subsequent leftward delta does not immediately reclaim ownership
+/// back to the phone (see [`MobileClient::connect`]).
+const SEED_STEP: i32 = 16;
+
+/// Errors crossing the FFI boundary. No panics ever cross: every fallible path maps to
+/// one of these (uniffi turns them into a thrown Swift error / Kotlin exception).
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MobileError {
+    /// The supplied peer `device_id` was not valid base32 / not a 32-byte id.
+    #[error("invalid peer device id")]
+    InvalidPeerId,
+    /// `connect` was called while already connected. Call `disconnect` first.
+    #[error("already connected")]
+    AlreadyConnected,
+    /// An input/connection method was called before a successful `connect`.
+    #[error("not connected")]
+    NotConnected,
+    /// Binding the local QUIC endpoint or resolving its address failed.
+    #[error("bind failed: {message}")]
+    Bind { message: String },
+    /// The QUIC dial / pinned-TLS handshake to the peer failed.
+    #[error("connect failed: {message}")]
+    Connect { message: String },
+}
+
+/// The phone never injects: it is a pure controller, not a handoff *target*. The
+/// source-mode engine only ever produces inject actions for input it *receives* while
+/// it owns a peer — which never happens here — so these are inert. They exist solely to
+/// satisfy [`RuntimeHandle::start`]'s [`InputInjection`] requirement.
+struct NoopInjector;
+
+impl InputInjection for NoopInjector {
+    fn move_cursor(&self, _display_id: u32, _x: i32, _y: i32) -> PlatformResult<()> {
+        Ok(())
+    }
+    fn move_cursor_relative(&self, _dx: i32, _dy: i32) -> PlatformResult<()> {
+        Ok(())
+    }
+    fn button(&self, _button: u8, _down: bool) -> PlatformResult<()> {
+        Ok(())
+    }
+    fn key(&self, _usage: u16, _down: bool, _mods: u16) -> PlatformResult<()> {
+        Ok(())
+    }
+    fn scroll(&self, _dx: i32, _dy: i32, _unit: ScrollUnit) -> PlatformResult<()> {
+        Ok(())
+    }
+}
+
+/// Live connection state, held together so `disconnect` (or drop) tears both down: the
+/// engine runtime and the QUIC connection it drives. The connection is kept alive
+/// alongside the handle because the runtime's background tasks borrow it via `Arc`.
+struct Session {
+    runtime: RuntimeHandle,
+    _connection: Arc<InteractiveConnection>,
+}
+
+/// A mobile controller for a single Mouser peer.
+///
+/// Owns a multi-thread tokio runtime and, once connected, a source-mode engine. All
+/// methods are **synchronous** at the FFI boundary: `connect` drives the async dial via
+/// the held runtime's `block_on`; the input senders are already sync (they call
+/// [`RuntimeHandle::feed_local`], which runs the sans-IO core inline).
+#[derive(uniffi::Object)]
+pub struct MobileClient {
+    /// This device's pinned identity (its leaf cert / `device_id`). Generated per
+    /// client instance; persisting it across launches is a Swift-side follow-up.
+    identity: DeviceIdentity,
+    /// The runtime that owns the QUIC endpoint's async tasks. Held for the client's
+    /// lifetime so the connection's background tasks keep running between calls.
+    rt: tokio::runtime::Runtime,
+    /// The active session, if connected.
+    session: Mutex<Option<Session>>,
+}
+
+#[uniffi::export]
+impl MobileClient {
+    /// Create a disconnected client with a fresh identity and a multi-thread runtime.
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        // A small fixed pool: enough for the sender + the three receiver/ticker tasks
+        // plus the dial, without spawning one thread per core on a phone.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            // The only failure here is the OS refusing to spawn threads at startup;
+            // there is no caller to return an error to from a constructor, and a phone
+            // that cannot start two threads cannot run the app at all.
+            .unwrap_or_else(|e| {
+                // SAFETY-OF-PANIC-FREE: constructor has no Result; fall back to the
+                // current-thread runtime rather than aborting. block_on still works.
+                let _ = e;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("current-thread runtime")
+            });
+        Arc::new(Self {
+            identity: DeviceIdentity::generate(),
+            rt,
+            session: Mutex::new(None),
+        })
+    }
+
+    /// This device's own `device_id` as base32 (what the peer must pin against). The
+    /// Swift UI surfaces this for pairing.
+    pub fn device_id(&self) -> String {
+        self.identity.device_id_base32()
+    }
+
+    /// Whether a session is currently active.
+    pub fn is_connected(&self) -> bool {
+        lock(&self.session).is_some()
+    }
+
+    /// Connect to a peer engine at `host:port`, pinning its `device_id` (§3), and start
+    /// forwarding input as the source.
+    ///
+    /// `peer_device_id_base32` is the peer's base32 `device_id` (from `NWBrowser` /
+    /// pairing). The dial is mutually pinned: we present our identity cert and require
+    /// the peer's leaf cert to hash to the given id. After the connection is up we hand
+    /// input ownership to the peer (one edge-cross) so subsequent events forward.
+    pub fn connect(
+        &self,
+        host: String,
+        port: u16,
+        peer_device_id_base32: String,
+    ) -> Result<(), MobileError> {
+        let peer_id = decode_device_id(&peer_device_id_base32).ok_or(MobileError::InvalidPeerId)?;
+        let mut guard = lock(&self.session);
+        if guard.is_some() {
+            return Err(MobileError::AlreadyConnected);
+        }
+
+        let addr = resolve(&host, port)?;
+        let identity = &self.identity;
+        // Synchronous at the boundary: bind the endpoint and drive the async dial on the
+        // held runtime. quinn's `Endpoint::client` must be created inside a tokio runtime
+        // context, so the bind happens inside `block_on` too (not just the dial).
+        let connection = self.rt.block_on(async {
+            // Ephemeral client-only QUIC endpoint (no listener; the phone dials out).
+            let endpoint = InteractiveEndpoint::bind_client(mouser_net::loopback_addr())
+                .map_err(|e| MobileError::Bind { message: e.to_string() })?;
+            endpoint
+                .connect_interactive(identity, addr, PinPolicy::Pinned(peer_id))
+                .await
+                .map_err(|e| MobileError::Connect { message: e.to_string() })
+        })?;
+        let connection = Arc::new(connection);
+
+        // Source-mode engine: the peer sits to our "right" in a large virtual space, so
+        // the very first cursor report crosses the edge and grants ownership to the peer
+        // (`crosses_out` for `Edge::Right` is `x >= width - 1`).
+        let me = self.identity.device_id();
+        let core = EngineCore::new_source(
+            me,
+            peer_id,
+            EdgeLayout::side_by_side(1, VIRTUAL_SPAN, VIRTUAL_SPAN, VIRTUAL_SPAN),
+        );
+        // `RuntimeHandle::start` calls `tokio::spawn`, so it must run inside the runtime
+        // context; enter it for the duration of the start.
+        let runtime = {
+            let _guard = self.rt.enter();
+            RuntimeHandle::start(core, Arc::clone(&connection), Arc::new(NoopInjector))
+        };
+
+        // Hand ownership to the peer: x >= width-1 (==0) crosses immediately. Then nudge
+        // the virtual peer cursor off the entry edge so a later leftward delta doesn't
+        // trip the back-cross reclaim (`Edge::Right` reclaims at peer_x <= 0 && dx < 0).
+        let center = VIRTUAL_SPAN / 2;
+        runtime.feed_local(LocalInputEvent::CursorMoved { display_id: 0, x: 0, y: center });
+        runtime.feed_local(LocalInputEvent::CursorMoved {
+            display_id: 0,
+            x: SEED_STEP,
+            y: center,
+        });
+
+        *guard = Some(Session { runtime, _connection: connection });
+        Ok(())
+    }
+
+    /// Report a cursor position (logical pixels). The engine forwards the resulting
+    /// motion to the peer as a lossy datagram (§7.6). Coordinates are treated as
+    /// successive samples; the engine forwards their *motion* and the peer clamps the
+    /// absolute result to its real display.
+    pub fn send_pointer_moved(&self, display_id: u32, x: i32, y: i32) {
+        self.feed(LocalInputEvent::CursorMoved { display_id, x, y });
+    }
+
+    /// Report a pointer button transition (`down` presses). Button index per §7.5
+    /// (0=left, 1=right, 2=middle, 3=back, 4=forward).
+    pub fn send_button(&self, button: u8, down: bool) {
+        self.feed(LocalInputEvent::Button { button, down });
+    }
+
+    /// Report a key transition by USB HID usage (Usage Page 0x07, Appendix B) with the
+    /// active modifier bitmask (`down` presses).
+    pub fn send_key(&self, usage: u16, down: bool, mods: u16) {
+        self.feed(LocalInputEvent::Key { usage, down, mods });
+    }
+
+    /// Report a scroll delta in logical pixels.
+    pub fn send_scroll(&self, dx: i32, dy: i32) {
+        self.feed(LocalInputEvent::Scroll { dx, dy });
+    }
+
+    /// Tear down the session: stop the engine tasks and close the QUIC connection.
+    /// Idempotent — disconnecting when not connected is a no-op.
+    pub fn disconnect(&self) {
+        if let Some(session) = lock(&self.session).take() {
+            session.runtime.shutdown();
+            // `session._connection`'s `Drop` sends the peer a graceful CONNECTION_CLOSE.
+        }
+    }
+}
+
+impl MobileClient {
+    /// Feed one synthetic local event to the source engine, if connected. Silently
+    /// drops events while disconnected (the UI may emit a stray gesture during
+    /// teardown); the senders are infallible at the FFI boundary by design.
+    fn feed(&self, event: LocalInputEvent) {
+        if let Some(session) = lock(&self.session).as_ref() {
+            let _ = session.runtime.feed_local(event);
+        }
+    }
+}
+
+/// Lock the session mutex, recovering the inner value if a holder panicked (panic-free
+/// discipline: never `unwrap` a poisoned guard).
+fn lock(m: &Mutex<Option<Session>>) -> std::sync::MutexGuard<'_, Option<Session>> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Resolve `host:port` to a single socket address. Accepts a literal IP (the common
+/// `NWBrowser` case, which already resolves the address) or a hostname.
+fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, MobileError> {
+    use std::net::ToSocketAddrs;
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| MobileError::Connect { message: e.to_string() })?
+        .next()
+        .ok_or_else(|| MobileError::Connect {
+            message: format!("no address for {host}:{port}"),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn new_client_is_disconnected_and_reports_device_id() {
+        let client = MobileClient::new();
+        assert!(!client.is_connected());
+        // The id must round-trip through the same decoder the connect path pins with.
+        let id = client.device_id();
+        assert!(decode_device_id(&id).is_some(), "device_id is valid base32");
+    }
+
+    #[test]
+    fn connect_rejects_malformed_peer_id() {
+        let client = MobileClient::new();
+        let err = client
+            .connect("127.0.0.1".into(), 1, "not-base32 !!!".into())
+            .expect_err("malformed id rejected");
+        assert!(matches!(err, MobileError::InvalidPeerId));
+        assert!(!client.is_connected());
+    }
+
+    #[test]
+    fn input_senders_are_noops_while_disconnected() {
+        let client = MobileClient::new();
+        // Must not panic and must stay disconnected.
+        client.send_pointer_moved(0, 10, 10);
+        client.send_button(0, true);
+        client.send_key(0x04, true, 0);
+        client.send_scroll(0, -3);
+        client.disconnect(); // idempotent no-op
+        assert!(!client.is_connected());
+    }
+
+    /// End-to-end over a real QUIC loopback connection: a target engine accepts, the
+    /// `MobileClient` connects as source and sends a key; the target injects it. Proves
+    /// the FFI drives the whole capture→forward→inject pipeline over the actual
+    /// transport (mirrors `mouser-engine/tests/loopback.rs`).
+    #[test]
+    fn loopback_connect_and_send_forwards_to_target() {
+        use mouser_engine::EngineCore;
+        use mouser_net::{DeviceIdentity, InteractiveEndpoint, PinPolicy};
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Recorded {
+            Key { usage: u16, down: bool },
+        }
+        struct RecordingInjector {
+            tx: tokio::sync::mpsc::UnboundedSender<Recorded>,
+        }
+        impl InputInjection for RecordingInjector {
+            fn move_cursor(&self, _d: u32, _x: i32, _y: i32) -> PlatformResult<()> {
+                Ok(())
+            }
+            fn move_cursor_relative(&self, _dx: i32, _dy: i32) -> PlatformResult<()> {
+                Ok(())
+            }
+            fn button(&self, _b: u8, _down: bool) -> PlatformResult<()> {
+                Ok(())
+            }
+            fn key(&self, usage: u16, down: bool, _mods: u16) -> PlatformResult<()> {
+                let _ = self.tx.send(Recorded::Key { usage, down });
+                Ok(())
+            }
+            fn scroll(&self, _dx: i32, _dy: i32, _u: ScrollUnit) -> PlatformResult<()> {
+                Ok(())
+            }
+        }
+
+        // A dedicated runtime drives the target accept loop while the (synchronous)
+        // MobileClient::connect blocks on its own runtime.
+        let target_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("target runtime");
+
+        let phone = MobileClient::new();
+        let phone_id = decode_device_id(&phone.device_id()).expect("phone id");
+
+        let target_identity = DeviceIdentity::generate();
+        let target_device = target_identity.device_id();
+        let target_id_b32 = target_identity.device_id_base32();
+
+        // Target listens, pinning the phone's id; learn its bound port. quinn's
+        // `Endpoint::server` must run inside a tokio runtime, so bind on `target_rt`.
+        let (server, server_addr) = target_rt.block_on(async {
+            let server = InteractiveEndpoint::bind_server(
+                &target_identity,
+                mouser_net::loopback_addr(),
+                PinPolicy::Pinned(phone_id),
+            )
+            .expect("bind server");
+            let addr = server.local_addr().expect("server addr");
+            (server, addr)
+        });
+
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Recorded>();
+        let accept = target_rt.spawn(async move {
+            let conn = server.accept_interactive().await.expect("accept");
+            let conn = Arc::new(conn);
+            let _target = RuntimeHandle::start(
+                EngineCore::new_target(target_device, phone_id),
+                conn,
+                Arc::new(RecordingInjector { tx: rec_tx }),
+            );
+            // Keep the target engine alive until the test drops the runtime.
+            std::future::pending::<()>().await;
+        });
+
+        phone
+            .connect(server_addr.ip().to_string(), server_addr.port(), target_id_b32)
+            .expect("phone connects");
+        assert!(phone.is_connected());
+
+        // Forward a key; the target must inject it over the real QUIC connection.
+        phone.send_key(0x04, true, 0);
+
+        let got = target_rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), rec_rx.recv()).await
+        });
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Recorded::Key { usage: 0x04, down: true }),
+            "the forwarded key was injected on the target over QUIC",
+        );
+
+        phone.disconnect();
+        accept.abort();
+    }
+}

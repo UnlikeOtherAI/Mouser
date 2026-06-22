@@ -5,5 +5,32 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[lints]
-workspace = true
+# This crate deliberately does NOT set `[lints] workspace = true`: the workspace
+# forbids `unsafe_code`, but uniffi's `setup_scaffolding!()` emits `unsafe extern
+# "C"` scaffolding (like the platform-* adapters' C-API code). We replicate the
+# workspace panic-free clippy denies via an inner `#![deny(...)]` in lib.rs.
+
+[lib]
+# staticlib/cdylib for the iOS/Android native libraries; lib so the uniffi-bindgen
+# binary can link the crate as a library to read its metadata.
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+mouser-core = { path = "../mouser-core" }
+mouser-net = { path = "../mouser-net" }
+mouser-engine = { path = "../mouser-engine" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# `cli` brings in the bindgen library so the `uniffi-bindgen` bin can drive Swift /
+# Kotlin generation; the proc-macro scaffolding (`setup_scaffolding!`) needs no UDL
+# and no build.rs.
+uniffi = { version = "0.31", features = ["cli"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# `cargo run --bin uniffi-bindgen -- generate ...` drives the Swift/Kotlin
+# bindings generation off the built library (see README/bindgen command below).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
