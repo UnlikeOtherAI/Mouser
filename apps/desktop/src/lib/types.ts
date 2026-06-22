@@ -36,6 +36,22 @@ export interface Device {
   monitors: Monitor[];
 }
 
+/**
+ * A peer seen on the LAN over mDNS (`_mouser._udp`), mirroring the backend
+ * `PeerInfo` (src-tauri/src/lib.rs). This is a UI-side discovery shortcut: it
+ * proves a peer is reachable but carries no trust or display layout — that
+ * arrives once the engine owns discovery over `mouser-ipc`.
+ */
+export interface Peer {
+  id: string;
+  name: string;
+  os: OsKind;
+  /** First resolved IP address of the peer. */
+  host: string;
+  /** Interactive-connection UDP port (`iport`). */
+  port: number;
+}
+
 export type SectionId =
   | "general"
   | "devices"

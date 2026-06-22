@@ -2414,6 +2414,7 @@ dependencies = [
 name = "mouser-desktop"
 version = "0.0.0"
 dependencies = [
+ "mouser-net",
  "serde",
  "serde_json",
  "tauri",

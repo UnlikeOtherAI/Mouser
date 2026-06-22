@@ -9,8 +9,10 @@
 //! Layout canvas reflect this computer instead of placeholder data. Remote peers
 //! still require the engine; the UI shows an honest "no peers yet" state.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use mouser_net::{Browser, PeerEvent};
 use serde::Serialize;
 use tauri::{
     menu::MenuBuilder,
@@ -48,6 +50,35 @@ struct LocalDevice {
     name: String,
     os: String,
     monitors: Vec<MonitorInfo>,
+}
+
+/// A peer discovered on the LAN over mDNS (`_mouser._udp`), surfaced to the
+/// Devices list. `host`/`port` are the first resolved address and the
+/// interactive (`iport`) port — enough to show "who is out there", not to dial.
+#[derive(Clone, Serialize)]
+struct PeerInfo {
+    id: String,
+    name: String,
+    os: String,
+    host: String,
+    port: u16,
+}
+
+/// Deduped set of LAN peers, keyed by DNS-SD instance fullname.
+///
+/// NOTE: This is a **UI-side mDNS shortcut**. The architecture's intended path
+/// (docs/architecture.md §8) is for the engine to own discovery and hand peers
+/// to the UI over `mouser-ipc`; the Tauri shell does not talk QUIC. Until that
+/// wiring lands this browse loop makes real peers visible now without claiming
+/// any trust/connection (TXT is advisory only, §4/§5).
+///
+/// The inner map is an `Arc<Mutex<…>>` so the background browse task can hold a
+/// clone with a `'static` lifetime while the `discovered_peers` command reads
+/// the same map through Tauri managed state.
+#[derive(Clone, Default)]
+struct DiscoveredPeers {
+    /// `fullname` (the string `PeerEvent::Removed` carries) -> peer snapshot.
+    by_fullname: Arc<Mutex<HashMap<String, PeerInfo>>>,
 }
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -114,6 +145,57 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
         os: OS_KIND.to_string(),
         monitors: out,
     })
+}
+
+/// Snapshot of the LAN peers discovered so far, for the Devices list.
+///
+/// UI-side mDNS shortcut (see [`DiscoveredPeers`]): real peers become visible
+/// here before the engine owns discovery over `mouser-ipc`.
+#[tauri::command]
+fn discovered_peers(state: tauri::State<'_, DiscoveredPeers>) -> Vec<PeerInfo> {
+    lock_recover(&state.by_fullname)
+        .values()
+        .cloned()
+        .collect()
+}
+
+/// Background mDNS browse loop: drives a [`Browser`] and folds `Found`/`Removed`
+/// events into the shared [`DiscoveredPeers`] set. Runs for the app's lifetime
+/// on the Tauri async runtime; returns (ending the loop) only if the browse
+/// channel closes or the browser fails to start.
+async fn run_discovery(peers: DiscoveredPeers) {
+    let browser = match Browser::browse() {
+        Ok(browser) => browser,
+        // No mDNS daemon (no network / permissions): leave the set empty so the
+        // UI honestly shows "no peers" rather than crashing the shell.
+        Err(_) => return,
+    };
+
+    while let Some(event) = browser.next_event().await {
+        match event {
+            PeerEvent::Found(advert) => {
+                // `addrs` is guaranteed non-empty by `from_service_info` (an
+                // address-less peer is skipped upstream), but stay panic-free.
+                let Some(host) = advert.addrs.first().map(|ip| ip.to_string()) else {
+                    continue;
+                };
+                // Key by the DNS-SD fullname so `Removed` (which carries only the
+                // fullname) can prune the exact entry.
+                let fullname = format!("{}.{}", advert.instance_name(), mouser_net::SERVICE_TYPE);
+                let info = PeerInfo {
+                    id: advert.id,
+                    name: advert.name,
+                    os: advert.os,
+                    host,
+                    port: advert.iport,
+                };
+                lock_recover(&peers.by_fullname).insert(fullname, info);
+            }
+            PeerEvent::Removed(fullname) => {
+                lock_recover(&peers.by_fullname).remove(&fullname);
+            }
+        }
+    }
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -213,9 +295,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(DesktopPreferences::default())
+        .manage(DiscoveredPeers::default())
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
+            // Spawn the LAN mDNS browse loop (UI-side shortcut — see
+            // `DiscoveredPeers`). Clone the managed `Arc` so the task holds a
+            // `'static` handle to the same map the command reads.
+            let peers = app.state::<DiscoveredPeers>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                run_discovery(peers).await;
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -233,6 +323,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             local_device,
+            discovered_peers,
             set_tray_icon_visible
         ])
         .run(tauri::generate_context!())
