@@ -112,6 +112,10 @@ pub enum Command {
     Connect {
         /// Base32 device id of the peer to connect to.
         peer_id: String,
+        /// Optional resolved host/IP supplied by a desktop-side mDNS browser.
+        host: Option<String>,
+        /// Optional interactive UDP port paired with `host`.
+        port: Option<u16>,
     },
     /// Request the engine tear down the current connection.
     Disconnect,

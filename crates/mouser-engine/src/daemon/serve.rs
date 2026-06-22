@@ -16,7 +16,7 @@ use mouser_net::{
 use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::{discovery, EngineCore, RuntimeHandle};
 
-use super::ipc_bridge::IpcBridge;
+use super::ipc_bridge::{ConnectRequest, IpcBridge};
 use super::{hostname, source_layout, windows_firewall_hint, EngineSink};
 
 /// A serve role (`auto`/`source`/`target`): advertise + discover over mDNS, run the
@@ -48,7 +48,7 @@ pub(super) async fn serve(
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "0.0.0.0".to_string());
     let advert = discovery::local_advert(&me, &hostname(), iport);
-    let _advertiser = Advertiser::advertise(&advert, &host_ip).map_err(|e| e.to_string())?;
+    let advertiser = Advertiser::advertise(&advert, &host_ip).map_err(|e| e.to_string())?;
     eprintln!(
         "mouserd: advertising {host_ip}:{iport} as {}",
         advert.instance_name()
@@ -58,20 +58,29 @@ pub(super) async fn serve(
     // Bring up the local IPC link so the desktop UI can see/drive the engine. The
     // bridge owns its own continuous mDNS browse + IPC server; failure to bind it is
     // non-fatal (the daemon still runs headless), so we warn and carry on.
-    let bridge = match IpcBridge::start(store.clone(), my_b32.clone(), hostname()).await {
-        Ok(bridge) => Some(bridge),
-        Err(e) => {
-            eprintln!("mouserd: IPC unavailable ({e}); running headless");
-            None
-        }
-    };
+    let bridge_browser = advertiser.browse().map_err(|e| e.to_string())?;
+    let bridge =
+        match IpcBridge::start(store.clone(), my_b32.clone(), hostname(), bridge_browser).await {
+            Ok(bridge) => Some(bridge),
+            Err(e) => {
+                eprintln!("mouserd: IPC unavailable ({e}); running headless");
+                None
+            }
+        };
 
-    let browser = Browser::browse().map_err(|e| e.to_string())?;
+    let browser = advertiser.browse().map_err(|e| e.to_string())?;
     eprintln!("mouserd: searching for peers on the local network...");
 
     // Wait for the first connection to form (auto-dial, accept, or IPC Connect).
     let Some((conn, can_control)) = next_connection(
-        store, &endpoint, &me, my_id, &my_b32, &browser, role, bridge.as_ref(),
+        store,
+        &endpoint,
+        &me,
+        my_id,
+        &my_b32,
+        &browser,
+        role,
+        bridge.as_ref(),
     )
     .await
     else {
@@ -95,7 +104,16 @@ pub(super) async fn serve(
         }
     );
 
-    run_session(my_id, peer, can_control, conn, injector, capture.as_ref(), bridge.as_ref()).await;
+    run_session(
+        my_id,
+        peer,
+        can_control,
+        conn,
+        injector,
+        capture.as_ref(),
+        bridge.as_ref(),
+    )
+    .await;
     if let Some(bridge) = bridge.as_ref() {
         bridge.set_idle();
     }
@@ -127,8 +145,8 @@ async fn next_connection(
                 return None;
             }
             ipc = wait_for_connect(bridge) => {
-                if let Some(peer_id) = ipc {
-                    match dial_peer_id(store, endpoint, me, browser, peer_id).await {
+                if let Some(request) = ipc {
+                    match dial_connect_request(store, endpoint, me, browser, request).await {
                         Ok(conn) => return Some((conn, true)),
                         Err(e) => {
                             eprintln!("mouserd: IPC connect failed: {e}");
@@ -154,34 +172,42 @@ async fn next_connection(
     }
 }
 
-/// Resolve an IPC `Connect` command into the next peer id, or never resolve when
+/// Resolve an IPC `Connect` command into the next request, or never resolve when
 /// there is no IPC bridge (so the `select!` arm is inert in headless mode).
-async fn wait_for_connect(bridge: Option<&IpcBridge>) -> Option<DeviceId> {
+async fn wait_for_connect(bridge: Option<&IpcBridge>) -> Option<ConnectRequest> {
     match bridge {
         Some(bridge) => bridge.next_connect_request().await,
         None => std::future::pending().await,
     }
 }
 
-/// Dial a specific trusted peer chosen over IPC, resolving its address from the live
-/// discovery registry. Errors if the peer is unknown, not dialable, or untrusted.
-async fn dial_peer_id(
+/// Dial a specific trusted peer chosen over IPC. Prefer the resolved socket address
+/// supplied by the desktop's own mDNS browser; otherwise fall back to this daemon's
+/// browse registry.
+async fn dial_connect_request(
     store: &DaemonStore,
     endpoint: &InteractiveEndpoint,
     me: &DeviceIdentity,
     browser: &Browser,
-    peer_id: DeviceId,
+    request: ConnectRequest,
 ) -> Result<InteractiveConnection, String> {
+    let peer_id = request.peer_id;
     if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
         return Err(format!(
             "peer {} is not trusted on this machine",
             format_device_id(&peer_id)
         ));
     }
-    // The bridge's registry holds resolved addresses; ask it for this peer's addr.
-    let addr = browser_addr_for(browser, &peer_id)
-        .await
-        .ok_or_else(|| format!("peer {} not currently discoverable", format_device_id(&peer_id)))?;
+    let addr = if let Some(addr) = request.addr {
+        addr
+    } else {
+        browser_addr_for(browser, &peer_id).await.ok_or_else(|| {
+            format!(
+                "peer {} not currently discoverable",
+                format_device_id(&peer_id)
+            )
+        })?
+    };
     eprintln!("mouserd: dialing {addr} (IPC connect)");
     endpoint
         .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
@@ -194,7 +220,9 @@ async fn browser_addr_for(browser: &Browser, peer_id: &DeviceId) -> Option<Socke
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
-        let event = tokio::time::timeout(remaining, browser.next_event()).await.ok()??;
+        let event = tokio::time::timeout(remaining, browser.next_event())
+            .await
+            .ok()??;
         if let PeerEvent::Found(peer) = event {
             if discovery::peer_device_id(&peer).as_ref() == Some(peer_id) {
                 if let Some(addr) = discovery::peer_socket_addr(&peer) {

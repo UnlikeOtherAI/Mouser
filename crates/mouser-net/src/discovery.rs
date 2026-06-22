@@ -161,6 +161,15 @@ impl Advertiser {
             .map_err(|e| NetError::Discovery(e.to_string()))?;
         Ok(())
     }
+
+    /// Browse for peers using the same mDNS daemon instance as this advertisement.
+    ///
+    /// On Windows, advertising and browsing through separate `ServiceDaemon`s in the
+    /// same process can miss remote peers. Sharing one daemon keeps the daemon's
+    /// advertise/browse shape on the mDNS crate's happy path.
+    pub fn browse(&self) -> Result<Browser, NetError> {
+        Browser::browse_on(self.daemon.clone(), false)
+    }
 }
 
 impl Drop for Advertiser {
@@ -174,6 +183,7 @@ impl Drop for Advertiser {
 pub struct Browser {
     daemon: ServiceDaemon,
     events: Receiver<ServiceEvent>,
+    shutdown_on_drop: bool,
 }
 
 impl Browser {
@@ -190,10 +200,18 @@ impl Browser {
 
     fn browse_with(loopback: bool) -> Result<Self, NetError> {
         let daemon = new_daemon(loopback)?;
+        Self::browse_on(daemon, true)
+    }
+
+    fn browse_on(daemon: ServiceDaemon, shutdown_on_drop: bool) -> Result<Self, NetError> {
         let events = daemon
             .browse(SERVICE_TYPE)
             .map_err(|e| NetError::Discovery(e.to_string()))?;
-        Ok(Self { daemon, events })
+        Ok(Self {
+            daemon,
+            events,
+            shutdown_on_drop,
+        })
     }
 
     /// Await the next [`PeerEvent`] (C2-6): a resolved, dialable peer
@@ -220,6 +238,8 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        let _ = self.daemon.shutdown();
+        if self.shutdown_on_drop {
+            let _ = self.daemon.shutdown();
+        }
     }
 }

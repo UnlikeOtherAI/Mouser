@@ -3,6 +3,7 @@
 //! UI `Connect`/`Disconnect` commands and to report connection state.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mouser_core::DeviceId;
@@ -44,9 +45,15 @@ pub struct IpcBridge {
     publisher: Publisher,
     // `tokio::sync::Mutex` so the single consumer (the serve loop) can hold the
     // guard across the `recv().await` without breaking `Send`.
-    connect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<DeviceId>>,
+    connect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<ConnectRequest>>,
     disconnect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ConnectRequest {
+    pub peer_id: DeviceId,
+    pub addr: Option<SocketAddr>,
 }
 
 impl IpcBridge {
@@ -55,6 +62,7 @@ impl IpcBridge {
         store: DaemonStore,
         local_id: String,
         local_name: String,
+        browser: Browser,
     ) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             store,
@@ -70,7 +78,10 @@ impl IpcBridge {
         let server = Server::bind(build_snapshot(&shared))
             .await
             .map_err(|e| e.to_string())?;
-        eprintln!("mouserd: IPC listening at {}", server.socket_path().display());
+        eprintln!(
+            "mouserd: IPC listening at {}",
+            server.socket_path().display()
+        );
         let publisher = server.publisher();
 
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
@@ -80,7 +91,7 @@ impl IpcBridge {
         // and browse loop publish through cloned `Publisher`s, so reporting state
         // never contends with command reception.
         let tasks = vec![
-            tokio::spawn(browse_loop(Arc::clone(&shared), publisher.clone())),
+            tokio::spawn(browse_loop(Arc::clone(&shared), publisher.clone(), browser)),
             tokio::spawn(command_loop(server, connect_tx, disconnect_tx)),
         ];
 
@@ -94,7 +105,7 @@ impl IpcBridge {
     }
 
     /// Await the next UI `Connect{peer_id}` request (decoded to a `DeviceId`).
-    pub async fn next_connect_request(&self) -> Option<DeviceId> {
+    pub async fn next_connect_request(&self) -> Option<ConnectRequest> {
         // The receiver is single-consumer; the serve loop is the only caller.
         let mut guard = self.connect_rx.lock().await;
         guard.recv().await
@@ -174,11 +185,7 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
 
 /// Continuous mDNS browse: fold `Found`/`Removed` into the peer registry and
 /// republish a snapshot on every change so connected UIs stay live.
-async fn browse_loop(shared: Arc<Shared>, publisher: Publisher) {
-    let browser = match Browser::browse() {
-        Ok(b) => b,
-        Err(_) => return, // no mDNS daemon: leave peers empty
-    };
+async fn browse_loop(shared: Arc<Shared>, publisher: Publisher, browser: Browser) {
     while let Some(event) = browser.next_event().await {
         let changed = match event {
             PeerEvent::Found(advert) => {
@@ -203,14 +210,19 @@ async fn browse_loop(shared: Arc<Shared>, publisher: Publisher) {
 /// loop. `GetSnapshot` is handled inside the server itself.
 async fn command_loop(
     mut server: Server,
-    connect_tx: mpsc::UnboundedSender<DeviceId>,
+    connect_tx: mpsc::UnboundedSender<ConnectRequest>,
     disconnect_tx: mpsc::UnboundedSender<()>,
 ) {
     loop {
         match server.recv_command().await {
-            Some(Command::Connect { peer_id }) => match discovery::decode_device_id(&peer_id) {
+            Some(Command::Connect {
+                peer_id,
+                host,
+                port,
+            }) => match discovery::decode_device_id(&peer_id) {
                 Some(id) => {
-                    let _ = connect_tx.send(id);
+                    let addr = connect_addr(host, port);
+                    let _ = connect_tx.send(ConnectRequest { peer_id: id, addr });
                 }
                 None => eprintln!("mouserd: IPC Connect with invalid peer id: {peer_id}"),
             },
@@ -222,4 +234,18 @@ async fn command_loop(
             None => return, // server dropped
         }
     }
+}
+
+fn connect_addr(host: Option<String>, port: Option<u16>) -> Option<SocketAddr> {
+    let (Some(host), Some(port)) = (host, port) else {
+        return None;
+    };
+    let ip: IpAddr = match host.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            eprintln!("mouserd: IPC Connect with invalid host {host}: {e}");
+            return None;
+        }
+    };
+    Some(SocketAddr::new(ip, port))
 }

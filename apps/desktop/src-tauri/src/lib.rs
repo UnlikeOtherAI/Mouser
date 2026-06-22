@@ -391,8 +391,27 @@ async fn engine_snapshot(
 
 /// Ask the engine to connect to a discovered, trusted peer by its base32 id.
 #[tauri::command]
-async fn connect_peer(peer_id: String) -> Result<(), String> {
-    send_command(Command::Connect { peer_id }).await
+async fn connect_peer(
+    peer_id: String,
+    peers: tauri::State<'_, DiscoveredPeers>,
+) -> Result<(), String> {
+    let resolved = mdns_peers(&peers)
+        .into_iter()
+        .find(|peer| peer.id == peer_id);
+    let host = resolved
+        .as_ref()
+        .and_then(|peer| peer.addrs.first())
+        .map(ToString::to_string);
+    let port = resolved
+        .as_ref()
+        .map(|peer| peer.iport)
+        .filter(|port| *port != 0);
+    send_command(Command::Connect {
+        peer_id,
+        host,
+        port,
+    })
+    .await
 }
 
 /// Ask the engine to tear down the current connection.
