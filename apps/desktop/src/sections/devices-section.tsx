@@ -179,6 +179,10 @@ function PeerRow({
         ? { label: "Trusted", dot: "bg-sky-400", text: "text-sky-300" }
         : { label: "Not paired", dot: "bg-slate-500", text: "text-muted" };
 
+  // A non-dialable peer (iport 0) is a controller-only device, e.g. a phone: it
+  // can control this machine after pairing, but there is nothing to connect *to*.
+  const dialable = peer.port !== 0;
+
   return (
     <li className="rounded-xl border border-ink-line bg-ink-card px-4 py-3">
       <div className="flex items-center justify-between">
@@ -191,7 +195,8 @@ function PeerRow({
           <div>
             <p className="text-sm font-semibold text-fg">{peer.name}</p>
             <p className="text-xs text-muted">
-              {osLabel(peer.os)} · {peer.host}:{peer.port}
+              {osLabel(peer.os)} · {peer.host}
+              {dialable ? `:${peer.port}` : ""}
             </p>
           </div>
         </div>
@@ -215,14 +220,18 @@ function PeerRow({
               Disconnect
             </button>
           ) : peer.trusted ? (
-            <button
-              type="button"
-              disabled={busy || connecting}
-              onClick={onConnect}
-              className="rounded-lg border border-sky-500/50 px-3 py-1 text-xs font-medium text-sky-200 hover:bg-sky-500/10 disabled:opacity-50"
-            >
-              {connecting ? "Connecting…" : "Connect"}
-            </button>
+            dialable ? (
+              <button
+                type="button"
+                disabled={busy || connecting}
+                onClick={onConnect}
+                className="rounded-lg border border-sky-500/50 px-3 py-1 text-xs font-medium text-sky-200 hover:bg-sky-500/10 disabled:opacity-50"
+              >
+                {connecting ? "Connecting…" : "Connect"}
+              </button>
+            ) : (
+              <span className="text-xs font-medium text-muted">Controller</span>
+            )
           ) : (
             <button
               type="button"

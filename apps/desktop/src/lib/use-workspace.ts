@@ -95,6 +95,10 @@ const FALLBACK: Device[] = [
 function osKindOf(os: string): OsKind {
   if (os === "windows") return "windows";
   if (os === "linux") return "linux";
+  // The iOS companion advertises `os: "phone"` (controller-only; it publishes its
+  // presence for pairing but isn't a dial target). Surface it as a phone so the
+  // device list renders the mobile icon/label rather than defaulting to macOS.
+  if (os === "phone") return "phone";
   return "macos";
 }
 

@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Root companion screen (brief: Mobile Companion App).
 ///
@@ -26,6 +29,7 @@ struct CompanionView: View {
 
     @StateObject private var peers = PeerStore()
     @StateObject private var browser = PeerBrowser()
+    @StateObject private var advertiser = PeerAdvertiser()
     @StateObject private var keyboard = KeyboardObserver()
     @StateObject private var lifecycle = AppLifecycle()
     @StateObject private var clipboard = ClipboardModel()
@@ -47,6 +51,23 @@ struct CompanionView: View {
     /// rather than mere selection.
     private var controllingName: String? {
         mouser.isConnected ? peers.selected?.name : nil
+    }
+
+    /// This device's display name, advertised so the desktop's pairing prompt can
+    /// name the phone (matches `MouserClient.deviceName`, which is sent on connect).
+    private var advertisedName: String {
+        #if canImport(UIKit)
+        return UIDevice.current.name
+        #else
+        return "Mouser companion"
+        #endif
+    }
+
+    /// Begin advertising our presence on the LAN with our persistent base32
+    /// `device_id` (so the desktop can list and pair the phone). Idempotent — safe to
+    /// call on appear and on every return to the foreground.
+    private func startAdvertising() {
+        advertiser.start(id: mouser.deviceId, name: advertisedName)
     }
 
     /// Dial a tapped peer (host/port/device_id resolved by `PeerBrowser`) and remember it
@@ -112,8 +133,15 @@ struct CompanionView: View {
             keyboardFocused = !isLandscape
             // Start Bonjour/mDNS discovery of computers running mouserd on the LAN.
             browser.start()
+            // Publish our own presence so desktops list the phone for pairing. The
+            // phone is controller-only (not a dial target); the advert carries a
+            // non-dialable port so it lists but offers no Connect.
+            startAdvertising()
         }
-        .onDisappear { browser.stop() }
+        .onDisappear {
+            browser.stop()
+            advertiser.stop()
+        }
         // Funnel resolved mDNS peers into the selector store (the single seam where
         // real discovery results land).
         .onChange(of: browser.peers) { _, discovered in
@@ -141,6 +169,9 @@ struct CompanionView: View {
                 // Local Network permission the user has since granted. `start()` is
                 // idempotent when already running.
                 browser.start()
+                // Likewise re-arm advertising: NWListener is suspended in the
+                // background and may have been waiting on the same permission grant.
+                startAdvertising()
             }
         }
         // Clipboard settings hook (UI/view-model only; no networking yet).
