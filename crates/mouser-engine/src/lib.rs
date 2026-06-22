@@ -20,5 +20,11 @@ pub mod daemon_store;
 pub mod discovery;
 pub mod runtime;
 
+// The daemon (the `mouserd` flow: CLI dispatch, mDNS serve roles, direct modes, and the
+// desktop IPC bridge), parameterized over the host's capture/injection adapters. Lives
+// in the library so the binary is a thin per-OS shim; gated to the supported hosts.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub mod daemon;
+
 pub use core::{Action, CaptureDecision, Edge, EdgeLayout, EngineCore, Inject, Role};
 pub use runtime::RuntimeHandle;
