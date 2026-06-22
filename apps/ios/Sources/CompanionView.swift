@@ -31,6 +31,12 @@ struct CompanionView: View {
     @StateObject private var clipboard = ClipboardModel()
     @StateObject private var mouser = MouserClient()
     @State private var showClipboardSettings = false
+    /// One-shot guard so we auto-reconnect to the last device only once per launch.
+    @State private var didAutoReconnect = false
+
+    /// UserDefaults key holding the `device_id` of the last computer we connected to,
+    /// so we can auto-reconnect to it when it reappears on the network.
+    private static let lastDeviceKey = "mouser.lastDevice"
 
     /// Landscape on iPhone collapses the height into `.compact`; that is our
     /// signal to go full-screen-trackpad.
@@ -43,9 +49,24 @@ struct CompanionView: View {
         mouser.isConnected ? peers.selected?.name : nil
     }
 
-    /// Dial a tapped peer (host/port/device_id resolved by `PeerBrowser`).
+    /// Dial a tapped peer (host/port/device_id resolved by `PeerBrowser`) and remember it
+    /// as the last device, so the next launch auto-reconnects to it.
     private func connect(to peer: Peer) {
         mouser.connect(host: peer.host, port: peer.port, peerId: peer.deviceId)
+        UserDefaults.standard.set(peer.deviceId, forKey: Self.lastDeviceKey)
+    }
+
+    /// On launch, reconnect to the device we last controlled as soon as it reappears —
+    /// once per session, and without auto-selecting any other device. Tapping a chip is
+    /// still the way to pick a different one.
+    private func autoReconnect(into discovered: [Peer]) {
+        guard !didAutoReconnect, !mouser.isConnected,
+            let lastId = UserDefaults.standard.string(forKey: Self.lastDeviceKey),
+            let peer = discovered.first(where: { $0.deviceId == lastId })
+        else { return }
+        didAutoReconnect = true
+        peers.select(peer)
+        connect(to: peer)
     }
 
     /// Forward the difference between what we last sent (`lastForwarded`) and the
@@ -97,6 +118,7 @@ struct CompanionView: View {
         // real discovery results land).
         .onChange(of: browser.peers) { _, discovered in
             peers.replace(with: discovered)
+            autoReconnect(into: discovered)
         }
         .onChange(of: isLandscape) { _, nowLandscape in
             keyboardFocused = !nowLandscape

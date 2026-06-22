@@ -25,6 +25,12 @@ pub const TYPE_PONG: u16 = 0x06;
 pub const TYPE_HEARTBEAT: u16 = 0x07;
 /// `[08] Goodbye` envelope type (§7.1).
 pub const TYPE_GOODBYE: u16 = 0x08;
+/// `[F0] DeviceName` — an extension control message whose payload is the dialing
+/// device's display name as UTF-8 (no CBOR envelope). A controller sends it right after
+/// connecting so the target can name the device in its pairing-approval prompt; it is
+/// advisory (trust is still the §3 cert pin), and unknown to the sans-IO core (skipped
+/// as a forward-compat type), so only the accept/pairing path reads it.
+pub const TYPE_DEVICE_NAME: u16 = 0x00F0;
 
 /// `[30] OwnershipTransfer` envelope type (§7.4).
 pub const TYPE_OWNERSHIP_TRANSFER: u16 = 0x30;

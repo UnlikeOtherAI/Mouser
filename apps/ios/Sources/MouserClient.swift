@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// App-facing wrapper around the uniffi `MobileClient` (the Rust source/controller in
 /// `mouser-ffi`). The trackpad emits **relative** deltas, but the engine forwards
@@ -11,7 +14,19 @@ final class MouserClient: ObservableObject {
     @Published private(set) var isConnected = false
     @Published private(set) var status = "Not connected"
 
-    private let inner = MobileClient()
+    private let inner: MobileClient
+
+    init() {
+        // Restore a persisted identity so this device keeps a stable `device_id` (and the
+        // desktop's trust of it) across launches; generate + persist it on first run.
+        if let seed = IdentityStore.load() {
+            inner = MobileClient.fromSeed(seed: seed)
+        } else {
+            let client = MobileClient()
+            IdentityStore.save(client.identitySeed())
+            inner = client
+        }
+    }
 
     /// The engine clamps absolute coordinates to the peer's real display; we move a
     /// virtual cursor across a large span and let the peer clamp.
@@ -22,11 +37,25 @@ final class MouserClient: ObservableObject {
     /// This device's own `device_id` (base32), for display/pairing.
     var deviceId: String { inner.deviceId() }
 
-    /// Dial a peer engine (host/port obtained out-of-band; NWBrowser discovery + a
-    /// connect UI are a follow-up, matching Android). Surfaces failures into `status`.
+    /// This device's display name, sent to the desktop so its pairing prompt can name us.
+    private static var deviceName: String {
+        #if canImport(UIKit)
+        return UIDevice.current.name
+        #else
+        return "Mouser companion"
+        #endif
+    }
+
+    /// Dial a peer engine (host/port/device_id from `PeerBrowser`). Sends our device name
+    /// so the desktop's pairing prompt can identify us. Surfaces failures into `status`.
     func connect(host: String, port: UInt16, peerId: String) {
         do {
-            try inner.connect(host: host, port: port, peerDeviceIdBase32: peerId)
+            try inner.connect(
+                host: host,
+                port: port,
+                peerDeviceIdBase32: peerId,
+                name: Self.deviceName
+            )
             cursorX = MouserClient.span / 2
             cursorY = MouserClient.span / 2
             isConnected = true

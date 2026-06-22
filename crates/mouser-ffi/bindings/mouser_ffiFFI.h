@@ -253,6 +253,11 @@ uint64_t uniffi_mouser_ffi_fn_clone_mobileclient(uint64_t handle, RustCallStatus
 void uniffi_mouser_ffi_fn_free_mobileclient(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_CONSTRUCTOR_MOBILECLIENT_FROM_SEED
+#define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_CONSTRUCTOR_MOBILECLIENT_FROM_SEED
+uint64_t uniffi_mouser_ffi_fn_constructor_mobileclient_from_seed(RustBuffer seed, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_CONSTRUCTOR_MOBILECLIENT_NEW
 #define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_CONSTRUCTOR_MOBILECLIENT_NEW
 uint64_t uniffi_mouser_ffi_fn_constructor_mobileclient_new(RustCallStatus *_Nonnull out_status
@@ -261,7 +266,7 @@ uint64_t uniffi_mouser_ffi_fn_constructor_mobileclient_new(RustCallStatus *_Nonn
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_CONNECT
 #define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_CONNECT
-void uniffi_mouser_ffi_fn_method_mobileclient_connect(uint64_t ptr, RustBuffer host, uint16_t port, RustBuffer peer_device_id_base32, RustCallStatus *_Nonnull out_status
+void uniffi_mouser_ffi_fn_method_mobileclient_connect(uint64_t ptr, RustBuffer host, uint16_t port, RustBuffer peer_device_id_base32, RustBuffer name, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_DEVICE_ID
@@ -272,6 +277,11 @@ RustBuffer uniffi_mouser_ffi_fn_method_mobileclient_device_id(uint64_t ptr, Rust
 #ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_DISCONNECT
 #define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_DISCONNECT
 void uniffi_mouser_ffi_fn_method_mobileclient_disconnect(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_IDENTITY_SEED
+#define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_IDENTITY_SEED
+RustBuffer uniffi_mouser_ffi_fn_method_mobileclient_identity_seed(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_FN_METHOD_MOBILECLIENT_IS_CONNECTED
@@ -577,6 +587,12 @@ uint16_t uniffi_mouser_ffi_checksum_method_mobileclient_disconnect(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_METHOD_MOBILECLIENT_IDENTITY_SEED
+#define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_METHOD_MOBILECLIENT_IDENTITY_SEED
+uint16_t uniffi_mouser_ffi_checksum_method_mobileclient_identity_seed(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_METHOD_MOBILECLIENT_IS_CONNECTED
 #define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_METHOD_MOBILECLIENT_IS_CONNECTED
 uint16_t uniffi_mouser_ffi_checksum_method_mobileclient_is_connected(void
@@ -604,6 +620,12 @@ uint16_t uniffi_mouser_ffi_checksum_method_mobileclient_send_pointer_moved(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_METHOD_MOBILECLIENT_SEND_SCROLL
 #define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_METHOD_MOBILECLIENT_SEND_SCROLL
 uint16_t uniffi_mouser_ffi_checksum_method_mobileclient_send_scroll(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_CONSTRUCTOR_MOBILECLIENT_FROM_SEED
+#define UNIFFI_FFIDEF_UNIFFI_MOUSER_FFI_CHECKSUM_CONSTRUCTOR_MOBILECLIENT_FROM_SEED
+uint16_t uniffi_mouser_ffi_checksum_constructor_mobileclient_from_seed(void
     
 );
 #endif

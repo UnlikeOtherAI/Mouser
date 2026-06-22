@@ -87,8 +87,8 @@ struct EngineSnapshot {
 struct EnginePairing {
     /// Base32 device id of the peer requesting control.
     peer_id: String,
-    /// The 6-digit SAS code, shown identically on both ends for verification.
-    sas: String,
+    /// The peer's announced display name (or a generic fallback).
+    name: String,
 }
 
 /// A peer as the engine reports it (mirrors [`mouser_ipc::PeerDto`]).
@@ -164,7 +164,7 @@ impl EngineSnapshot {
             },
             pairing: snapshot.pairing.map(|p| EnginePairing {
                 peer_id: p.peer_id,
-                sas: p.sas,
+                name: p.name,
             }),
             settings: snapshot.settings,
         }

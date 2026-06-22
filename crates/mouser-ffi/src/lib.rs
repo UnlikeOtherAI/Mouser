@@ -40,6 +40,7 @@ use mouser_core::platform::{
 use mouser_engine::discovery::decode_device_id;
 use mouser_engine::{EdgeLayout, EngineCore, RuntimeHandle};
 use mouser_net::{DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PinPolicy};
+use mouser_protocol::TYPE_DEVICE_NAME;
 
 uniffi::setup_scaffolding!();
 
@@ -234,6 +235,7 @@ impl MobileClient {
         host: String,
         port: u16,
         peer_device_id_base32: String,
+        name: String,
     ) -> Result<(), MobileError> {
         let peer_id = decode_device_id(&peer_device_id_base32).ok_or(MobileError::InvalidPeerId)?;
         let mut guard = lock(&self.session);
@@ -253,12 +255,16 @@ impl MobileClient {
                     .map_err(|e| MobileError::Bind {
                         detail: e.to_string(),
                     })?;
-                endpoint
+                let conn = endpoint
                     .connect_interactive(identity, addr, PinPolicy::Pinned(peer_id))
                     .await
                     .map_err(|e| MobileError::Connect {
                         detail: e.to_string(),
-                    })
+                    })?;
+                // Announce our display name so the target can label us in its pairing prompt.
+                // Advisory only (trust is the §3 cert pin); failure is non-fatal.
+                let _ = conn.send_control(TYPE_DEVICE_NAME, name.as_bytes()).await;
+                Ok(conn)
             })?;
         let connection = Arc::new(connection);
 
@@ -390,7 +396,12 @@ mod tests {
     fn connect_rejects_malformed_peer_id() {
         let client = MobileClient::new();
         let err = client
-            .connect("127.0.0.1".into(), 1, "not-base32 !!!".into())
+            .connect(
+                "127.0.0.1".into(),
+                1,
+                "not-base32 !!!".into(),
+                "Phone".into(),
+            )
             .expect_err("malformed id rejected");
         assert!(matches!(err, MobileError::InvalidPeerId));
         assert!(!client.is_connected());
@@ -490,6 +501,7 @@ mod tests {
                 server_addr.ip().to_string(),
                 server_addr.port(),
                 target_id_b32,
+                "Test Phone".into(),
             )
             .expect("phone connects");
         assert!(phone.is_connected());

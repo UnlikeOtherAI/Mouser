@@ -102,8 +102,8 @@ pub struct Snapshot {
     /// The current peer connection state.
     pub connection: ConnectionDto,
     /// A pending inbound pairing request awaiting the user's approval, if any. Set when
-    /// an untrusted peer dials this machine; the UI shows an Approve/Deny prompt with the
-    /// SAS code, and answers with [`Command::ApprovePairing`]/[`Command::DenyPairing`].
+    /// an untrusted peer dials this machine; the UI shows an Allow/Deny prompt naming the
+    /// device, and answers with [`Command::ApprovePairing`]/[`Command::DenyPairing`].
     #[serde(default)]
     pub pairing: Option<PairingDto>,
     /// Daemon-owned, persisted settings (input/clipboard/security). The UI and the MCP
@@ -113,15 +113,14 @@ pub struct Snapshot {
 }
 
 /// An inbound pairing request from an untrusted peer that dialed this machine: the peer's
-/// base32 device id and the short authentication string (SAS) to confirm out-of-band (it
-/// is shown identically on both devices, so the user verifies they match before allowing
-/// control).
+/// base32 device id and the display name it announced (advisory — trust is still the §3
+/// cert pin keyed on `peer_id`; the name just lets the user recognize the device).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingDto {
     /// Base32 device id of the peer requesting control.
     pub peer_id: String,
-    /// The 6-digit SAS code, shown identically on both ends for verification.
-    pub sas: String,
+    /// The peer's announced display name (e.g. "Ondrej's iPhone"), or a generic fallback.
+    pub name: String,
 }
 
 /// Daemon-owned, persisted settings — the single source of truth that both the

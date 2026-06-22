@@ -56,7 +56,7 @@ export function DevicesSection(): React.JSX.Element {
     <div className="space-y-3">
       {pairing ? (
         <PairingPrompt
-          sas={pairing.sas}
+          name={pairing.name}
           onApprove={() => void approvePairing(pairing.peerId)}
           onDeny={() => void denyPairing(pairing.peerId)}
         />
@@ -256,31 +256,29 @@ function PeerRow({
 }
 
 interface PairingPromptProps {
-  sas: string;
+  name: string;
   onApprove: () => void;
   onDeny: () => void;
 }
 
-/** Approve/deny prompt for an untrusted device asking to control this machine. The SAS
- *  code is shown identically on both ends — the user confirms they match before allowing
- *  control, which both authorizes and authenticates the peer. */
+/** Allow/deny prompt for an untrusted device asking to control this machine. The device's
+ *  announced name is shown so the user can recognize it; allowing trusts it (the §3 cert
+ *  pin authenticates the specific device, the name is just a human label). */
 function PairingPrompt({
-  sas,
+  name,
   onApprove,
   onDeny,
 }: PairingPromptProps): React.JSX.Element {
   return (
     <div className="rounded-xl border border-sky-500/50 bg-sky-500/10 px-4 py-3">
       <p className="text-sm font-semibold text-fg">
-        A device wants to control this computer
+        <span className="text-sky-200">{name}</span> wants to control this
+        computer
       </p>
       <p className="mt-1 text-xs text-muted">
-        Allow it only if this code matches the one shown on that device:
+        Allow only if you recognize this device.
       </p>
-      <p className="my-2 text-center font-mono text-2xl tracking-[0.3em] text-sky-200">
-        {sas}
-      </p>
-      <div className="flex justify-end gap-2">
+      <div className="mt-3 flex justify-end gap-2">
         <button
           type="button"
           onClick={onDeny}

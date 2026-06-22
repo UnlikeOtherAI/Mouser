@@ -55,7 +55,7 @@ interface RawEngineConnection {
 }
 interface RawEnginePairing {
   peer_id: string;
-  sas: string;
+  name: string;
 }
 interface RawEngineSnapshot {
   engine_running: boolean;
@@ -69,7 +69,7 @@ interface RawEngineSnapshot {
 /** A pending inbound pairing request awaiting the user's Approve/Deny. */
 export interface Pairing {
   peerId: string;
-  sas: string;
+  name: string;
 }
 
 // How often we re-poll the engine snapshot over IPC. The daemon pushes snapshots
@@ -277,7 +277,7 @@ export function useWorkspace(): Workspace {
           setConnection(toConnection(raw.connection));
           setPairing(
             raw.pairing
-              ? { peerId: raw.pairing.peer_id, sas: raw.pairing.sas }
+              ? { peerId: raw.pairing.peer_id, name: raw.pairing.name }
               : null,
           );
           if (Date.now() - settingsEditedAt.current > 2500) {

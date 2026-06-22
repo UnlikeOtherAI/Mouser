@@ -19,6 +19,7 @@ crate-type = ["staticlib", "cdylib", "lib"]
 mouser-core = { path = "../mouser-core" }
 mouser-net = { path = "../mouser-net" }
 mouser-engine = { path = "../mouser-engine" }
+mouser-protocol = { path = "../mouser-protocol" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # `cli` brings in the bindgen library so the `uniffi-bindgen` bin can drive Swift /

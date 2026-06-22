@@ -550,6 +550,24 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterData: FfiConverterRustBuffer {
+    typealias SwiftType = Data
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        let len: Int32 = try readInt(&buf)
+        return Data(try readBytes(&buf, count: Int(len)))
+    }
+
+    public static func write(_ value: Data, into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        writeBytes(&buf, value)
+    }
+}
+
 
 
 
@@ -572,7 +590,7 @@ public protocol MobileClientProtocol: AnyObject, Sendable {
      * the peer's leaf cert to hash to the given id. After the connection is up we hand
      * input ownership to the peer (one edge-cross) so subsequent events forward.
      */
-    func connect(host: String, port: UInt16, peerDeviceIdBase32: String) throws 
+    func connect(host: String, port: UInt16, peerDeviceIdBase32: String, name: String) throws 
     
     /**
      * This device's own `device_id` as base32 (what the peer must pin against). The
@@ -585,6 +603,14 @@ public protocol MobileClientProtocol: AnyObject, Sendable {
      * Idempotent — disconnecting when not connected is a no-op.
      */
     func disconnect() 
+    
+    /**
+     * The 32-byte secret seed for this identity. Persist it in the platform keystore
+     * (iOS Keychain / Android Keystore) and restore it via [`MobileClient::from_seed`]
+     * so the `device_id` — and the desktop's trust of this device — survives restarts.
+     * This is private key material; store it securely.
+     */
+    func identitySeed()  -> Data
     
     /**
      * Whether a session is currently active.
@@ -666,6 +692,7 @@ open class MobileClient: MobileClientProtocol, @unchecked Sendable {
     }
     /**
      * Create a disconnected client with a fresh identity and a multi-thread runtime.
+     * Prefer [`MobileClient::from_seed`] so the `device_id` is stable across launches.
      */
 public convenience init() {
     let handle =
@@ -686,6 +713,22 @@ public convenience init() {
     }
 
     
+    /**
+     * Create a client from a persisted 32-byte secret seed (see [`identity_seed`]), so
+     * the device keeps a **stable** `device_id` across launches — required for the
+     * desktop's trust/pairing to survive an app restart. A wrong-length seed falls back
+     * to a fresh identity (the caller should then persist the new [`identity_seed`]).
+     *
+     * [`identity_seed`]: MobileClient::identity_seed
+     */
+public static func fromSeed(seed: Data) -> MobileClient  {
+    return try!  FfiConverterTypeMobileClient_lift(try! rustCall() {
+    uniffi_mouser_ffi_fn_constructor_mobileclient_from_seed(
+        FfiConverterData.lower(seed),$0
+    )
+})
+}
+    
 
     
     /**
@@ -697,12 +740,13 @@ public convenience init() {
      * the peer's leaf cert to hash to the given id. After the connection is up we hand
      * input ownership to the peer (one edge-cross) so subsequent events forward.
      */
-open func connect(host: String, port: UInt16, peerDeviceIdBase32: String)throws   {try rustCallWithError(FfiConverterTypeMobileError_lift) {
+open func connect(host: String, port: UInt16, peerDeviceIdBase32: String, name: String)throws   {try rustCallWithError(FfiConverterTypeMobileError_lift) {
     uniffi_mouser_ffi_fn_method_mobileclient_connect(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(host),
         FfiConverterUInt16.lower(port),
-        FfiConverterString.lower(peerDeviceIdBase32),$0
+        FfiConverterString.lower(peerDeviceIdBase32),
+        FfiConverterString.lower(name),$0
     )
 }
 }
@@ -728,6 +772,20 @@ open func disconnect()  {try! rustCall() {
             self.uniffiCloneHandle(),$0
     )
 }
+}
+    
+    /**
+     * The 32-byte secret seed for this identity. Persist it in the platform keystore
+     * (iOS Keychain / Android Keystore) and restore it via [`MobileClient::from_seed`]
+     * so the `device_id` — and the desktop's trust of this device — survives restarts.
+     * This is private key material; store it securely.
+     */
+open func identitySeed() -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_mouser_ffi_fn_method_mobileclient_identity_seed(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
     /**
@@ -979,13 +1037,16 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_mouser_ffi_checksum_method_mobileclient_connect() != 52991) {
+    if (uniffi_mouser_ffi_checksum_method_mobileclient_connect() != 49157) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mouser_ffi_checksum_method_mobileclient_device_id() != 18976) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mouser_ffi_checksum_method_mobileclient_disconnect() != 61973) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mouser_ffi_checksum_method_mobileclient_identity_seed() != 33331) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mouser_ffi_checksum_method_mobileclient_is_connected() != 44059) {
@@ -1003,7 +1064,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mouser_ffi_checksum_method_mobileclient_send_scroll() != 27360) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mouser_ffi_checksum_constructor_mobileclient_new() != 62635) {
+    if (uniffi_mouser_ffi_checksum_constructor_mobileclient_from_seed() != 31351) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mouser_ffi_checksum_constructor_mobileclient_new() != 27471) {
         return InitializationResult.apiChecksumMismatch
     }
 

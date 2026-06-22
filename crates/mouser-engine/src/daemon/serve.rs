@@ -11,6 +11,7 @@ use mouser_core::DeviceId;
 use mouser_net::{
     DeviceIdentity, Discovery, InteractiveConnection, InteractiveEndpoint, PinPolicy,
 };
+use mouser_protocol::TYPE_DEVICE_NAME;
 
 use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::discovery::PeerRegistry;
@@ -169,7 +170,7 @@ async fn next_connection(
                     }
                 }
             }
-            accepted = accept_trusted(endpoint, store, bridge) => {
+            accepted = accept_trusted(endpoint, store, registry, bridge) => {
                 match accepted {
                     Ok(conn) => return Some((conn, false)),
                     Err(e) => { eprintln!("mouserd: accept error: {e}"); continue; }
@@ -377,6 +378,7 @@ async fn dial_discovered(
 async fn accept_trusted(
     endpoint: &InteractiveEndpoint,
     store: &DaemonStore,
+    registry: &PeerRegistry,
     bridge: Option<&IpcBridge>,
 ) -> Result<InteractiveConnection, String> {
     loop {
@@ -394,7 +396,7 @@ async fn accept_trusted(
         }
 
         match bridge {
-            Some(bridge) if pair_via_ui(store, bridge, &conn, &peer_id).await? => {
+            Some(bridge) if pair_via_ui(store, registry, bridge, &conn, &peer_id).await? => {
                 return Ok(conn);
             }
             Some(_) => {} // denied or timed out
@@ -423,19 +425,30 @@ impl Drop for PairingGuard<'_> {
     }
 }
 
-/// Drive an inbound pairing approval through the UI: publish the request (peer id + SAS),
-/// wait up to [`PAIRING_TIMEOUT`] for an Approve/Deny matching this peer, and on approval
-/// persist trust. Returns whether the connection was approved.
+/// Drive an inbound pairing approval through the UI: publish the request naming the
+/// device, wait up to [`PAIRING_TIMEOUT`] for an Approve/Deny matching this peer, and on
+/// approval persist trust. Returns whether the connection was approved.
 async fn pair_via_ui(
     store: &DaemonStore,
+    registry: &PeerRegistry,
     bridge: &IpcBridge,
     conn: &InteractiveConnection,
     peer_id: &DeviceId,
 ) -> Result<bool, String> {
     let peer_b32 = format_device_id(peer_id);
-    let sas = conn.sas().map_err(|e| e.to_string())?;
-    eprintln!("mouserd: pairing request from {peer_b32}; confirm code {sas}");
-    bridge.request_pairing(peer_b32.clone(), sas);
+    // Name the device for the prompt: the name it announced on connect (phones), else its
+    // advertised name from our discovery registry (desktops), else a generic label.
+    let name = recv_device_name(conn)
+        .await
+        .or_else(|| {
+            registry
+                .find(peer_id)
+                .map(|p| p.name)
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or_else(|| "A device".to_string());
+    eprintln!("mouserd: pairing request from {name} ({peer_b32})");
+    bridge.request_pairing(peer_b32.clone(), name);
     let _guard = PairingGuard(bridge);
 
     let approved = loop {
@@ -452,4 +465,24 @@ async fn pair_via_ui(
         eprintln!("mouserd: pairing with {peer_b32} not approved");
     }
     Ok(approved)
+}
+
+/// Briefly wait for the dialing device's announced display name (a `TYPE_DEVICE_NAME`
+/// control message a controller sends right after connecting). Safe to read here because
+/// the engine runtime — the other reader of control messages — has not started yet on the
+/// accept path. Returns `None` on timeout or if the connection closes first.
+async fn recv_device_name(conn: &InteractiveConnection) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let (ty, payload) = tokio::time::timeout(remaining, conn.recv_control())
+            .await
+            .ok()?
+            .ok()?;
+        if ty == TYPE_DEVICE_NAME {
+            let name = String::from_utf8_lossy(&payload).trim().to_string();
+            return (!name.is_empty()).then_some(name);
+        }
+        // Ignore any other early control message and keep waiting for the name.
+    }
 }

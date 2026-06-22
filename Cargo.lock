@@ -2595,6 +2595,7 @@ dependencies = [
  "mouser-core",
  "mouser-engine",
  "mouser-net",
+ "mouser-protocol",
  "thiserror 2.0.18",
  "tokio",
  "uniffi",
