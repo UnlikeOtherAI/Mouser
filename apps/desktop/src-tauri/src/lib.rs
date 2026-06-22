@@ -222,10 +222,18 @@ async fn engine_snapshot() -> Result<EngineSnapshot, String> {
     })
 }
 
-/// Ask the engine to connect to a discovered, trusted peer by its base32 id.
+/// Ask the engine to connect to a discovered, trusted peer by its base32 id. The engine
+/// resolves the address from its own discovery registry, so the desktop supplies no
+/// host/port (the optional fields exist for a desktop-side resolver, which this app does
+/// not run — the engine owns discovery).
 #[tauri::command]
 async fn connect_peer(peer_id: String) -> Result<(), String> {
-    send_command(Command::Connect { peer_id }).await
+    send_command(Command::Connect {
+        peer_id,
+        host: None,
+        port: None,
+    })
+    .await
 }
 
 /// Ask the engine to tear down the current connection.

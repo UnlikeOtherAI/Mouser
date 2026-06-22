@@ -44,15 +44,11 @@ But major product features are still not end-to-end:
 
 ## Current Windows Machine State
 
-At the time this audit was written, this machine was running:
-
-- `mouser-desktop.exe` from `target/release`
-- `mouserd.exe` from `target/release` in explicit `target` mode
-
-`target` mode advertises this machine and accepts incoming control without
-starting local capture/browse. That is currently the safer Windows mode. Active
-`auto`/`source` modes should not be left running until the keyboard-sluggishness
-path is isolated.
+At the time this audit was written, this machine was temporarily running
+`mouserd.exe` in explicit `target` mode while the Windows keyboard/touchpad
+sluggishness path was isolated. The Windows capture hot path has since been
+moved off the low-level hook callback, but the desktop-launched Windows mode is
+still receive-first `target` so capture only starts after an explicit connect.
 
 ## Functionality Matrix
 
@@ -96,7 +92,7 @@ Implemented:
 
 - `mouserd` supports `auto`, `source`, `target`, `connect <host:port>`, and
   `probe <host:port>`.
-- Windows default is passive `target`; macOS/Linux default is `auto`.
+- Windows defaults to receive-first `target`; macOS/Linux default to `auto`.
 - mDNS advertise/browse is wired for non-direct modes.
 - Auto mode uses lower `device_id` to avoid double dialing.
 
@@ -167,15 +163,16 @@ Implemented:
 - Engine can forward local cursor/button/key/scroll events.
 - Engine gates incoming injection by owner epoch and anti-replay counters.
 - macOS, Windows, and Linux platform adapters implement capture/injection.
-- Windows capture hot path now bypasses non-cursor input while local until
-  suppression/remote ownership begins.
+- Windows capture hooks now return from the low-level callback using cached
+  suppression state; engine dispatch runs on a worker and cursor bursts are
+  coalesced.
 
 Partial or missing:
 
 - "Any-to-any" is source-capable single-peer, not arbitrary multi-machine
   control.
-- Windows defaults to target mode because active discovery/control previously
-  caused keyboard sluggishness.
+- Windows explicit connect can still dial/control, but automatic startup remains
+  receive-first to avoid surprise capture on Bluetooth keyboard/touchpad setups.
 - Local hardware reclaim is incomplete.
 - Panic hotkey is not implemented.
 - Runtime does not query `can_suppress()` or downgrade if suppression is missing.
@@ -451,4 +448,3 @@ Is the desktop tray/taskbar behavior working?
 
 - Yes for the tray shell and the tray-icon/taskbar visibility toggle. Other
   settings are mostly local-only.
-

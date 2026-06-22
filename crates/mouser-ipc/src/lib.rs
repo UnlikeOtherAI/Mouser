@@ -77,6 +77,8 @@ mod loopback_tests {
         client
             .send_command(&Command::Connect {
                 peer_id: want_peer.clone(),
+                host: Some("192.168.1.50".to_string()),
+                port: Some(49970),
             })
             .await
             .expect("send connect");
@@ -84,7 +86,14 @@ mod loopback_tests {
             .await
             .expect("command did not arrive in time")
             .expect("server still receiving");
-        assert_eq!(command, Command::Connect { peer_id: want_peer });
+        assert_eq!(
+            command,
+            Command::Connect {
+                peer_id: want_peer,
+                host: Some("192.168.1.50".to_string()),
+                port: Some(49970),
+            }
+        );
     }
 
     /// A snapshot the daemon publishes after connect is pushed to the live client.
@@ -117,6 +126,36 @@ mod loopback_tests {
             .expect("updated snapshot did not arrive")
             .expect("updated decode");
         assert_eq!(received.connection.state, ConnectionStateDto::Connected);
+        assert_eq!(received, updated);
+    }
+
+    /// A peer can be discovered before the desktop UI connects. The server must retain
+    /// that latest snapshot so short-lived polling clients do not see the empty boot
+    /// snapshot forever.
+    #[tokio::test]
+    async fn published_snapshot_without_clients_is_seen_by_later_client() {
+        let socket = temp_socket_path("late-client");
+        let server = Server::bind_at(&socket, sample_snapshot())
+            .await
+            .expect("bind server");
+
+        let mut updated = sample_snapshot();
+        updated.peers.push(PeerDto {
+            id: "latepeer".to_string(),
+            name: "Late peer".to_string(),
+            os: "macos".to_string(),
+            host: "192.168.1.229".to_string(),
+            port: 53004,
+            trusted: false,
+        });
+        server.publish(updated.clone());
+
+        let mut client = Client::connect_at(&socket).await.expect("connect client");
+        let received = tokio::time::timeout(Duration::from_secs(2), client.next_snapshot())
+            .await
+            .expect("snapshot did not arrive")
+            .expect("snapshot decode");
+
         assert_eq!(received, updated);
     }
 }

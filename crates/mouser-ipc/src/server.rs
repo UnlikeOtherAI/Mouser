@@ -40,7 +40,7 @@ impl Publisher {
     /// Publish a new snapshot to every connected client (and to the value new clients
     /// see on connect). Cheap; a no-op effect when nothing changed.
     pub fn publish(&self, snapshot: Snapshot) {
-        let _ = self.snapshot_tx.send(snapshot);
+        self.snapshot_tx.send_replace(snapshot);
     }
 }
 
@@ -97,9 +97,7 @@ impl Server {
     /// Publish a new snapshot. Every connected client receives it; the value is also
     /// the one new clients see on connect. Cheap when unchanged (no clients = no-op).
     pub fn publish(&self, snapshot: Snapshot) {
-        // `send` only errs when there are no receivers; the sender always keeps one
-        // alive via `subscribe`, so this never drops the stored value.
-        let _ = self.snapshot_tx.send(snapshot);
+        self.snapshot_tx.send_replace(snapshot);
     }
 
     /// A cloneable [`Publisher`] for pushing snapshots without holding the `Server`.

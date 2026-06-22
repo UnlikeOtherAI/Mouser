@@ -16,7 +16,7 @@ use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::discovery::PeerRegistry;
 use crate::{discovery, EngineCore, RuntimeHandle};
 
-use super::ipc_bridge::IpcBridge;
+use super::ipc_bridge::{ConnectRequest, IpcBridge};
 use super::{hostname, source_layout, windows_firewall_hint, EngineSink};
 
 /// A serve role (`auto`/`source`/`target`): advertise + discover over mDNS, run the
@@ -139,8 +139,8 @@ async fn next_connection(
                 return None;
             }
             ipc = wait_for_connect(bridge) => {
-                if let Some(peer_id) = ipc {
-                    match dial_peer_id(store, endpoint, me, registry, peer_id).await {
+                if let Some(request) = ipc {
+                    match dial_connect_request(store, endpoint, me, registry, request).await {
                         Ok(conn) => return Some((conn, true)),
                         Err(e) => {
                             eprintln!("mouserd: IPC connect failed: {e}");
@@ -166,34 +166,38 @@ async fn next_connection(
     }
 }
 
-/// Resolve an IPC `Connect` command into the next peer id, or never resolve when
+/// Resolve an IPC `Connect` command into the next request, or never resolve when
 /// there is no IPC bridge (so the `select!` arm is inert in headless mode).
-async fn wait_for_connect(bridge: Option<&IpcBridge>) -> Option<DeviceId> {
+async fn wait_for_connect(bridge: Option<&IpcBridge>) -> Option<ConnectRequest> {
     match bridge {
         Some(bridge) => bridge.next_connect_request().await,
         None => std::future::pending().await,
     }
 }
 
-/// Dial a specific trusted peer chosen over IPC, resolving its address from the live
-/// discovery registry. Errors if the peer is unknown, not dialable, or untrusted.
-async fn dial_peer_id(
+/// Dial a specific trusted peer chosen over IPC. Prefer the address the desktop already
+/// resolved over its own browse (if supplied); otherwise resolve it from this daemon's
+/// live discovery registry. Errors if the peer is untrusted or not discoverable.
+async fn dial_connect_request(
     store: &DaemonStore,
     endpoint: &InteractiveEndpoint,
     me: &DeviceIdentity,
     registry: &PeerRegistry,
-    peer_id: DeviceId,
+    request: ConnectRequest,
 ) -> Result<InteractiveConnection, String> {
+    let peer_id = request.peer_id;
     if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
         return Err(format!(
             "peer {} is not trusted on this machine",
             format_device_id(&peer_id)
         ));
     }
-    // The shared registry holds resolved addresses; wait briefly for this peer's addr.
-    let addr = registry_addr_for(registry, &peer_id)
-        .await
-        .ok_or_else(|| format!("peer {} not currently discoverable", format_device_id(&peer_id)))?;
+    let addr = match request.addr {
+        Some(addr) => addr,
+        None => registry_addr_for(registry, &peer_id).await.ok_or_else(|| {
+            format!("peer {} not currently discoverable", format_device_id(&peer_id))
+        })?,
+    };
     eprintln!("mouserd: dialing {addr} (IPC connect)");
     endpoint
         .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))

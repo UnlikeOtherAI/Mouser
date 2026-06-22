@@ -4,9 +4,12 @@
 //! in the engine; the UI reads its state over `mouser_ipc`.
 
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use tauri::Manager;
 
@@ -14,6 +17,13 @@ use crate::lock_recover;
 
 /// How often the supervisor checks the engine is reachable (and relaunches it if not).
 const SUPERVISE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Windows process-creation flags: run the engine with no console window and detached
+/// from the app's console, so the bundled `mouserd` never flashes a terminal.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// Handle to the `mouserd` engine the app launches and supervises (spawn on launch,
 /// relaunch on crash, stop on quit). `None` when an engine was already running and we
@@ -93,6 +103,13 @@ fn respawn_if_needed(app: &tauri::AppHandle) {
     for arg in mouserd_launch_args() {
         command.arg(arg);
     }
+    // The engine is a headless daemon; detach its stdio and (on Windows) suppress the
+    // console window so it never flashes a terminal when (re)launched.
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     match command.spawn() {
         Ok(child) => {
             *lock_recover(&state.child) = Some(child);

@@ -3,6 +3,7 @@
 //! registry change, plus the channels the serve loop uses to learn about UI
 //! `Connect`/`Disconnect` commands and to report connection state.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mouser_core::DeviceId;
@@ -22,6 +23,14 @@ const OS_KIND: &str = if cfg!(target_os = "macos") {
 } else {
     "linux"
 };
+
+/// A UI `Connect` request forwarded to the serve loop: the trusted peer to dial, plus an
+/// optional address the desktop already resolved over its own browse (when present the
+/// engine dials it directly; otherwise the engine resolves the id from its registry).
+pub(super) struct ConnectRequest {
+    pub peer_id: DeviceId,
+    pub addr: Option<SocketAddr>,
+}
 
 /// Shared, mutable engine state the snapshot is built from.
 struct Shared {
@@ -43,7 +52,7 @@ pub struct IpcBridge {
     publisher: Publisher,
     // `tokio::sync::Mutex` so the single consumer (the serve loop) can hold the
     // guard across the `recv().await` without breaking `Send`.
-    connect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<DeviceId>>,
+    connect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<ConnectRequest>>,
     disconnect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -93,8 +102,8 @@ impl IpcBridge {
         })
     }
 
-    /// Await the next UI `Connect{peer_id}` request (decoded to a `DeviceId`).
-    pub async fn next_connect_request(&self) -> Option<DeviceId> {
+    /// Await the next UI `Connect` request (decoded peer id + optional resolved addr).
+    pub async fn next_connect_request(&self) -> Option<ConnectRequest> {
         // The receiver is single-consumer; the serve loop is the only caller.
         let mut guard = self.connect_rx.lock().await;
         guard.recv().await
@@ -193,14 +202,19 @@ async fn republish_loop(shared: Arc<Shared>, publisher: Publisher) {
 /// loop. `GetSnapshot` is handled inside the server itself.
 async fn command_loop(
     mut server: Server,
-    connect_tx: mpsc::UnboundedSender<DeviceId>,
+    connect_tx: mpsc::UnboundedSender<ConnectRequest>,
     disconnect_tx: mpsc::UnboundedSender<()>,
 ) {
     loop {
         match server.recv_command().await {
-            Some(Command::Connect { peer_id }) => match discovery::decode_device_id(&peer_id) {
+            Some(Command::Connect {
+                peer_id,
+                host,
+                port,
+            }) => match discovery::decode_device_id(&peer_id) {
                 Some(id) => {
-                    let _ = connect_tx.send(id);
+                    let addr = connect_addr(host, port);
+                    let _ = connect_tx.send(ConnectRequest { peer_id: id, addr });
                 }
                 None => eprintln!("mouserd: IPC Connect with invalid peer id: {peer_id}"),
             },
@@ -212,4 +226,21 @@ async fn command_loop(
             None => return, // server dropped
         }
     }
+}
+
+/// Pair an optional desktop-supplied host + port into a dialable [`SocketAddr`]. Returns
+/// `None` (engine resolves the id from its own registry) unless both are present and the
+/// host parses as an IP.
+fn connect_addr(host: Option<String>, port: Option<u16>) -> Option<SocketAddr> {
+    let (Some(host), Some(port)) = (host, port) else {
+        return None;
+    };
+    let ip: IpAddr = match host.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            eprintln!("mouserd: IPC Connect with invalid host {host}: {e}");
+            return None;
+        }
+    };
+    Some(SocketAddr::new(ip, port))
 }
