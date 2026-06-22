@@ -38,7 +38,7 @@ pub mod tls;
 pub mod transport;
 
 pub use bulk::{BulkConnection, BulkEndpoint, TransferStream};
-pub use discovery::{Advertiser, Browser, PeerAdvert, PeerEvent, SERVICE_TYPE};
+pub use discovery::{Advertiser, Browser, Discovery, PeerAdvert, PeerEvent, SERVICE_TYPE};
 pub use identity::{
     build_tls_certificate, device_id_from_cert, verifying_key_from_cert, TlsCertificate,
 };

@@ -7,11 +7,14 @@
 //! own advertisement. Discovery is advisory: trust still comes from the §3 cert pin
 //! (and, in the future, §5 SAS pairing) — never from the TXT record.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use data_encoding::BASE32_NOPAD;
 use mouser_core::{DeviceId, DeviceIdentity};
-use mouser_net::PeerAdvert;
+use mouser_net::{Browser, PeerAdvert, PeerEvent};
+use tokio::sync::watch;
 
 /// OS string advertised in the §4 TXT record.
 const OS_NAME: &str = if cfg!(target_os = "macos") {
@@ -71,6 +74,96 @@ pub fn local_ipv4() -> Option<IpAddr> {
     // TEST-NET-3 (RFC 5737) discard port: selects the default route, transmits nothing.
     sock.connect("203.0.113.1:9").ok()?;
     sock.local_addr().ok().map(|addr| addr.ip())
+}
+
+/// A live registry of mDNS-discovered peers, fed by a single browse and read by every
+/// consumer (the auto/IPC dialer and the IPC snapshot). One registry per host keeps all
+/// discovery on a single [`mouser_net::Discovery`] daemon — multiple browsing daemons on
+/// one host race for inbound multicast and silently drop peers (macOS).
+#[derive(Clone)]
+pub struct PeerRegistry {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    /// Discovered peers keyed by DNS-SD instance fullname.
+    peers: Mutex<HashMap<String, PeerAdvert>>,
+    /// Bumped on every change so consumers can await updates without polling.
+    version: watch::Sender<u64>,
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PeerRegistry {
+    /// An empty registry.
+    pub fn new() -> Self {
+        let (version, _rx) = watch::channel(0);
+        Self {
+            inner: Arc::new(Inner {
+                peers: Mutex::new(HashMap::new()),
+                version,
+            }),
+        }
+    }
+
+    fn peers_guard(&self) -> MutexGuard<'_, HashMap<String, PeerAdvert>> {
+        self.inner
+            .peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A snapshot of the currently discovered peers.
+    pub fn peers(&self) -> Vec<PeerAdvert> {
+        self.peers_guard().values().cloned().collect()
+    }
+
+    /// The discovered advert for `peer_id`, if it is currently visible.
+    pub fn find(&self, peer_id: &DeviceId) -> Option<PeerAdvert> {
+        self.peers_guard()
+            .values()
+            .find(|advert| peer_device_id(advert).as_ref() == Some(peer_id))
+            .cloned()
+    }
+
+    /// A receiver that resolves on every registry change, for change-driven loops that
+    /// re-scan [`PeerRegistry::peers`]/[`PeerRegistry::find`] without busy-polling.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.version.subscribe()
+    }
+
+    /// Fold one browse event into the registry; returns whether the peer set changed.
+    fn apply(&self, event: PeerEvent) -> bool {
+        let changed = match event {
+            PeerEvent::Found(advert) => {
+                let key = format!("{}.{}", advert.instance_name(), mouser_net::SERVICE_TYPE);
+                let mut guard = self.peers_guard();
+                // A re-announce with new address/port counts as a change so dialers and
+                // snapshots stay current; an identical re-announce does not.
+                let changed = guard.get(&key) != Some(&advert);
+                guard.insert(key, advert);
+                changed
+            }
+            PeerEvent::Removed(fullname) => self.peers_guard().remove(&fullname).is_some(),
+        };
+        if changed {
+            self.inner.version.send_modify(|v| *v = v.wrapping_add(1));
+        }
+        changed
+    }
+}
+
+/// Drive `browser` into `registry` forever — the single consumer of the browse stream
+/// (mdns-sd allows one querier per service type). Returns when the browse channel
+/// closes (the owning [`mouser_net::Discovery`] was dropped).
+pub async fn run_registry(browser: Browser, registry: PeerRegistry) {
+    while let Some(event) = browser.next_event().await {
+        registry.apply(event);
+    }
 }
 
 #[cfg(test)]

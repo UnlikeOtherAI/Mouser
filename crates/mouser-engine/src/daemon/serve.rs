@@ -9,11 +9,11 @@ use std::sync::Arc;
 use mouser_core::platform::{InputCapture, InputInjection, InputSink};
 use mouser_core::DeviceId;
 use mouser_net::{
-    Advertiser, Browser, DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PeerEvent,
-    PinPolicy,
+    DeviceIdentity, Discovery, InteractiveConnection, InteractiveEndpoint, PinPolicy,
 };
 
 use crate::daemon_store::{format_device_id, DaemonStore};
+use crate::discovery::PeerRegistry;
 use crate::{discovery, EngineCore, RuntimeHandle};
 
 use super::ipc_bridge::IpcBridge;
@@ -43,22 +43,33 @@ pub(super) async fn serve(
         .map_err(|e| e.to_string())?;
     let iport = endpoint.local_addr().map_err(|e| e.to_string())?.port();
 
-    // Advertise this device over mDNS (§4) so the peer can find us.
+    // One shared mDNS endpoint advertises this host (§4) and feeds a single browse into
+    // one peer registry that both the dialer and the IPC snapshot read. A host must use
+    // ONE mDNS daemon: several browsing daemons race for inbound multicast and silently
+    // drop peers on macOS. Kept alive for the whole serve() (drop ends advertise+browse).
     let host_ip = discovery::local_ipv4()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "0.0.0.0".to_string());
     let advert = discovery::local_advert(&me, &hostname(), iport);
-    let _advertiser = Advertiser::advertise(&advert, &host_ip).map_err(|e| e.to_string())?;
+    let mdns = Discovery::new().map_err(|e| e.to_string())?;
+    mdns.advertise(&advert, &host_ip).map_err(|e| e.to_string())?;
     eprintln!(
         "mouserd: advertising {host_ip}:{iport} as {}",
         advert.instance_name()
     );
     windows_firewall_hint(iport);
 
-    // Bring up the local IPC link so the desktop UI can see/drive the engine. The
-    // bridge owns its own continuous mDNS browse + IPC server; failure to bind it is
-    // non-fatal (the daemon still runs headless), so we warn and carry on.
-    let bridge = match IpcBridge::start(store.clone(), my_b32.clone(), hostname()).await {
+    let registry = PeerRegistry::new();
+    let browser = mdns.browse().map_err(|e| e.to_string())?;
+    tokio::spawn(discovery::run_registry(browser, registry.clone()));
+    eprintln!("mouserd: searching for peers on the local network...");
+
+    // Bring up the local IPC link so the desktop UI can see/drive the engine. The bridge
+    // reads the shared registry for its snapshots; failure to bind it is non-fatal (the
+    // daemon still runs headless), so we warn and carry on.
+    let bridge = match IpcBridge::start(store.clone(), my_b32.clone(), hostname(), registry.clone())
+        .await
+    {
         Ok(bridge) => Some(bridge),
         Err(e) => {
             eprintln!("mouserd: IPC unavailable ({e}); running headless");
@@ -66,12 +77,9 @@ pub(super) async fn serve(
         }
     };
 
-    let browser = Browser::browse().map_err(|e| e.to_string())?;
-    eprintln!("mouserd: searching for peers on the local network...");
-
     // Wait for the first connection to form (auto-dial, accept, or IPC Connect).
     let Some((conn, can_control)) = next_connection(
-        store, &endpoint, &me, my_id, &my_b32, &browser, role, bridge.as_ref(),
+        store, &endpoint, &me, my_id, &my_b32, &registry, role, bridge.as_ref(),
     )
     .await
     else {
@@ -114,7 +122,7 @@ async fn next_connection(
     me: &DeviceIdentity,
     my_id: DeviceId,
     my_b32: &str,
-    browser: &Browser,
+    registry: &PeerRegistry,
     role: &str,
     bridge: Option<&IpcBridge>,
 ) -> Option<(InteractiveConnection, bool)> {
@@ -128,7 +136,7 @@ async fn next_connection(
             }
             ipc = wait_for_connect(bridge) => {
                 if let Some(peer_id) = ipc {
-                    match dial_peer_id(store, endpoint, me, browser, peer_id).await {
+                    match dial_peer_id(store, endpoint, me, registry, peer_id).await {
                         Ok(conn) => return Some((conn, true)),
                         Err(e) => {
                             eprintln!("mouserd: IPC connect failed: {e}");
@@ -144,7 +152,7 @@ async fn next_connection(
                     Err(e) => { eprintln!("mouserd: accept error: {e}"); continue; }
                 }
             }
-            dialed = dial_discovered(store, endpoint, me, my_id, my_b32, browser, role == "source"), if can_dial => {
+            dialed = dial_discovered(store, endpoint, me, my_id, my_b32, registry, role == "source"), if can_dial => {
                 match dialed {
                     Ok(conn) => return Some((conn, true)),
                     Err(e) => { eprintln!("mouserd: dial error: {e}"); continue; }
@@ -169,7 +177,7 @@ async fn dial_peer_id(
     store: &DaemonStore,
     endpoint: &InteractiveEndpoint,
     me: &DeviceIdentity,
-    browser: &Browser,
+    registry: &PeerRegistry,
     peer_id: DeviceId,
 ) -> Result<InteractiveConnection, String> {
     if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
@@ -178,8 +186,8 @@ async fn dial_peer_id(
             format_device_id(&peer_id)
         ));
     }
-    // The bridge's registry holds resolved addresses; ask it for this peer's addr.
-    let addr = browser_addr_for(browser, &peer_id)
+    // The shared registry holds resolved addresses; wait briefly for this peer's addr.
+    let addr = registry_addr_for(registry, &peer_id)
         .await
         .ok_or_else(|| format!("peer {} not currently discoverable", format_device_id(&peer_id)))?;
     eprintln!("mouserd: dialing {addr} (IPC connect)");
@@ -189,18 +197,21 @@ async fn dial_peer_id(
         .map_err(|e| e.to_string())
 }
 
-/// Browse briefly for `peer_id`'s current socket address (used by an IPC dial).
-async fn browser_addr_for(browser: &Browser, peer_id: &DeviceId) -> Option<SocketAddr> {
+/// Wait up to 5s for `peer_id`'s current socket address to appear in the shared
+/// discovery registry (used by an IPC dial), re-checking on each registry change.
+async fn registry_addr_for(registry: &PeerRegistry, peer_id: &DeviceId) -> Option<SocketAddr> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut changes = registry.subscribe();
     loop {
+        if let Some(addr) = registry.find(peer_id).and_then(|p| discovery::peer_socket_addr(&p)) {
+            return Some(addr);
+        }
         let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
-        let event = tokio::time::timeout(remaining, browser.next_event()).await.ok()??;
-        if let PeerEvent::Found(peer) = event {
-            if discovery::peer_device_id(&peer).as_ref() == Some(peer_id) {
-                if let Some(addr) = discovery::peer_socket_addr(&peer) {
-                    return Some(addr);
-                }
-            }
+        if tokio::time::timeout(remaining, changes.changed())
+            .await
+            .is_err()
+        {
+            return None; // timed out before the peer became discoverable
         }
     }
 }
@@ -264,41 +275,46 @@ async fn dial_discovered(
     me: &DeviceIdentity,
     my_id: DeviceId,
     my_b32: &str,
-    browser: &Browser,
+    registry: &PeerRegistry,
     force: bool,
 ) -> Result<InteractiveConnection, String> {
     let mut warned_untrusted = BTreeSet::new();
+    let mut changes = registry.subscribe();
     loop {
-        match browser.next_event().await {
-            Some(PeerEvent::Found(peer)) if peer.id != my_b32 => {
-                let Some(peer_id) = discovery::peer_device_id(&peer) else {
-                    continue;
-                };
-                if !force && my_id >= peer_id {
-                    continue; // the peer (lower id) will dial us; we accept instead
-                }
-                if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
-                    if warned_untrusted.insert(peer_id) {
-                        let peer_text = format_device_id(&peer_id);
-                        eprintln!(
-                            "mouserd: found untrusted peer {}; run `mouserd trust {peer_text}` \
-                             on this machine before connecting",
-                            peer.instance_name()
-                        );
-                    }
-                    continue;
-                }
-                let Some(addr) = discovery::peer_socket_addr(&peer) else {
-                    continue;
-                };
-                eprintln!("mouserd: dialing {} at {addr}", peer.instance_name());
-                return endpoint
-                    .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
-                    .await
-                    .map_err(|e| e.to_string());
+        // Scan the current registry for a trusted, dialable peer we should dial.
+        for peer in registry.peers() {
+            if peer.id == my_b32 {
+                continue; // never dial ourselves
             }
-            Some(_) => continue,
-            None => return Err("mDNS browse channel closed".to_string()),
+            let Some(peer_id) = discovery::peer_device_id(&peer) else {
+                continue;
+            };
+            if !force && my_id >= peer_id {
+                continue; // the peer (lower id) will dial us; we accept instead
+            }
+            if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
+                if warned_untrusted.insert(peer_id) {
+                    let peer_text = format_device_id(&peer_id);
+                    eprintln!(
+                        "mouserd: found untrusted peer {}; run `mouserd trust {peer_text}` \
+                         on this machine before connecting",
+                        peer.instance_name()
+                    );
+                }
+                continue;
+            }
+            let Some(addr) = discovery::peer_socket_addr(&peer) else {
+                continue;
+            };
+            eprintln!("mouserd: dialing {} at {addr}", peer.instance_name());
+            return endpoint
+                .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
+                .await
+                .map_err(|e| e.to_string());
+        }
+        // Nothing to dial yet; wait for the registry to change, then re-scan.
+        if changes.changed().await.is_err() {
+            return Err("discovery registry closed".to_string());
         }
     }
 }

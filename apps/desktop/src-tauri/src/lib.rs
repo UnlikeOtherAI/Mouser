@@ -12,14 +12,12 @@
 //! snapshot command reports `engine_running: false` so the UI can degrade gracefully
 //! (show the local device + an "engine not running" hint).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use mouser_ipc::{Client, Command, Snapshot};
-use mouser_net::{Browser, PeerAdvert, PeerEvent};
 use serde::Serialize;
 use tauri::{
     menu::MenuBuilder,
@@ -98,32 +96,15 @@ struct EngineConnection {
 }
 
 impl EngineSnapshot {
-    /// The daemon is not running, but we discovered peers directly over mDNS. Show them
-    /// (read-only — `engine_running: false` tells the UI to prompt starting the engine
-    /// before connecting). `trusted` is unknown without the engine, so reported `false`.
-    fn from_mdns(adverts: Vec<PeerAdvert>) -> Self {
-        let mut peers: Vec<EnginePeer> = adverts
-            .into_iter()
-            .map(|a| {
-                let host = a.addrs.first().map(|ip| ip.to_string()).unwrap_or_default();
-                EnginePeer {
-                    name: if a.name.is_empty() {
-                        host.clone()
-                    } else {
-                        a.name
-                    },
-                    id: a.id,
-                    os: a.os,
-                    host,
-                    port: a.iport,
-                    trusted: false,
-                }
-            })
-            .collect();
-        peers.sort_by(|a, b| a.id.cmp(&b.id));
+    /// The daemon's IPC socket did not answer. The engine owns discovery, so without it
+    /// there are no peers to show; `engine_running: false` tells the UI to surface the
+    /// "engine not running" hint. The desktop deliberately does **not** run its own mDNS
+    /// browse — a second browsing daemon on the host races the engine's for inbound
+    /// multicast and makes both silently miss peers (macOS).
+    fn offline() -> Self {
         Self {
             engine_running: false,
-            peers,
+            peers: Vec::new(),
             connection: EngineConnection {
                 state: "idle".to_string(),
                 peer_id: None,
@@ -251,38 +232,6 @@ fn mouserd_launch_args() -> &'static [&'static str] {
     }
 }
 
-/// Peers this app discovered directly over mDNS, keyed by DNS-SD instance fullname.
-/// A standalone fallback so the Devices list is populated even when the headless
-/// `mouserd` engine isn't running (discovery needs no engine).
-#[derive(Default)]
-struct DiscoveredPeers {
-    inner: Arc<Mutex<HashMap<String, PeerAdvert>>>,
-}
-
-/// Snapshot the current mDNS-discovered peers.
-fn mdns_peers(state: &DiscoveredPeers) -> Vec<PeerAdvert> {
-    lock_recover(&state.inner).values().cloned().collect()
-}
-
-/// Continuously browse `_mouser._udp` and fold Found/Removed into the registry.
-async fn mdns_browse_loop(inner: Arc<Mutex<HashMap<String, PeerAdvert>>>) {
-    let browser = match Browser::browse() {
-        Ok(b) => b,
-        Err(_) => return, // no mDNS daemon available; leave the registry empty
-    };
-    while let Some(event) = browser.next_event().await {
-        match event {
-            PeerEvent::Found(advert) => {
-                let key = format!("{}.{}", advert.instance_name(), mouser_net::SERVICE_TYPE);
-                lock_recover(&inner).insert(key, advert);
-            }
-            PeerEvent::Removed(fullname) => {
-                lock_recover(&inner).remove(&fullname);
-            }
-        }
-    }
-}
-
 /// Returns the real local device: friendly name, OS, and the physical monitor
 /// layout reported by the windowing system (positions and sizes converted from
 /// physical pixels to logical points).
@@ -332,15 +281,13 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
 /// snapshot (`engine_running: false`) rather than failing, so the UI can show the
 /// local device with an "engine not running" hint.
 #[tauri::command]
-async fn engine_snapshot(
-    peers: tauri::State<'_, DiscoveredPeers>,
-) -> Result<EngineSnapshot, String> {
+async fn engine_snapshot() -> Result<EngineSnapshot, String> {
     Ok(match fetch_engine_snapshot().await {
         // Engine is up: it owns discovery + trust + the live connection.
         Ok(snapshot) => EngineSnapshot::from_snapshot(snapshot),
-        // Engine is down: fall back to the peers we discovered over mDNS ourselves, so
-        // the Devices list is still populated (read-only until the engine is started).
-        Err(_) => EngineSnapshot::from_mdns(mdns_peers(&peers)),
+        // Engine is down: report offline so the UI shows the "engine not running" hint.
+        // The app supervises the engine, so this is only the brief startup window.
+        Err(_) => EngineSnapshot::offline(),
     })
 }
 
@@ -405,6 +352,19 @@ fn apply_tray_icon_visibility(app: &tauri::AppHandle, visible: bool) -> Result<(
         }
     }
 
+    // macOS: a tray-only app is a menu-bar agent — drop it from the Dock and the
+    // Cmd-Tab app switcher (Accessory). Restore the Dock/switcher icon (Regular) in
+    // taskbar/dock mode. skip_taskbar alone doesn't remove the Dock icon on macOS.
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if visible {
+            tauri::ActivationPolicy::Accessory
+        } else {
+            tauri::ActivationPolicy::Regular
+        };
+        app.set_activation_policy(policy).map_err(|e| e.to_string())?;
+    }
+
     Ok(())
 }
 
@@ -430,11 +390,14 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         .separator()
         .text(TRAY_QUIT, "Quit")
         .build()?;
-    let icon = app.default_window_icon().cloned();
+    // Menu-bar icon: the Font Awesome cursor (arrow-pointer), as a macOS template
+    // image so it auto-tints to the light/dark menu bar. Falls back to the app icon.
+    let icon = tray_cursor_icon().or_else(|| app.default_window_icon().cloned());
 
     let mut tray = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip("Mouser")
+        .icon_as_template(true)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             TRAY_SHOW => show_main_window(app),
@@ -463,6 +426,12 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// The bundled Font Awesome cursor as a Tauri image for the menu-bar tray icon.
+fn tray_cursor_icon() -> Option<tauri::image::Image<'static>> {
+    const PNG: &[u8] = include_bytes!("../icons/tray-cursor.png");
+    tauri::image::Image::from_bytes(PNG).ok()
+}
+
 /// Builds and runs the Tauri application.
 ///
 /// Kept in the library (not `main.rs`) so the same entry point can be reused by
@@ -480,18 +449,15 @@ pub fn run() {
             None,
         ))
         .manage(DesktopPreferences::default())
-        .manage(DiscoveredPeers::default())
         .manage(EngineProcess::default())
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
             // The app administers the engine: launch the headless `mouserd` daemon if it
-            // isn't already running, so the user never starts a daemon by hand.
+            // isn't already running, so the user never starts a daemon by hand. The engine
+            // owns mDNS discovery; the app reads peers from its IPC snapshot rather than
+            // running a second browse (which would race the engine's and miss peers).
             ensure_engine_running(app.handle());
-            // Browse mDNS directly so the Devices list is populated even before the
-            // engine's snapshot arrives (the engine snapshot takes over once it is up).
-            let peers = app.state::<DiscoveredPeers>().inner.clone();
-            tauri::async_runtime::spawn(mdns_browse_loop(peers));
             Ok(())
         })
         .on_window_event(|window, event| {

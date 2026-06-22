@@ -12,8 +12,18 @@ use crate::NetError;
 
 /// Create a `ServiceDaemon`, optionally enabling the loopback interfaces (disabled by
 /// default in `mdns-sd`). Loopback is needed for single-host discovery (e.g. tests).
+///
+/// IPv6 is disabled: hosts (especially macOS) expose many virtual IPv6 link-local
+/// interfaces — `awdl0` (Apple Wireless Direct Link), `llw0`, and per-VPN `utunN`.
+/// Browsing and answering across all of them drowns the real LAN multicast in
+/// `mdns-sd`, so peers on the wire are never received and our own service never answers
+/// remote resolve queries (verified: with IPv6 enabled a LAN peer is invisible;
+/// disabled, it resolves immediately). IPv4 mDNS is sufficient for a local-network KVM.
 fn new_daemon(loopback: bool) -> Result<ServiceDaemon, NetError> {
     let daemon = ServiceDaemon::new().map_err(|e| NetError::Discovery(e.to_string()))?;
+    daemon
+        .disable_interface(IfKind::IPv6)
+        .map_err(|e| NetError::Discovery(e.to_string()))?;
     if loopback {
         daemon
             .enable_interface(IfKind::LoopbackV4)
@@ -137,17 +147,7 @@ impl Advertiser {
         loopback: bool,
     ) -> Result<Self, NetError> {
         let daemon = new_daemon(loopback)?;
-        let host_name = format!("{}.local.", advert.id);
-        let info = ServiceInfo::new(
-            SERVICE_TYPE,
-            &advert.instance_name(),
-            &host_name,
-            host_ip,
-            advert.iport,
-            advert.txt_map(),
-        )
-        .map_err(|e| NetError::Discovery(e.to_string()))?;
-        let fullname = info.get_fullname().to_string();
+        let (info, fullname) = build_service_info(advert, host_ip)?;
         daemon
             .register(info)
             .map_err(|e| NetError::Discovery(e.to_string()))?;
@@ -170,9 +170,85 @@ impl Drop for Advertiser {
     }
 }
 
+/// Build the `_mouser._udp` [`ServiceInfo`] for `advert` on `host_ip` (§4), returning
+/// it alongside its DNS-SD fullname.
+fn build_service_info(
+    advert: &PeerAdvert,
+    host_ip: &str,
+) -> Result<(ServiceInfo, String), NetError> {
+    let host_name = format!("{}.local.", advert.id);
+    let info = ServiceInfo::new(
+        SERVICE_TYPE,
+        &advert.instance_name(),
+        &host_name,
+        host_ip,
+        advert.iport,
+        advert.txt_map(),
+    )
+    .map_err(|e| NetError::Discovery(e.to_string()))?;
+    let fullname = info.get_fullname().to_string();
+    Ok((info, fullname))
+}
+
+/// A single mDNS endpoint — ONE [`ServiceDaemon`] used for **both** advertising and
+/// browsing. A host must share one of these: every `ServiceDaemon` binds the port-5353
+/// multicast sockets, and several on one host race for inbound packets — on macOS all
+/// but one silently miss remote peers. The advertisement lasts until the [`Discovery`]
+/// is dropped, which shuts the daemon down (ending the browse too).
+pub struct Discovery {
+    daemon: ServiceDaemon,
+}
+
+impl Discovery {
+    /// Create the shared endpoint on the IPv4 LAN interfaces (see [`new_daemon`]).
+    pub fn new() -> Result<Self, NetError> {
+        Ok(Self {
+            daemon: new_daemon(false)?,
+        })
+    }
+
+    /// As [`Discovery::new`] but with the loopback interface enabled (same-host tests).
+    pub fn new_loopback() -> Result<Self, NetError> {
+        Ok(Self {
+            daemon: new_daemon(true)?,
+        })
+    }
+
+    /// Advertise this host (§4). The registration lasts until `self` is dropped.
+    pub fn advertise(&self, advert: &PeerAdvert, host_ip: &str) -> Result<(), NetError> {
+        let (info, _fullname) = build_service_info(advert, host_ip)?;
+        self.daemon
+            .register(info)
+            .map_err(|e| NetError::Discovery(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Start the single browse for `_mouser._udp` peers. Call once per endpoint:
+    /// mdns-sd keys queriers by service type, so a second browse replaces the first's
+    /// receiver. The returned [`Browser`] does not own the daemon (this does).
+    pub fn browse(&self) -> Result<Browser, NetError> {
+        let events = self
+            .daemon
+            .browse(SERVICE_TYPE)
+            .map_err(|e| NetError::Discovery(e.to_string()))?;
+        Ok(Browser {
+            daemon: None,
+            events,
+        })
+    }
+}
+
+impl Drop for Discovery {
+    fn drop(&mut self) {
+        let _ = self.daemon.shutdown();
+    }
+}
+
 /// A browse session yielding resolved peers as they appear on the network (§4).
 pub struct Browser {
-    daemon: ServiceDaemon,
+    /// `Some` when this browser owns its daemon (standalone) and shuts it down on drop;
+    /// `None` when the daemon is owned by a shared [`Discovery`].
+    daemon: Option<ServiceDaemon>,
     events: Receiver<ServiceEvent>,
 }
 
@@ -193,7 +269,10 @@ impl Browser {
         let events = daemon
             .browse(SERVICE_TYPE)
             .map_err(|e| NetError::Discovery(e.to_string()))?;
-        Ok(Self { daemon, events })
+        Ok(Self {
+            daemon: Some(daemon),
+            events,
+        })
     }
 
     /// Await the next [`PeerEvent`] (C2-6): a resolved, dialable peer
@@ -220,6 +299,10 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        let _ = self.daemon.shutdown();
+        // Only a standalone browser owns its daemon; a shared [`Discovery`] shuts its
+        // own daemon down.
+        if let Some(daemon) = &self.daemon {
+            let _ = daemon.shutdown();
+        }
     }
 }
