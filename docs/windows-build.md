@@ -14,7 +14,7 @@ helper, packaging, and the acceptance test.
 > [tech-stack.md §8](tech-stack.md) are **not in the workspace yet**; the
 > commands that mention them below are the intended flow and become runnable as
 > those crates land. **What you can run on a Windows box today** is the
-> `platform-win` build + `inject_demo` acceptance test (§7).
+> `platform-win` build + `win_inject_demo` acceptance test (§7).
 >
 > This code has **not** been executed on Windows by the author (no Windows host
 > was available). It has been *type-checked and clippy-clean against the real
@@ -303,7 +303,7 @@ Then:
    does not block it — that's why it's the target.)
 2. Run the demo:
    ```powershell
-   cargo run -p platform-win --example inject_demo
+   cargo run -p platform-win --example win_inject_demo
    ```
 3. **Expected:**
    - The mouse cursor visibly traces a **square** through four corners of the
