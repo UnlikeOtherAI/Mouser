@@ -13,6 +13,15 @@ settings:
     CODE_SIGN_IDENTITY: ""
     CODE_SIGNING_ALLOWED: "NO"
 
+packages:
+  # AppReveal — debug-only in-app MCP server. Advertises _appreveal._tcp over the
+  # LAN so agents can inspect/control DEBUG builds. The framework's own code is
+  # gated behind #if DEBUG (zero production footprint), and AppReveal.start() is
+  # only invoked inside #if DEBUG in MouserApp.swift. See docs/tech-stack.md.
+  AppReveal:
+    url: https://github.com/UnlikeOtherAI/AppReveal.git
+    from: "0.9.8"
+
 targets:
   Mouser:
     type: application
@@ -26,6 +35,8 @@ targets:
       # pre-build script below also runs so `xcodebuild` is self-sufficient.
       - framework: Frameworks/MouserFFI.xcframework
         embed: false
+      # AppReveal debug-only in-app MCP server (see packages: above).
+      - package: AppReveal
     preBuildScripts:
       - script: bash "${PROJECT_DIR}/build-ffi.sh"
         name: Build mouser-ffi XCFramework
@@ -47,6 +58,9 @@ targets:
         NSLocalNetworkUsageDescription: Mouser discovers and connects to your computers on the local network to control their mouse and keyboard.
         NSBonjourServices:
           - _mouser._udp
+          # AppReveal advertises its debug MCP server over this Bonjour type so
+          # agents can discover DEBUG builds on the LAN. See docs/tech-stack.md.
+          - _appreveal._tcp
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

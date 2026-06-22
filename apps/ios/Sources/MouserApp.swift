@@ -1,7 +1,19 @@
 import SwiftUI
 
+#if DEBUG
+import AppReveal
+#endif
+
 @main
 struct MouserApp: App {
+    init() {
+        #if DEBUG
+        // Debug-only in-app MCP server. Advertises `_appreveal._tcp` over the LAN
+        // so agents can inspect/control this build. Compiled out of release builds.
+        AppReveal.start()
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
             CompanionView()

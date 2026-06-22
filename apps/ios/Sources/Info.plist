@@ -25,6 +25,7 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_mouser._udp</string>
+		<string>_appreveal._tcp</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
