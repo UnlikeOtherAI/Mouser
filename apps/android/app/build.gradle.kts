@@ -72,6 +72,10 @@ dependencies {
     // used to pause the inertia/frame loop in the background and reconnect on resume
     // (audit R2 HIGH: app lifecycle). Pinned to the same lifecycle train as -ktx.
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    // Coroutines for the NSD discovery StateFlow + off-main-thread connect. Pinned
+    // to the train the lifecycle artifacts already pull in transitively, made
+    // explicit so the discovery code doesn't depend on a transitive coordinate.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")

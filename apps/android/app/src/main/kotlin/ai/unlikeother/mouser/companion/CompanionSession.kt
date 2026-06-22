@@ -6,6 +6,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * App-lifecycle / connection state holder for the companion (audit R2 HIGH:
@@ -29,7 +36,13 @@ import androidx.lifecycle.LifecycleOwner
  * [DefaultLifecycleObserver] and — for the frame loop specifically — by a
  * Compose `LifecycleEventEffect` in [CompanionScreen].
  */
-class CompanionSession(private val mouser: MouserClient? = null) {
+class CompanionSession(
+    private val mouser: MouserClient? = null,
+    private val discovery: PeerDiscovery? = null,
+) {
+
+    /** Off-main-thread scope for the QUIC dial (connect blocks on the FFI runtime). */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * True while the app is in the foreground (resumed). The touchpad's inertia
@@ -47,6 +60,34 @@ class CompanionSession(private val mouser: MouserClient? = null) {
     var isConnected by mutableStateOf(false)
         private set
 
+    /** Live `_mouser._udp` peers (empty when no discovery is wired, e.g. tests). */
+    val peers: StateFlow<List<DiscoveredPeer>> =
+        discovery?.peers ?: MutableStateFlow<List<DiscoveredPeer>>(emptyList()).asStateFlow()
+
+    private val _connection = MutableStateFlow<ConnectionUiState>(ConnectionUiState.Idle)
+    /** The tap-to-connect phase the [PeerSelector] highlights. */
+    val connection: StateFlow<ConnectionUiState> = _connection.asStateFlow()
+
+    /**
+     * Dial a discovered peer off the main thread (the FFI `connect` blocks on its
+     * tokio runtime). Reflects the phase in [connection] / [isConnected]. A
+     * no-op-safe disconnect of any prior session runs first so tapping a second
+     * peer cleanly switches.
+     */
+    fun connect(peer: DiscoveredPeer) {
+        val client = mouser ?: return
+        _connection.value = ConnectionUiState.Connecting(peer.id)
+        scope.launch {
+            client.disconnect()
+            val result = client.connect(peer.hostAddress, peer.port, peer.id)
+            val up = result.isSuccess && client.isConnected
+            isConnected = up
+            _connection.value =
+                if (up) ConnectionUiState.Connected(peer.id) else ConnectionUiState.Failed(peer.id)
+            Log.d(TAG, "connect ${peer.id} → $up")
+        }
+    }
+
     /**
      * Resume hook. Called from the activity's `onResume` and mirrored by the
      * Compose lifecycle effect. Idempotent.
@@ -61,6 +102,8 @@ class CompanionSession(private val mouser: MouserClient? = null) {
         // the backoff and re-issuing request_ownership) is a follow-up; connect is
         // explicit (host/port) today, mirroring iOS / the mouser-ffi scope note.
         isConnected = mouser?.isConnected ?: false
+        // Resume LAN discovery so the peer list repopulates while in the foreground.
+        discovery?.start()
         Log.d(TAG, "resume → isConnected=$isConnected")
     }
 
@@ -80,6 +123,9 @@ class CompanionSession(private val mouser: MouserClient? = null) {
         // A lighter-weight Goodbye{Sleep}+resume-reconnect path is a follow-up.
         mouser?.disconnect()
         isConnected = false
+        _connection.value = ConnectionUiState.Idle
+        // Stop browsing + release the multicast lock while backgrounded (battery).
+        discovery?.stop()
         Log.d(TAG, "stop → stop frame loop + disconnect (yield ownership)")
     }
 
