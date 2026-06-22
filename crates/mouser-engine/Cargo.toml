@@ -1,0 +1,26 @@
+[package]
+name = "mouser-engine"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The engine core is sans-IO and unsafe-free, so it adopts the workspace lints
+# (panic-free discipline + `forbid(unsafe_code)`).
+[lints]
+workspace = true
+
+[dependencies]
+mouser-protocol = { path = "../mouser-protocol" }
+mouser-core = { path = "../mouser-core" }
+mouser-net = { path = "../mouser-net" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+thiserror = "2"
+
+# The daemon binary plugs the real macOS adapters into the runtime.
+[target.'cfg(target_os = "macos")'.dependencies]
+platform-mac = { path = "../platform-mac" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

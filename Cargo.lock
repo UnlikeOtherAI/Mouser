@@ -2301,6 +2301,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouser-engine"
+version = "0.0.0"
+dependencies = [
+ "mouser-core",
+ "mouser-net",
+ "mouser-protocol",
+ "platform-mac",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "mouser-ffi"
 version = "0.0.0"
 
@@ -4382,6 +4395,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.4",
  "tokio-macros",
  "windows-sys 0.61.2",
