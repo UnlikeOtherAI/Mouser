@@ -16,6 +16,7 @@
 //! multi-peer/CRDT layout, the §5 SAS pairing UI, and clipboard live above this.
 
 pub mod core;
+pub mod daemon_store;
 pub mod discovery;
 pub mod runtime;
 

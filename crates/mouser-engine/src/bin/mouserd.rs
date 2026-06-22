@@ -12,8 +12,10 @@
 //! - `mouserd auto`     - advertise + browse; either connected side can control.
 //! - `mouserd source`   - controller-only connection: capture + dial a discovered peer.
 //! - `mouserd target`   - receive-only connection: accept + inject, no input hooks.
-//! - `mouserd connect <host:port>` - direct controller-only connection, no mDNS.
+//! - `mouserd connect <host:port> <peer-id>` - direct trusted controller connection.
 //! - `mouserd probe <host:port>`   - handshake-only transport check, no capture/inject.
+//! - `mouserd identity` - print this machine's persistent device id.
+//! - `mouserd trust <peer-id>` / `mouserd trusted` - manage trusted peer pins.
 //!
 //! Discovery itself is platform-agnostic (it lives in the shared `mouser-engine`/
 //! `mouser-net` crates over `mdns-sd`), so the same serve loop runs on every host;
@@ -62,6 +64,7 @@ fn main() {
 /// capture/injection adapters (the only per-OS difference).
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod engine {
+    use std::collections::BTreeSet;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -70,6 +73,7 @@ mod engine {
     };
     use mouser_core::DeviceId;
     use mouser_engine::core::CaptureDecision;
+    use mouser_engine::daemon_store::{format_device_id, parse_peer_id_arg, DaemonStore};
     use mouser_engine::{discovery, EdgeLayout, EngineCore, RuntimeHandle};
     use mouser_net::{
         Advertiser, Browser, DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PeerEvent,
@@ -98,6 +102,22 @@ mod engine {
             .get(1)
             .cloned()
             .unwrap_or_else(|| default_role().to_string());
+        let store = match DaemonStore::open_default() {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("mouserd: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        match handle_local_command(&arg1, &args, &store) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("mouserd: {e}");
+                std::process::exit(1);
+            }
+        }
 
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -127,9 +147,18 @@ mod engine {
             };
             rt.block_on(async move {
                 let result = if arg1 == "probe" {
-                    probe(addr).await
+                    probe(&store, addr).await
+                } else if let Some(peer_id_arg) = args.get(3).cloned() {
+                    match parse_peer_id_arg(&peer_id_arg) {
+                        Ok(peer_id) => serve_direct(&store, addr, peer_id, injector, capture).await,
+                        Err(e) => Err(e.to_string()),
+                    }
                 } else {
-                    serve_direct(addr, injector, capture).await
+                    Err(format!(
+                        "`connect` needs a trusted <peer-id>. Run `mouserd probe {addr}` \
+                         to read the peer id, then `mouserd trust <peer-id>`, then \
+                         `mouserd connect {addr} <peer-id>`"
+                    ))
                 };
                 if let Err(e) = result {
                     eprintln!("mouserd: {e}");
@@ -141,11 +170,44 @@ mod engine {
 
         let role = role_from_arg(&arg1);
         rt.block_on(async move {
-            if let Err(e) = serve(&role, injector, capture).await {
+            if let Err(e) = serve(&store, &role, injector, capture).await {
                 eprintln!("mouserd: {e}");
                 std::process::exit(1);
             }
         });
+    }
+
+    fn handle_local_command(
+        command: &str,
+        args: &[String],
+        store: &DaemonStore,
+    ) -> Result<bool, String> {
+        match command {
+            "identity" | "id" => {
+                let identity = store.load_or_create_identity().map_err(|e| e.to_string())?;
+                println!("{}", identity.device_id_base32());
+                println!("store {}", store.dir().display());
+                Ok(true)
+            }
+            "trusted" => {
+                for peer in store.trusted_peer_ids().map_err(|e| e.to_string())? {
+                    println!("{}", format_device_id(&peer));
+                }
+                Ok(true)
+            }
+            "trust" => {
+                let Some(peer_id) = args.get(2) else {
+                    return Err("`trust` needs a <peer-id>, e.g. mouserd trust abc...".to_string());
+                };
+                let trusted = store
+                    .trust_peer_base32(peer_id)
+                    .map_err(|e| e.to_string())?;
+                println!("trusted {}", format_device_id(&trusted));
+                println!("store {}", store.dir().display());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn role_from_arg(arg: &str) -> String {
@@ -171,8 +233,8 @@ mod engine {
 
     /// Connect to an explicit peer (TrustOnFirstUse) and report the handshake, then
     /// exit - a safe transport check that never captures or injects input.
-    async fn probe(addr: SocketAddr) -> Result<(), String> {
-        let me = DeviceIdentity::generate();
+    async fn probe(store: &DaemonStore, addr: SocketAddr) -> Result<(), String> {
+        let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
         let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
             .map_err(|e| e.to_string())?;
         eprintln!("mouserd: probing {addr}...");
@@ -188,11 +250,21 @@ mod engine {
         let alpn = conn
             .negotiated_alpn()
             .map(|b| String::from_utf8_lossy(&b).into_owned());
+        let peer = conn.peer_device_id();
+        let peer_text = peer
+            .as_ref()
+            .map(format_device_id)
+            .unwrap_or_else(|| "<missing>".to_string());
         eprintln!(
             "mouserd: PROBE OK - handshake with {addr} completed; ALPN={alpn:?}; \
-             peer_device_id_present={}",
-            conn.peer_device_id().is_some()
+             peer_device_id={peer_text}"
         );
+        if let Some(peer_id) = peer {
+            eprintln!(
+                "mouserd: to trust this peer on this machine, run: mouserd trust {}",
+                format_device_id(&peer_id)
+            );
+        }
         conn.shutdown().await;
         Ok(())
     }
@@ -200,18 +272,31 @@ mod engine {
     /// Source mode against an explicit peer address (direct dial, no mDNS): this host
     /// becomes the controller (captures + forwards across the right edge).
     async fn serve_direct(
+        store: &DaemonStore,
         addr: SocketAddr,
+        expected_peer: DeviceId,
         injector: Arc<dyn InputInjection>,
         capture: Box<dyn InputCapture>,
     ) -> Result<(), String> {
-        let me = DeviceIdentity::generate();
+        if !store
+            .is_peer_trusted(&expected_peer)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!(
+                "peer {} is not trusted on this machine; run `mouserd trust {}` first",
+                format_device_id(&expected_peer),
+                format_device_id(&expected_peer)
+            ));
+        }
+
+        let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
         let my_id = me.device_id();
         eprintln!("mouserd: device_id {}", me.device_id_base32());
         let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
             .map_err(|e| e.to_string())?;
         eprintln!("mouserd: dialing {addr} directly...");
         let conn = endpoint
-            .connect_interactive(&me, addr, PinPolicy::TrustOnFirstUse)
+            .connect_interactive(&me, addr, PinPolicy::Pinned(expected_peer))
             .await
             .map_err(|e| e.to_string())?;
         let peer = conn
@@ -233,11 +318,12 @@ mod engine {
     }
 
     async fn serve(
+        store: &DaemonStore,
         role: &str,
         injector: Arc<dyn InputInjection>,
         capture: Box<dyn InputCapture>,
     ) -> Result<(), String> {
-        let me = DeviceIdentity::generate();
+        let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
         let my_id = me.device_id();
         let my_b32 = me.device_id_base32();
         eprintln!("mouserd: device_id {my_b32}");
@@ -268,6 +354,7 @@ mod engine {
         let (conn, direction) = match role {
             "source" => (
                 dial_discovered(
+                    store,
                     &endpoint,
                     &me,
                     my_id,
@@ -278,22 +365,16 @@ mod engine {
                 .await?,
                 "dialed",
             ),
-            "target" => (
-                endpoint
-                    .accept_interactive()
-                    .await
-                    .map_err(|e| e.to_string())?,
-                "accepted",
-            ),
+            "target" => (accept_trusted(&endpoint, store).await?, "accepted"),
             _ => {
                 let browser = Browser::browse().map_err(|e| e.to_string())?;
                 eprintln!("mouserd: searching for peers on the local network...");
                 tokio::select! {
-                    accepted = endpoint.accept_interactive() => (
-                        accepted.map_err(|e| e.to_string())?,
+                    accepted = accept_trusted(&endpoint, store) => (
+                        accepted?,
                         "accepted"
                     ),
-                    dialed = dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, false) => (
+                    dialed = dial_discovered(store, &endpoint, &me, my_id, &my_b32, &browser, false) => (
                         dialed?,
                         "dialed"
                     ),
@@ -369,6 +450,7 @@ mod engine {
     /// When `force` is false (auto mode) only the lower `device_id` dials, so the two
     /// sides don't connect twice.
     async fn dial_discovered(
+        store: &DaemonStore,
         endpoint: &InteractiveEndpoint,
         me: &DeviceIdentity,
         my_id: DeviceId,
@@ -376,6 +458,7 @@ mod engine {
         browser: &Browser,
         force: bool,
     ) -> Result<InteractiveConnection, String> {
+        let mut warned_untrusted = BTreeSet::new();
         loop {
             match browser.next_event().await {
                 Some(PeerEvent::Found(peer)) if peer.id != my_b32 => {
@@ -384,6 +467,17 @@ mod engine {
                     };
                     if !force && my_id >= peer_id {
                         continue; // the peer (lower id) will dial us; we accept instead
+                    }
+                    if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
+                        if warned_untrusted.insert(peer_id) {
+                            let peer_text = format_device_id(&peer_id);
+                            eprintln!(
+                                "mouserd: found untrusted peer {}; run `mouserd trust {peer_text}` \
+                                 on this machine before connecting",
+                                peer.instance_name()
+                            );
+                        }
+                        continue;
                     }
                     let Some(addr) = discovery::peer_socket_addr(&peer) else {
                         continue;
@@ -397,6 +491,36 @@ mod engine {
                 Some(_) => continue,
                 None => return Err("mDNS browse channel closed".to_string()),
             }
+        }
+    }
+
+    /// Accept inbound connections until the peer id is explicitly trusted locally.
+    /// Untrusted peers can complete the transport handshake (so `probe` can discover
+    /// their id), but they are closed before the engine runtime can inject anything.
+    async fn accept_trusted(
+        endpoint: &InteractiveEndpoint,
+        store: &DaemonStore,
+    ) -> Result<InteractiveConnection, String> {
+        loop {
+            let conn = endpoint
+                .accept_interactive()
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(peer_id) = conn.peer_device_id() else {
+                eprintln!("mouserd: rejected peer without a valid device_id");
+                conn.close();
+                continue;
+            };
+            if store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
+                return Ok(conn);
+            }
+
+            let peer_text = format_device_id(&peer_id);
+            eprintln!(
+                "mouserd: rejected untrusted peer {peer_text}; run `mouserd trust {peer_text}` \
+                 on this machine to allow control"
+            );
+            conn.close();
         }
     }
 
