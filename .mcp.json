@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mouser": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--release", "-p", "mouser-mcp"]
+    }
+  }
+}
