@@ -103,9 +103,10 @@ impl EngineSnapshot {
     /// The daemon is not running, but we discovered peers directly over mDNS. Show them
     /// (read-only — `engine_running: false` tells the UI to prompt starting the engine
     /// before connecting). `trusted` is unknown without the engine, so reported `false`.
-    fn from_mdns(adverts: Vec<PeerAdvert>) -> Self {
+    fn from_mdns(adverts: Vec<PeerAdvert>, local_id: Option<&str>) -> Self {
         let mut peers: Vec<EnginePeer> = adverts
             .into_iter()
+            .filter(|a| local_id != Some(a.id.as_str()))
             .map(|a| {
                 let host = a.addrs.first().map(|ip| ip.to_string()).unwrap_or_default();
                 EnginePeer {
@@ -140,6 +141,7 @@ impl EngineSnapshot {
     fn from_snapshot(snapshot: Snapshot, mdns_adverts: Vec<PeerAdvert>) -> Self {
         let mut seen = HashSet::new();
         let mut peers: Vec<EnginePeer> = Vec::new();
+        seen.insert(snapshot.local.id.clone());
 
         for p in snapshot.peers {
             seen.insert(p.id.clone());
@@ -378,6 +380,7 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
 /// local device with an "engine not running" hint.
 #[tauri::command]
 async fn engine_snapshot(
+    app: tauri::AppHandle,
     peers: tauri::State<'_, DiscoveredPeers>,
 ) -> Result<EngineSnapshot, String> {
     Ok(match fetch_engine_snapshot().await {
@@ -385,7 +388,10 @@ async fn engine_snapshot(
         Ok(snapshot) => EngineSnapshot::from_snapshot(snapshot, mdns_peers(&peers)),
         // Engine is down: fall back to the peers we discovered over mDNS ourselves, so
         // the Devices list is still populated (read-only until the engine is started).
-        Err(_) => EngineSnapshot::from_mdns(mdns_peers(&peers)),
+        Err(_) => {
+            let local_id = local_engine_identity(app).await.ok();
+            EngineSnapshot::from_mdns(mdns_peers(&peers), local_id.as_deref())
+        }
     })
 }
 
@@ -429,6 +435,26 @@ async fn fetch_engine_snapshot() -> Result<Snapshot, String> {
         .await
         .map_err(|_| "engine did not reply in time".to_string())?
         .map_err(|e| e.to_string())
+}
+
+async fn local_engine_identity(app: tauri::AppHandle) -> Result<String, String> {
+    let path = resolve_mouserd(&app);
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new(path).arg("identity").output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|e| e.to_string())?
+        .lines()
+        .next()
+        .map(str::to_string)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "identity command returned no device id".to_string())
 }
 
 /// Open a short-lived IPC client and send one command.
