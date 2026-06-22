@@ -21,11 +21,17 @@ fn has_control(actions: &[Action], ty: u16) -> Option<Vec<u8>> {
 }
 
 fn has_capture(actions: &[Action], want: CaptureDecision) -> bool {
-    actions.iter().any(|a| matches!(a, Action::Capture(d) if *d == want))
+    actions
+        .iter()
+        .any(|a| matches!(a, Action::Capture(d) if *d == want))
 }
 
 fn cursor(x: i32, y: i32) -> LocalInputEvent {
-    LocalInputEvent::CursorMoved { display_id: 0, x, y }
+    LocalInputEvent::CursorMoved {
+        display_id: 0,
+        x,
+        y,
+    }
 }
 
 #[test]
@@ -55,16 +61,29 @@ fn source_forwards_input_with_incrementing_counters_while_peer_owns() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40)); // cross → peer owns, counters reset
 
-    let a = e.on_local_input(LocalInputEvent::Key { usage: 0x04, down: true, mods: 0 });
+    let a = e.on_local_input(LocalInputEvent::Key {
+        usage: 0x04,
+        down: true,
+        mods: 0,
+    });
     let k1: KeyEvent =
         from_cbor(&has_control(&a, TYPE_KEY_EVENT).expect("key forwarded")).expect("decode");
-    assert_eq!((k1.usage, k1.down, k1.owner_epoch, k1.ctr), (0x04, true, 1, 1));
+    assert_eq!(
+        (k1.usage, k1.down, k1.owner_epoch, k1.ctr),
+        (0x04, true, 1, 1)
+    );
     assert!(has_capture(&a, CaptureDecision::Suppress));
 
-    let a = e.on_local_input(LocalInputEvent::Button { button: 0, down: true });
+    let a = e.on_local_input(LocalInputEvent::Button {
+        button: 0,
+        down: true,
+    });
     let b: PointerButton =
         from_cbor(&has_control(&a, TYPE_POINTER_BUTTON).expect("button forwarded")).expect("dec");
-    assert_eq!(b.ctr, 2, "counter strictly increments across forwarded events");
+    assert_eq!(
+        b.ctr, 2,
+        "counter strictly increments across forwarded events"
+    );
 }
 
 #[test]
@@ -80,26 +99,97 @@ fn target_accepts_grant_then_injects_with_anti_replay() {
     })
     .unwrap();
     let a = t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
-    assert!(has_control(&a, TYPE_OWNERSHIP_ACK).is_some(), "acks the transfer");
+    assert!(
+        has_control(&a, TYPE_OWNERSHIP_ACK).is_some(),
+        "acks the transfer"
+    );
     assert!(t.is_owner());
     assert_eq!(t.epoch(), 1);
 
     // A key for the current epoch is injected.
     let key = |ctr: u64| {
-        to_cbor(&KeyEvent { usage: 0x07, down: true, mods: 0, owner_epoch: 1, ctr }).unwrap()
+        to_cbor(&KeyEvent {
+            usage: 0x07,
+            down: true,
+            mods: 0,
+            owner_epoch: 1,
+            ctr,
+        })
+        .unwrap()
     };
     let a = t.on_control(TYPE_KEY_EVENT, &key(1));
-    assert_eq!(a, vec![Action::Inject(Inject::Key { usage: 0x07, down: true, mods: 0 })]);
+    assert_eq!(
+        a,
+        vec![Action::Inject(Inject::Key {
+            usage: 0x07,
+            down: true,
+            mods: 0
+        })]
+    );
 
     // Replay of the same counter is rejected (anti-replay §7.5).
-    assert!(t.on_control(TYPE_KEY_EVENT, &key(1)).is_empty(), "replayed ctr dropped");
+    assert!(
+        t.on_control(TYPE_KEY_EVENT, &key(1)).is_empty(),
+        "replayed ctr dropped"
+    );
     // A lower counter is rejected.
-    assert!(t.on_control(TYPE_KEY_EVENT, &key(0)).is_empty(), "non-increasing ctr dropped");
+    assert!(
+        t.on_control(TYPE_KEY_EVENT, &key(0)).is_empty(),
+        "non-increasing ctr dropped"
+    );
     // A higher counter is accepted.
     assert_eq!(
         t.on_control(TYPE_KEY_EVENT, &key(2)),
-        vec![Action::Inject(Inject::Key { usage: 0x07, down: true, mods: 0 })]
+        vec![Action::Inject(Inject::Key {
+            usage: 0x07,
+            down: true,
+            mods: 0
+        })]
     );
+}
+
+#[test]
+fn source_capable_peer_accepts_grant_and_injects() {
+    let mut peer = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+
+    let grant = to_cbor(&OwnershipTransfer {
+        to: ME.to_vec(),
+        owner_epoch: 1,
+        layout_rev: 0,
+        reason: TransferReason::EdgeCross,
+    })
+    .unwrap();
+    let a = peer.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
+    assert!(
+        has_control(&a, TYPE_OWNERSHIP_ACK).is_some(),
+        "acks the transfer"
+    );
+    assert!(peer.is_owner());
+    assert_eq!(peer.epoch(), 1);
+
+    let key = to_cbor(&KeyEvent {
+        usage: 0x07,
+        down: true,
+        mods: 0,
+        owner_epoch: 1,
+        ctr: 1,
+    })
+    .unwrap();
+    assert_eq!(
+        peer.on_control(TYPE_KEY_EVENT, &key),
+        vec![Action::Inject(Inject::Key {
+            usage: 0x07,
+            down: true,
+            mods: 0,
+        })]
+    );
+
+    let local = peer.on_local_input(LocalInputEvent::Key {
+        usage: 0x04,
+        down: true,
+        mods: 0,
+    });
+    assert!(has_capture(&local, CaptureDecision::PassThrough));
 }
 
 #[test]
@@ -116,7 +206,14 @@ fn target_rejects_events_for_a_stale_epoch() {
     assert_eq!(t.epoch(), 2);
 
     // An event tagged with an old epoch must be dropped.
-    let stale = to_cbor(&KeyEvent { usage: 5, down: true, mods: 0, owner_epoch: 1, ctr: 99 }).unwrap();
+    let stale = to_cbor(&KeyEvent {
+        usage: 5,
+        down: true,
+        mods: 0,
+        owner_epoch: 1,
+        ctr: 99,
+    })
+    .unwrap();
     assert!(t.on_control(TYPE_KEY_EVENT, &stale).is_empty());
 }
 
@@ -133,11 +230,21 @@ fn target_injects_motion_and_drops_out_of_order_seq() {
     t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
 
     let motion = |seq: u32, x: i32| {
-        Datagram::Motion(PointerMotion { owner_epoch: 1, seq, display_id: 0, x, y: 20 })
+        Datagram::Motion(PointerMotion {
+            owner_epoch: 1,
+            seq,
+            display_id: 0,
+            x,
+            y: 20,
+        })
     };
     assert_eq!(
         t.on_motion(motion(5, 10)),
-        vec![Action::Inject(Inject::MoveCursor { display_id: 0, x: 10, y: 20 })]
+        vec![Action::Inject(Inject::MoveCursor {
+            display_id: 0,
+            x: 10,
+            y: 20
+        })]
     );
     // Older/equal seq is dropped (keep-newest, §7.6 anti-replay).
     assert!(t.on_motion(motion(5, 11)).is_empty());
@@ -145,7 +252,11 @@ fn target_injects_motion_and_drops_out_of_order_seq() {
     // Newer seq is applied.
     assert_eq!(
         t.on_motion(motion(6, 30)),
-        vec![Action::Inject(Inject::MoveCursor { display_id: 0, x: 30, y: 20 })]
+        vec![Action::Inject(Inject::MoveCursor {
+            display_id: 0,
+            x: 30,
+            y: 20
+        })]
     );
 }
 

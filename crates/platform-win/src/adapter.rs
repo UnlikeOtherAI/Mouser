@@ -255,6 +255,7 @@ struct CaptureState {
     sink: Option<Arc<dyn InputSink>>,
     displays: Vec<DisplayBounds>,
     mods: u16,
+    suppressing: bool,
 }
 
 static CAPTURE_STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
@@ -272,6 +273,7 @@ fn clear_capture_state() {
     state.sink = None;
     state.displays.clear();
     state.mods = 0;
+    state.suppressing = false;
 }
 
 fn prepare_capture_state(sink: Arc<dyn InputSink>) -> PlatformResult<()> {
@@ -281,6 +283,7 @@ fn prepare_capture_state(sink: Arc<dyn InputSink>) -> PlatformResult<()> {
     }
     state.displays = active_display_bounds().unwrap_or_else(|_| Vec::new());
     state.mods = 0;
+    state.suppressing = false;
     state.sink = Some(sink);
     Ok(())
 }
@@ -487,7 +490,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     // KBDLLHOOKSTRUCT for the duration of the callback.
     let hook = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
     let decision = keyboard_event_from_parts(message, hook.scanCode, hook.flags.0)
-        .map(dispatch_capture_event)
+        .map(dispatch_non_cursor_capture_event)
         .unwrap_or(CaptureDecision::PassThrough);
     hook_result(decision, code, wparam, lparam)
 }
@@ -508,7 +511,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     let hook = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
     let decision =
         mouse_event_from_parts(message, hook.pt.x, hook.pt.y, hook.mouseData, hook.flags)
-            .map(dispatch_capture_event)
+            .map(dispatch_mouse_capture_event)
             .unwrap_or(CaptureDecision::PassThrough);
     hook_result(decision, code, wparam, lparam)
 }
@@ -647,12 +650,38 @@ fn cursor_event_for_virtual_point(x: i32, y: i32) -> LocalInputEvent {
     }
 }
 
+fn dispatch_mouse_capture_event(event: LocalInputEvent) -> CaptureDecision {
+    match event {
+        LocalInputEvent::CursorMoved { .. } => dispatch_capture_event(event),
+        _ => dispatch_non_cursor_capture_event(event),
+    }
+}
+
+fn dispatch_non_cursor_capture_event(event: LocalInputEvent) -> CaptureDecision {
+    if !capture_is_suppressing() {
+        return CaptureDecision::PassThrough;
+    }
+    dispatch_capture_event(event)
+}
+
 fn dispatch_capture_event(event: LocalInputEvent) -> CaptureDecision {
     let sink = lock_recover(capture_state()).sink.clone();
-    let Some(sink) = sink else {
-        return CaptureDecision::PassThrough;
+    let decision = if let Some(sink) = sink {
+        catch_unwind(AssertUnwindSafe(|| sink.on_event(event)))
+            .unwrap_or(CaptureDecision::PassThrough)
+    } else {
+        CaptureDecision::PassThrough
     };
-    catch_unwind(AssertUnwindSafe(|| sink.on_event(event))).unwrap_or(CaptureDecision::PassThrough)
+    set_capture_suppressing(decision)
+}
+
+fn capture_is_suppressing() -> bool {
+    lock_recover(capture_state()).suppressing
+}
+
+fn set_capture_suppressing(decision: CaptureDecision) -> CaptureDecision {
+    lock_recover(capture_state()).suppressing = matches!(decision, CaptureDecision::Suppress);
+    decision
 }
 
 fn high_word_u16(value: u32) -> u16 {
@@ -703,10 +732,45 @@ impl std::error::Error for CaptureStartFailed {}
 mod tests {
     use super::*;
 
+    use std::collections::VecDeque;
+
     static CAPTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn capture_test_lock() -> MutexGuard<'static, ()> {
         lock_recover(CAPTURE_TEST_LOCK.get_or_init(|| Mutex::new(())))
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<LocalInputEvent>>,
+        decisions: Mutex<VecDeque<CaptureDecision>>,
+    }
+
+    impl RecordingSink {
+        fn with_decisions(decisions: impl IntoIterator<Item = CaptureDecision>) -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                decisions: Mutex::new(decisions.into_iter().collect()),
+            }
+        }
+
+        fn events(&self) -> Vec<LocalInputEvent> {
+            lock_recover(&self.events).clone()
+        }
+    }
+
+    impl InputSink for RecordingSink {
+        fn on_event(&self, event: LocalInputEvent) -> CaptureDecision {
+            lock_recover(&self.events).push(event);
+            lock_recover(&self.decisions)
+                .pop_front()
+                .unwrap_or(CaptureDecision::PassThrough)
+        }
+    }
+
+    fn install_test_sink(sink: &Arc<RecordingSink>) {
+        let sink_trait: Arc<dyn InputSink> = sink.clone();
+        lock_recover(capture_state()).sink = Some(sink_trait);
     }
 
     #[test]
@@ -845,6 +909,58 @@ mod tests {
                 y: 30,
             }
         );
+        clear_capture_state();
+    }
+
+    #[test]
+    fn idle_non_cursor_events_bypass_the_sink() {
+        let _guard = capture_test_lock();
+        clear_capture_state();
+        let sink = Arc::new(RecordingSink::with_decisions([CaptureDecision::Suppress]));
+        install_test_sink(&sink);
+
+        assert_eq!(
+            dispatch_non_cursor_capture_event(LocalInputEvent::Key {
+                usage: 0x04,
+                down: true,
+                mods: 0,
+            }),
+            CaptureDecision::PassThrough
+        );
+        assert!(sink.events().is_empty());
+        assert!(!capture_is_suppressing());
+        clear_capture_state();
+    }
+
+    #[test]
+    fn cursor_suppression_enables_non_cursor_forwarding() {
+        let _guard = capture_test_lock();
+        clear_capture_state();
+        let sink = Arc::new(RecordingSink::with_decisions([
+            CaptureDecision::Suppress,
+            CaptureDecision::PassThrough,
+        ]));
+        install_test_sink(&sink);
+
+        let cursor = LocalInputEvent::CursorMoved {
+            display_id: 0,
+            x: 100,
+            y: 20,
+        };
+        let key = LocalInputEvent::Key {
+            usage: 0x04,
+            down: true,
+            mods: 0,
+        };
+
+        assert_eq!(dispatch_capture_event(cursor), CaptureDecision::Suppress);
+        assert!(capture_is_suppressing());
+        assert_eq!(
+            dispatch_non_cursor_capture_event(key),
+            CaptureDecision::PassThrough
+        );
+        assert!(!capture_is_suppressing());
+        assert_eq!(sink.events(), vec![cursor, key]);
         clear_capture_state();
     }
 }

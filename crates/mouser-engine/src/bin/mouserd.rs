@@ -1,16 +1,19 @@
-//! `mouserd` — the Mouser engine daemon.
+//! `mouserd` - the Mouser engine daemon.
 //!
 //! v1 single-peer bring-up: **auto-discover a peer over mDNS** (`_mouser._udp.local`,
 //! §4), establish the device_id-pinned interactive QUIC connection (§3), and run the
 //! [`mouser_engine`] runtime wired to the host's real capture/injection adapters:
-//! - macOS → `platform-mac` (`MacCapture` + `MacInjector`),
-//! - Windows → `platform-win` (`WinCapture` + `WinInjector`),
-//! - Linux → `platform-linux` (`LinuxCapture` + `UinputInjector`).
+//! - macOS -> `platform-mac` (`MacCapture` + `MacInjector`),
+//! - Windows -> `platform-win` (`WinCapture` + `WinInjector`),
+//! - Linux -> `platform-linux` (`LinuxCapture` + `UinputInjector`).
 //!
 //! Usage:
-//! - `mouserd`          — auto: advertise + browse; the lower device_id becomes source.
-//! - `mouserd source`   — be the controller (capture + dial the discovered peer).
-//! - `mouserd target`   — be the controlled screen (accept + inject).
+//! - `mouserd`          - auto: advertise + browse; either connected side can control.
+//! - `mouserd auto`     - same as default; lower device_id dials to avoid duplicates.
+//! - `mouserd source`   - controller-only connection: capture + dial a discovered peer.
+//! - `mouserd target`   - receive-only connection: accept + inject, no input hooks.
+//! - `mouserd connect <host:port>` - direct controller-only connection, no mDNS.
+//! - `mouserd probe <host:port>`   - handshake-only transport check, no capture/inject.
 //!
 //! Discovery itself is platform-agnostic (it lives in the shared `mouser-engine`/
 //! `mouser-net` crates over `mdns-sd`), so the same serve loop runs on every host;
@@ -89,16 +92,12 @@ mod engine {
     }
 
     /// Run the daemon with the host's `injector` and `capture` adapters.
-    ///
-    /// Usage:
-    /// - `mouserd [source|target|auto]` — mDNS auto-discovery (default `auto`).
-    /// - `mouserd connect <host:port>`  — dial an explicit peer (no mDNS) and be the
-    ///   source/controller; useful when mDNS doesn't traverse the network.
-    /// - `mouserd probe <host:port>`    — connect, report the handshake, and exit
-    ///   WITHOUT capturing/injecting (a safe cross-machine transport check).
     pub fn run(injector: Arc<dyn InputInjection>, capture: Box<dyn InputCapture>) {
         let args: Vec<String> = std::env::args().collect();
-        let arg1 = args.get(1).cloned().unwrap_or_else(|| "auto".to_string());
+        let arg1 = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| default_role().to_string());
 
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -114,7 +113,9 @@ mod engine {
         // Direct modes take an explicit peer address and bypass mDNS.
         if arg1 == "probe" || arg1 == "connect" {
             let Some(addr_str) = args.get(2).cloned() else {
-                eprintln!("mouserd: `{arg1}` needs <host:port>, e.g. mouserd {arg1} 192.168.1.230:49970");
+                eprintln!(
+                    "mouserd: `{arg1}` needs <host:port>, e.g. mouserd {arg1} 192.168.1.230:49970"
+                );
                 std::process::exit(1);
             };
             let addr: SocketAddr = match addr_str.parse() {
@@ -138,33 +139,51 @@ mod engine {
             return;
         }
 
+        let role = role_from_arg(&arg1);
         rt.block_on(async move {
-            if let Err(e) = serve(&arg1, injector, capture).await {
+            if let Err(e) = serve(&role, injector, capture).await {
                 eprintln!("mouserd: {e}");
                 std::process::exit(1);
             }
         });
     }
 
+    fn role_from_arg(arg: &str) -> String {
+        match arg {
+            role @ ("auto" | "source" | "target") => role.to_string(),
+            other => {
+                eprintln!("mouserd: unknown role '{other}', using {}", default_role());
+                default_role().to_string()
+            }
+        }
+    }
+
+    fn default_role() -> &'static str {
+        "auto"
+    }
+
     /// Connect to an explicit peer (TrustOnFirstUse) and report the handshake, then
-    /// exit — a safe transport check that never captures or injects input.
+    /// exit - a safe transport check that never captures or injects input.
     async fn probe(addr: SocketAddr) -> Result<(), String> {
         let me = DeviceIdentity::generate();
         let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
             .map_err(|e| e.to_string())?;
-        eprintln!("mouserd: probing {addr} …");
+        eprintln!("mouserd: probing {addr}...");
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(8),
             endpoint.connect_interactive(&me, addr, PinPolicy::TrustOnFirstUse),
         )
         .await
-        .map_err(|_| format!("timed out connecting to {addr} (no Mouser peer there, or UDP blocked)"))?
+        .map_err(|_| {
+            format!("timed out connecting to {addr} (no Mouser peer there, or UDP blocked)")
+        })?
         .map_err(|e| e.to_string())?;
         let alpn = conn
             .negotiated_alpn()
             .map(|b| String::from_utf8_lossy(&b).into_owned());
         eprintln!(
-            "mouserd: PROBE OK — handshake with {addr} completed; ALPN={alpn:?}; peer_device_id_present={}",
+            "mouserd: PROBE OK - handshake with {addr} completed; ALPN={alpn:?}; \
+             peer_device_id_present={}",
             conn.peer_device_id().is_some()
         );
         conn.shutdown().await;
@@ -183,21 +202,24 @@ mod engine {
         eprintln!("mouserd: device_id {}", me.device_id_base32());
         let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
             .map_err(|e| e.to_string())?;
-        eprintln!("mouserd: dialing {addr} directly…");
+        eprintln!("mouserd: dialing {addr} directly...");
         let conn = endpoint
             .connect_interactive(&me, addr, PinPolicy::TrustOnFirstUse)
             .await
             .map_err(|e| e.to_string())?;
-        let peer = conn.peer_device_id().ok_or("peer did not present a device_id")?;
-        eprintln!("mouserd: connected as source (controller)");
-        let core =
-            EngineCore::new_source(my_id, peer, EdgeLayout::side_by_side(1512, 982, 1920, 1080));
+        let peer = conn
+            .peer_device_id()
+            .ok_or("peer did not present a device_id")?;
+        eprintln!("mouserd: connected directly; this machine can control the peer");
+
+        let core = EngineCore::new_source(my_id, peer, source_layout());
         let runtime = Arc::new(RuntimeHandle::start(core, Arc::new(conn), injector));
         let sink: Arc<dyn InputSink> = Arc::new(EngineSink {
             runtime: Arc::clone(&runtime),
         });
         capture.start(sink).map_err(|e| e.to_string())?;
-        eprintln!("mouserd: capturing — move the cursor to the right edge to cross to the peer");
+        eprintln!("mouserd: capture ready - local keys/buttons stay local until edge crossing");
+
         tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
         let _ = capture.stop();
         Ok(())
@@ -212,8 +234,9 @@ mod engine {
         let my_id = me.device_id();
         let my_b32 = me.device_id_base32();
         eprintln!("mouserd: device_id {my_b32}");
+        eprintln!("mouserd: role {role}");
 
-        // One endpoint both accepts (TrustOnFirstUse — trust is the §3 cert pin checked
+        // One endpoint both accepts (TrustOnFirstUse - trust is the §3 cert pin checked
         // against the mDNS-advertised id) and dials.
         let bind = SocketAddr::from(([0, 0, 0, 0], 0));
         let endpoint = InteractiveEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
@@ -230,56 +253,75 @@ mod engine {
             "mouserd: advertising {host_ip}:{iport} as {}",
             advert.instance_name()
         );
-
-        let browser = Browser::browse().map_err(|e| e.to_string())?;
-        eprintln!("mouserd: searching for peers on the local network…");
+        windows_firewall_hint(iport);
 
         // Form exactly one connection per role (whichever side dials/accepts).
-        let (conn, is_source) = match role {
+        // Connection direction only avoids duplicate QUIC sessions; control ability
+        // comes from the selected role below.
+        let (conn, direction) = match role {
             "source" => (
-                dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, true).await?,
-                true,
+                dial_discovered(
+                    &endpoint,
+                    &me,
+                    my_id,
+                    &my_b32,
+                    &Browser::browse().map_err(|e| e.to_string())?,
+                    true,
+                )
+                .await?,
+                "dialed",
             ),
             "target" => (
                 endpoint
                     .accept_interactive()
                     .await
                     .map_err(|e| e.to_string())?,
-                false,
+                "accepted",
             ),
-            _ => tokio::select! {
-                accepted = endpoint.accept_interactive() => (accepted.map_err(|e| e.to_string())?, false),
-                dialed = dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, false) => (dialed?, true),
-            },
+            _ => {
+                let browser = Browser::browse().map_err(|e| e.to_string())?;
+                eprintln!("mouserd: searching for peers on the local network...");
+                tokio::select! {
+                    accepted = endpoint.accept_interactive() => (
+                        accepted.map_err(|e| e.to_string())?,
+                        "accepted"
+                    ),
+                    dialed = dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, false) => (
+                        dialed?,
+                        "dialed"
+                    ),
+                }
+            }
         };
 
-        let peer = conn.peer_device_id().ok_or("peer did not present a device_id")?;
+        let peer = conn
+            .peer_device_id()
+            .ok_or("peer did not present a device_id")?;
+        let can_control = role != "target";
         eprintln!(
-            "mouserd: connected as {}",
-            if is_source {
-                "source (controller)"
+            "mouserd: connected ({direction}); {}",
+            if can_control {
+                "this machine can control the peer"
             } else {
-                "target (controlled)"
+                "receive-only target mode"
             }
         );
 
-        let core = if is_source {
-            EngineCore::new_source(my_id, peer, EdgeLayout::side_by_side(1512, 982, 1920, 1080))
+        let core = if can_control {
+            EngineCore::new_source(my_id, peer, source_layout())
         } else {
             EngineCore::new_target(my_id, peer)
         };
         let runtime = Arc::new(RuntimeHandle::start(core, Arc::new(conn), injector));
 
-        if is_source {
+        if can_control {
             let sink: Arc<dyn InputSink> = Arc::new(EngineSink {
                 runtime: Arc::clone(&runtime),
             });
             capture.start(sink).map_err(|e| e.to_string())?;
-            eprintln!(
-                "mouserd: capturing — move the cursor to the right edge to cross to the peer"
-            );
+            eprintln!("mouserd: capture ready - local keys/buttons stay local until edge crossing");
         } else {
-            eprintln!("mouserd: target ready — injecting input received from the source");
+            eprintln!("mouserd: target ready - injecting input received from the source");
         }
 
         tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
@@ -287,6 +329,33 @@ mod engine {
         // Restore local input (ungrab on Linux / drop the tap on macOS).
         let _ = capture.stop();
         Ok(())
+    }
+
+    fn source_layout() -> EdgeLayout {
+        let (width, height) = local_display_size().unwrap_or((1920, 1080));
+        EdgeLayout::side_by_side(width, height, 1920, 1080)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn local_display_size() -> Option<(i32, i32)> {
+        platform_win::active_display_bounds()
+            .ok()?
+            .into_iter()
+            .next()
+            .map(|display| (display.width, display.height))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn local_display_size() -> Option<(i32, i32)> {
+        platform_mac::active_display_bounds()
+            .into_iter()
+            .next()
+            .map(|display| (display.w.round() as i32, display.h.round() as i32))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local_display_size() -> Option<(i32, i32)> {
+        None
     }
 
     /// Browse mDNS until a dialable peer appears and dial it (device_id-pinned, §3).
@@ -326,10 +395,29 @@ mod engine {
 
     /// Best-effort host display name for the advertisement (advisory only, §4).
     fn hostname() -> String {
-        std::env::var("HOST")
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOST"))
             .or_else(|_| std::env::var("HOSTNAME"))
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "mouser".to_string())
     }
+
+    #[cfg(target_os = "windows")]
+    fn windows_firewall_hint(_iport: u16) {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.into_os_string().into_string().ok())
+            .unwrap_or_else(|| "mouserd.exe".to_string());
+        eprintln!(
+            "mouserd: Windows Firewall must allow inbound UDP for mDNS/QUIC. \
+             If Windows prompts, allow Private networks. If peers do not appear, \
+             run elevated PowerShell:\n  netsh advfirewall firewall add rule \
+             name=\"Mouser daemon UDP\" dir=in action=allow program=\"{exe}\" \
+             protocol=UDP profile=private"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn windows_firewall_hint(_iport: u16) {}
 }

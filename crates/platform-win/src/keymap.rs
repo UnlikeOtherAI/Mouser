@@ -205,9 +205,20 @@ pub fn hid_usage_to_scancode(usage: u16) -> Option<ScanCode> {
 /// instead of maintaining a second source of truth.
 #[must_use]
 pub fn scancode_to_hid_usage(code: u16, extended: bool) -> Option<u16> {
-    supported_hid_usages()
+    let target = ScanCode { code, extended };
+    scancode_usage_in(0x04u16..=0x39, target)
+        .or_else(|| scancode_usage_in(0x3Au16..=0x45, target))
+        .or_else(|| scancode_usage_in(0x49u16..=0x52, target))
+        .or_else(|| scancode_usage_in(0x53u16..=0x63, target))
+        .or_else(|| scancode_usage_in([0x67, 0x85], target))
+        .or_else(|| scancode_usage_in(0xE0u16..=0xE7, target))
+}
+
+fn scancode_usage_in(usages: impl IntoIterator<Item = u16>, target: ScanCode) -> Option<u16> {
+    usages
         .into_iter()
-        .find(|&usage| hid_usage_to_scancode(usage) == Some(ScanCode { code, extended }))
+        .filter(|&usage| usage != 0x32)
+        .find(|&usage| hid_usage_to_scancode(usage) == Some(target))
 }
 
 /// Translate a USB HID Usage (Usage Page 0x07) to a Windows **virtual-key
