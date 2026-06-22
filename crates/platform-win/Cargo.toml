@@ -6,28 +6,29 @@ license.workspace = true
 repository.workspace = true
 
 # NOTE: this crate deliberately does NOT set `[lints] workspace = true`.
-# The workspace forbids `unsafe_code`, but this Windows input-injection skeleton
-# must call Win32 APIs (`SendInput`, `GetCursorPos`, `GetSystemMetrics`) that
-# require `unsafe`. Reconciliation with the core traits (`InputCapture` /
-# `InputInjection`) is a later step. All Windows-only code is cfg-gated so the
-# crate builds as a stub on macOS / Linux (the pure `keymap` module is always
-# compiled and tested).
+# The workspace forbids `unsafe_code`, but this Windows platform adapter must
+# call Win32 APIs (`SendInput`, low-level hooks, `GetCursorPos`,
+# `GetSystemMetrics`) that require `unsafe`. All Windows-only code is cfg-gated
+# so the crate builds as a stub on macOS / Linux (the pure `keymap` module is
+# always compiled and tested).
 
 # `mouser-core` provides the `Clipboard` trait contract the clipboard adapter
-# implements (spec §7.7). The injection skeleton stays trait-free; only the
-# clipboard module (cfg(windows)) uses it, but the dep is platform-neutral.
+# implements (spec §7.7), plus the `InputInjection` / `InputCapture` contracts
+# the Windows adapter implements on Windows.
 [dependencies]
 mouser-core = { path = "../mouser-core" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Shell",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
   "Win32_System_Ole",
+  "Win32_System_Threading",
 ] }
 
 # Example target name is crate-prefixed: examples share one output dir, so a bare

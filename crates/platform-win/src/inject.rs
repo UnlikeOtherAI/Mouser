@@ -1,4 +1,4 @@
-//! Windows input **injection** via `SendInput` — skeleton.
+//! Windows input **injection** via `SendInput`.
 //!
 //! Synthesizes mouse motion, mouse buttons, scroll, and key events through the
 //! Win32 [`SendInput`] API. This is the Windows analogue of `platform-mac`'s
@@ -10,9 +10,8 @@
 //! that rectangle is the **whole virtual desktop** (all monitors). The wire
 //! protocol delivers motion as integer logical pixels in a target *display's*
 //! space (§7.6); [`move_cursor`] takes a pixel point in **virtual-desktop**
-//! coordinates and normalizes it. Mapping a per-display `(display_id, x, y)`
-//! into virtual-desktop pixels is the job of the (future) display-enumeration
-//! layer; this skeleton handles the final normalize+inject hop.
+//! coordinates and normalizes it. [`crate::adapter::WinInjector`] adds the
+//! display-local translation required by `mouser_core::InputInjection`.
 //!
 //! ## Keys use scancodes
 //! [`key`] injects with `KEYEVENTF_SCANCODE` (+ `KEYEVENTF_EXTENDEDKEY` for
@@ -48,7 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::keymap::hid_usage_to_scancode;
 
-/// Mouse buttons this skeleton can synthesize.
+/// Mouse buttons this adapter can synthesize.
 ///
 /// Numeric values mirror the wire `PointerButton.button` field (§7.5):
 /// `0=left, 1=right, 2=middle, 3=back, 4=forward`.
@@ -199,6 +198,26 @@ pub fn move_cursor(x: i32, y: i32) -> Result<(), InjectError> {
     send_mouse(mi)
 }
 
+/// Move the cursor by a relative delta in physical pixels.
+///
+/// This is the pointer-lock / grabbed-pointer path in the core trait. It uses
+/// `MOUSEEVENTF_MOVE` without `MOUSEEVENTF_ABSOLUTE`, so `dx,dy` are interpreted
+/// by Windows as relative mickeys/pixels in the caller's desktop.
+///
+/// # Errors
+/// [`InjectError::SendInput`] if the event was not queued.
+pub fn move_cursor_relative(dx: i32, dy: i32) -> Result<(), InjectError> {
+    let mi = MOUSEINPUT {
+        dx,
+        dy,
+        mouseData: 0,
+        dwFlags: MOUSEEVENTF_MOVE,
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    send_mouse(mi)
+}
+
 /// Press (`down = true`) or release (`down = false`) a mouse button at the
 /// current cursor position.
 ///
@@ -237,7 +256,7 @@ fn button_flags(button: Button, down: bool) -> (MOUSE_EVENT_FLAGS, u32) {
 }
 
 /// Scroll-delta unit, mirroring the wire `ScrollUnit` (§7.5 / Appendix C) so this
-/// standalone skeleton needn't depend on `mouser-core`'s platform contract (the
+/// standalone injection layer needn't depend on `mouser-core`'s platform contract (the
 /// engine translates between the two, exactly as [`Button::from_wire`] mirrors the
 /// wire button codes).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

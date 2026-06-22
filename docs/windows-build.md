@@ -7,20 +7,21 @@ engine model, the UIPI / secure-desktop limits, the optional signed `uiAccess`
 helper, packaging, and the acceptance test.
 
 > **Status.** The Windows input path lives in
-> [`crates/platform-win`](../crates/platform-win) — a `SendInput` injection
-> **skeleton** (`move_cursor`, `button`, `key`, `scroll`) plus the Windows half
-> of the Appendix B keymap (HID usage → scancode/VK). The daemon
-> (`mouser-engine`) and the Tauri UI (`apps/desktop`) named in
-> [tech-stack.md §8](tech-stack.md) are **not in the workspace yet**; the
-> commands that mention them below are the intended flow and become runnable as
-> those crates land. **What you can run on a Windows box today** is the
-> `platform-win` build + `win_inject_demo` acceptance test (§7).
+> [`crates/platform-win`](../crates/platform-win) — a `SendInput` injector that
+> implements the shared `mouser_core::InputInjection` trait, a low-level
+> keyboard/mouse hook capture adapter implementing `mouser_core::InputCapture`,
+> the Windows half of the Appendix B keymap (HID usage ↔ scancode/VK), and the
+> Win32 clipboard adapter. The Tauri UI (`apps/desktop`) is in the workspace and
+> builds Windows `.msi` / `.exe` bundles. The daemon (`mouser-engine`) is still
+> the missing runtime workstream; until it lands, Windows can build and exercise
+> the platform adapter but cannot join a live Mouser cluster. **What you can run
+> on a Windows box today** is the `platform-win` build + `win_inject_demo`
+> acceptance test (§7), the hook-backed capture adapter, and the desktop
+> settings shell (§4/§6).
 >
-> This code has **not** been executed on Windows by the author (no Windows host
-> was available). It has been *type-checked and clippy-clean against the real
-> `windows` 0.62 bindings* by cross-checking with the `x86_64-pc-windows-gnu`
-> target on macOS (see §8). Real end-to-end execution is the job of whoever runs
-> this on the Windows box — §7 is that test.
+> This adapter has been built, tested, and linted on Windows against the real
+> `windows` 0.62 bindings. Full cross-machine execution still depends on the
+> pending `mouser-engine` runtime; §7 remains the platform acceptance test.
 
 ---
 
@@ -70,7 +71,7 @@ toolchain manually.
 git clone https://github.com/UnlikeOtherAI/Mouser
 cd Mouser
 
-# Build just the Windows input skeleton:
+# Build just the Windows input adapter:
 cargo build -p platform-win
 
 # Unit tests (the Appendix B keymap table; pure logic, runs anywhere):

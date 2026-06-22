@@ -1,4 +1,4 @@
-//! HID Usage (USB HID Usage Page 0x07) → Windows key identifiers.
+//! HID Usage (USB HID Usage Page 0x07) ↔ Windows key identifiers.
 //!
 //! The Mouser wire protocol carries keys as **USB HID Usage IDs on Usage Page
 //! 0x07** (see `docs/communication-interface.md` §7.5 + Appendix B). This module
@@ -20,9 +20,8 @@
 //! A virtual-key fallback ([`hid_usage_to_vk`]) is provided for callers/tests
 //! that prefer VK, but injection ([`crate::inject::key`]) uses scancodes.
 //!
-//! Only the common subset needed for the skeleton is mapped; unmapped usages
-//! return `None`. The full table is filled in when this crate is reconciled with
-//! `mouser-core`'s `InputInjection` trait.
+//! The common keyboard/keypad/modifier set shared with the macOS and Linux
+//! adapters is mapped; unmapped usages return `None`.
 
 /// A Windows physical-key identity: a PS/2 Set 1 **scancode** (the "make" code)
 /// plus whether it lives on the `E0`-prefixed **extended** block.
@@ -195,6 +194,20 @@ pub fn hid_usage_to_scancode(usage: u16) -> Option<ScanCode> {
         _ => return None,
     };
     Some(sc)
+}
+
+/// Reverse of [`hid_usage_to_scancode`]: a Windows PS/2 Set 1 scancode plus
+/// extended-key flag to a USB HID Usage (Usage Page 0x07).
+///
+/// Used by capture (`WH_KEYBOARD_LL`) to report locally-observed keyboard input
+/// in the same physical-key vocabulary the wire protocol uses. The table is
+/// tiny, so a linear scan keeps the reverse path pinned to the injection table
+/// instead of maintaining a second source of truth.
+#[must_use]
+pub fn scancode_to_hid_usage(code: u16, extended: bool) -> Option<u16> {
+    supported_hid_usages()
+        .into_iter()
+        .find(|&usage| hid_usage_to_scancode(usage) == Some(ScanCode { code, extended }))
 }
 
 /// Translate a USB HID Usage (Usage Page 0x07) to a Windows **virtual-key
@@ -430,5 +443,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn reverse_scancode_map_round_trips_supported_usages() {
+        for usage in supported_hid_usages() {
+            let sc = hid_usage_to_scancode(usage);
+            assert!(sc.is_some(), "supported usage {usage:#06x} has no scancode");
+            if let Some(sc) = sc {
+                assert_eq!(scancode_to_hid_usage(sc.code, sc.extended), Some(usage));
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_scancode_disambiguates_extended_twins() {
+        assert_eq!(scancode_to_hid_usage(0x47, false), Some(0x5F)); // KP 7
+        assert_eq!(scancode_to_hid_usage(0x47, true), Some(0x4A)); // Home
+        assert_eq!(scancode_to_hid_usage(0x1D, false), Some(0xE0)); // L Ctrl
+        assert_eq!(scancode_to_hid_usage(0x1D, true), Some(0xE4)); // R Ctrl
     }
 }

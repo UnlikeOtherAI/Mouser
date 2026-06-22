@@ -8,7 +8,7 @@
 | `mouser-net` | mDNS, 2-conn QUIC transport, device_id-pinned TLS, keep-alive, cancel-safe recv, keep-newest motion, graceful drain |
 | `platform-mac` | CGEvent inject + capture adapter (impl core traits), suppression, FlagsChanged modifiers, full keymap, display_id |
 | `platform-linux` | uinput inject adapter (impl core traits), HID→evdev keymap (verified on ai@192.168.1.203) |
-| `platform-win` | SendInput skeleton (cfg-stub off-Windows) + docs/windows-build.md |
+| `platform-win` | SendInput `InputInjection` adapter + low-level hook `InputCapture` adapter (monitor routing, relative motion, buttons/keys/scroll) + Win32 clipboard |
 | `apps/ios` | SwiftUI: portrait touchpad+keyboard, landscape full trackpad, Mac-parity gestures+haptics, Local-Network entitlement |
 | `apps/android` | Kotlin/Compose: same layout + gestures + haptics, 8/8 gesture tests, emulator-verified |
 | `apps/desktop` | Tauri v2 + React settings/layout-canvas; Linux CI deps + WebView2 bootstrapper |

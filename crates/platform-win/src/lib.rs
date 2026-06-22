@@ -1,10 +1,10 @@
-//! `platform-win` — Windows input-injection **skeleton** for Mouser.
+//! `platform-win` — Windows platform adapter for Mouser.
 //!
-//! ## Status: de-risking skeleton
-//! Standalone skeleton mirroring `platform-mac` / `platform-linux`. It does
-//! **not** depend on `mouser-core`'s `InputCapture` / `InputInjection` traits
-//! yet — the goal is to prove the `SendInput` injection path before committing
-//! to a trait shape. Reconciliation is a later, separate step.
+//! [`adapter::WinInjector`] implements `mouser_core::InputInjection` over the
+//! `SendInput` backend in [`inject`]. [`adapter::WinCapture`] implements
+//! `mouser_core::InputCapture` with low-level keyboard/mouse hooks. [`keymap`]
+//! is the Windows HID↔scancode/VK table, and [`clipboard`] is the Win32
+//! clipboard adapter.
 //!
 //! It deliberately does **not** set `[lints] workspace = true`: the workspace
 //! forbids `unsafe_code`, but the Windows path calls Win32 (`SendInput`,
@@ -13,8 +13,7 @@
 //! ## What builds where
 //! - [`keymap`] is **platform-neutral pure Rust** (no `windows` dependency), so
 //!   it compiles and its tests run on **every** host — that is how the Windows
-//!   half of Appendix B (HID usage → scancode/VK) is verified on a macOS/Linux
-//!   CI box where the rest of the crate is only a stub.
+//!   half of Appendix B (HID usage → scancode/VK) is verified on every host.
 //! - [`inject`] (the real `SendInput` work) is `#[cfg(target_os = "windows")]`.
 //!   On non-Windows hosts only [`UNSUPPORTED`] is compiled, so
 //!   `cargo build -p platform-win` succeeds everywhere.
@@ -27,8 +26,9 @@
 //!   cannot reach. In both cases events are silently dropped (no error). The
 //!   adapter surfaces this as `CapState::SecureContext` /
 //!   `BlockedReason::SecureDesktop` (§7.4) and returns ownership to the source.
-//! - **Capture** (future): low-level hooks (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`)
-//!   or Raw Input — not part of this injection skeleton.
+//! - **Capture** (`adapter::WinCapture`): low-level hooks (`WH_KEYBOARD_LL` /
+//!   `WH_MOUSE_LL`) observe local keyboard, pointer, button, and wheel input and
+//!   can suppress events when the engine returns `CaptureDecision::Suppress`.
 //!
 //! Absolute coordinates are integer logical pixels in the multi-monitor
 //! **virtual-desktop** space, matching the wire protocol's absolute
@@ -50,10 +50,15 @@ pub use keymap::{hid_usage_to_scancode, hid_usage_to_vk, supported_hid_usages, S
 mod cfhtml;
 
 #[cfg(target_os = "windows")]
+pub mod adapter;
+#[cfg(target_os = "windows")]
 pub mod inject;
 #[cfg(target_os = "windows")]
+pub use adapter::{active_display_bounds, display_bounds, DisplayBounds, WinCapture, WinInjector};
+#[cfg(target_os = "windows")]
 pub use inject::{
-    button, cursor_position, key, move_cursor, scroll, Button, InjectError, ScrollUnit,
+    button, cursor_position, key, move_cursor, move_cursor_relative, scroll, Button, InjectError,
+    ScrollUnit,
 };
 
 #[cfg(target_os = "windows")]
