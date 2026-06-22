@@ -23,12 +23,15 @@ class MainActivity : ComponentActivity() {
 
     // Single native bridge for the process. Owned here (not in the Compose tree) so
     // it survives recompositions/orientation changes and its tokio runtime + QUIC
-    // connection live for the activity's lifetime.
-    private val mouser = MouserClient()
+    // connection live for the activity's lifetime. Built via `create` so it restores
+    // the persisted identity seed (stable device_id across launches, parity with iOS).
+    private val mouser by lazy { MouserClient.create(this) }
     // LAN peer discovery (NsdManager). Owned here for the same reason; its browse
     // session + multicast lock are driven by the session's foreground/background hooks.
     private val discovery by lazy { PeerDiscovery(this) }
-    private val session by lazy { CompanionSession(mouser, discovery) }
+    // Persists the last connected device for once-per-launch auto-reconnect (iOS parity).
+    private val lastDevice by lazy { LastDeviceStore(this) }
+    private val session by lazy { CompanionSession(mouser, discovery, lastDevice) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

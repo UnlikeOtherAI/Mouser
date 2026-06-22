@@ -1,5 +1,8 @@
 package ai.unlikeother.mouser.companion
 
+import android.content.Context
+import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import uniffi.mouser_ffi.MobileClient
 import uniffi.mouser_ffi.MobileException
@@ -25,9 +28,18 @@ import kotlin.math.roundToInt
  *
  * Discovery and pairing are out of scope here (parity with iOS / the FFI doc):
  * [connect] takes an explicit host/port + the peer's base32 `device_id`.
+ *
+ * Identity persistence (parity with the iOS `MouserClient` + `IdentityStore`): build
+ * the production client with [create], which restores the persisted seed (stable
+ * `device_id` across launches) or generates + persists a fresh one on first run.
+ *
+ * @param client the native bridge (injected so tests can pass a fresh in-memory one).
+ * @param deviceName this controller's display name, sent to the desktop on [connect]
+ *   so its pairing prompt can identify us.
  */
 class MouserClient(
-    private val client: MobileClient = MobileClient()
+    private val client: MobileClient = MobileClient(),
+    private val deviceName: String = DEFAULT_DEVICE_NAME,
 ) {
     /** Virtual absolute cursor the relative gesture deltas integrate into. Starts
      *  centred in the engine's large virtual span so ordinary motion never clamps. */
@@ -47,7 +59,8 @@ class MouserClient(
     fun connect(host: String, port: Int, peerDeviceIdBase32: String): Result<Unit> = runCatching {
         cursorX = VIRTUAL_CENTER
         cursorY = VIRTUAL_CENTER
-        client.connect(host, port.toUShort(), peerDeviceIdBase32)
+        // Announce our display name so the desktop's pairing prompt can name us (§7.4).
+        client.connect(host, port.toUShort(), peerDeviceIdBase32, deviceName)
     }.onFailure { Log.w(TAG, "connect failed", it) }
 
     /** Tear down the session (idempotent). */
@@ -112,21 +125,52 @@ class MouserClient(
         }
     }
 
-    private companion object {
-        const val TAG = "MouserClient"
+    companion object {
+        private const val TAG = "MouserClient"
 
         // §7.5 pointer button indices.
-        const val BUTTON_LEFT = 0
-        const val BUTTON_RIGHT = 1
+        private const val BUTTON_LEFT = 0
+        private const val BUTTON_RIGHT = 1
 
-        val NO_MODS: UShort = 0u
+        private val NO_MODS: UShort = 0u
 
         // Mirrors mouser-ffi VIRTUAL_SPAN (1 << 20); the deltas integrate inside it.
-        const val VIRTUAL_SPAN = 1 shl 20
-        const val VIRTUAL_CENTER = VIRTUAL_SPAN / 2
+        private const val VIRTUAL_SPAN = 1 shl 20
+        private const val VIRTUAL_CENTER = VIRTUAL_SPAN / 2
+
+        /** Fallback display name when no [Context] is available (e.g. in tests). */
+        private const val DEFAULT_DEVICE_NAME = "Mouser companion"
+
+        /**
+         * Build the production client: restore the persisted identity seed so the
+         * `device_id` (and the desktop's trust of this phone) survives an app restart,
+         * else generate a fresh identity and persist it. Mirrors the iOS `MouserClient`
+         * init + `IdentityStore`. The resolved display name is sent on every [connect].
+         */
+        fun create(context: Context): MouserClient {
+            val store = IdentityStore(context)
+            val seed = store.load()
+            val native = if (seed != null) {
+                MobileClient.fromSeed(seed)
+            } else {
+                MobileClient().also { runCatching { store.save(it.identitySeed()) } }
+            }
+            return MouserClient(native, deviceName(context))
+        }
+
+        /**
+         * This device's user-visible name for the desktop's pairing prompt: the
+         * user-set `Settings.Global.DEVICE_NAME` when available, else [Build.MODEL].
+         */
+        private fun deviceName(context: Context): String {
+            val configured = runCatching {
+                Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
+            }.getOrNull()
+            return configured?.takeIf { it.isNotBlank() } ?: Build.MODEL ?: DEFAULT_DEVICE_NAME
+        }
 
         /** Minimal USB HID Usage Page 0x07 map for the capture field's ASCII subset. */
-        fun hidUsageFor(ch: Char): UShort? = when (ch) {
+        private fun hidUsageFor(ch: Char): UShort? = when (ch) {
             in 'a'..'z' -> (0x04 + (ch - 'a')).toUShort()
             in 'A'..'Z' -> (0x04 + (ch - 'A')).toUShort()
             in '1'..'9' -> (0x1E + (ch - '1')).toUShort()

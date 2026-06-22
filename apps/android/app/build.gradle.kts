@@ -76,6 +76,10 @@ dependencies {
     // to the train the lifecycle artifacts already pull in transitively, made
     // explicit so the discovery code doesn't depend on a transitive coordinate.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    // EncryptedSharedPreferences for the persisted FFI identity seed (Android parity
+    // of the iOS Keychain IdentityStore): the seed is private key material, so it is
+    // wrapped by a Keystore-backed master key rather than stored as cleartext prefs.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")

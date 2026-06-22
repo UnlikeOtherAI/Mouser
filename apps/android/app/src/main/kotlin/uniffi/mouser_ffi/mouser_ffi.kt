@@ -748,6 +748,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_mouser_ffi_checksum_method_mobileclient_disconnect(): Int
 
+    external fun uniffi_mouser_ffi_checksum_method_mobileclient_identity_seed(): Int
+
     external fun uniffi_mouser_ffi_checksum_method_mobileclient_is_connected(): Int
 
     external fun uniffi_mouser_ffi_checksum_method_mobileclient_send_button(): Int
@@ -757,6 +759,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_mouser_ffi_checksum_method_mobileclient_send_pointer_moved(): Int
 
     external fun uniffi_mouser_ffi_checksum_method_mobileclient_send_scroll(): Int
+
+    external fun uniffi_mouser_ffi_checksum_constructor_mobileclient_from_seed(): Int
 
     external fun uniffi_mouser_ffi_checksum_constructor_mobileclient_new(): Int
 
@@ -783,6 +787,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_mouser_ffi_fn_constructor_mobileclient_from_seed(
+        `seed`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
     external fun uniffi_mouser_ffi_fn_constructor_mobileclient_new(uniffi_out_err: UniffiRustCallStatus): Long
 
     external fun uniffi_mouser_ffi_fn_method_mobileclient_connect(
@@ -790,6 +799,7 @@ internal object UniffiLib {
         `host`: RustBuffer.ByValue,
         `port`: Short,
         `peerDeviceIdBase32`: RustBuffer.ByValue,
+        `name`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -802,6 +812,11 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+
+    external fun uniffi_mouser_ffi_fn_method_mobileclient_identity_seed(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun uniffi_mouser_ffi_fn_method_mobileclient_is_connected(
         `ptr`: Long,
@@ -1052,13 +1067,16 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_mouser_ffi_checksum_method_mobileclient_connect() != 52991) {
+    if (lib.uniffi_mouser_ffi_checksum_method_mobileclient_connect() != 49157) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mouser_ffi_checksum_method_mobileclient_device_id() != 18976) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mouser_ffi_checksum_method_mobileclient_disconnect() != 61973) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_mouser_ffi_checksum_method_mobileclient_identity_seed() != 33331) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mouser_ffi_checksum_method_mobileclient_is_connected() != 44059) {
@@ -1076,7 +1094,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_mouser_ffi_checksum_method_mobileclient_send_scroll() != 27360) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_mouser_ffi_checksum_constructor_mobileclient_new() != 62635) {
+    if (lib.uniffi_mouser_ffi_checksum_constructor_mobileclient_from_seed() != 31351) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_mouser_ffi_checksum_constructor_mobileclient_new() != 27471) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1416,6 +1437,28 @@ public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
     }
 }
 
+/**
+ * @suppress
+ */
+public object FfiConverterByteArray : FfiConverterRustBuffer<ByteArray> {
+    override fun read(buf: ByteBuffer): ByteArray {
+        val len = buf.getInt()
+        val byteArr = ByteArray(len)
+        buf.get(byteArr)
+        return byteArr
+    }
+
+    override fun allocationSize(value: ByteArray): ULong = 4UL + value.size.toULong()
+
+    override fun write(
+        value: ByteArray,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        buf.put(value)
+    }
+}
+
 // This template implements a class for working with a Rust struct via a handle
 // to the live Rust struct on the other side of the FFI.
 //
@@ -1532,6 +1575,7 @@ public interface MobileClientInterface {
         `host`: kotlin.String,
         `port`: kotlin.UShort,
         `peerDeviceIdBase32`: kotlin.String,
+        `name`: kotlin.String,
     )
 
     /**
@@ -1545,6 +1589,14 @@ public interface MobileClientInterface {
      * Idempotent — disconnecting when not connected is a no-op.
      */
     fun `disconnect`()
+
+    /**
+     * The 32-byte secret seed for this identity. Persist it in the platform keystore
+     * (iOS Keychain / Android Keystore) and restore it via [`MobileClient::from_seed`]
+     * so the `device_id` — and the desktop's trust of this device — survives restarts.
+     * This is private key material; store it securely.
+     */
+    fun `identitySeed`(): kotlin.ByteArray
 
     /**
      * Whether a session is currently active.
@@ -1629,6 +1681,7 @@ open class MobileClient :
 
     /**
      * Create a disconnected client with a fresh identity and a multi-thread runtime.
+     * Prefer [`MobileClient::from_seed`] so the `device_id` is stable across launches.
      */
     constructor() :
         this(
@@ -1725,6 +1778,7 @@ open class MobileClient :
         `host`: kotlin.String,
         `port`: kotlin.UShort,
         `peerDeviceIdBase32`: kotlin.String,
+        `name`: kotlin.String,
     ) = callWithHandle {
         uniffiRustCallWithError(MobileException) { _status ->
             UniffiLib.uniffi_mouser_ffi_fn_method_mobileclient_connect(
@@ -1732,6 +1786,7 @@ open class MobileClient :
                 FfiConverterString.lower(`host`),
                 FfiConverterUShort.lower(`port`),
                 FfiConverterString.lower(`peerDeviceIdBase32`),
+                FfiConverterString.lower(`name`),
                 _status,
             )
         }
@@ -1766,6 +1821,24 @@ open class MobileClient :
                 )
             }
         }
+
+    /**
+     * The 32-byte secret seed for this identity. Persist it in the platform keystore
+     * (iOS Keychain / Android Keystore) and restore it via [`MobileClient::from_seed`]
+     * so the `device_id` — and the desktop's trust of this device — survives restarts.
+     * This is private key material; store it securely.
+     */
+    override fun `identitySeed`(): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_mouser_ffi_fn_method_mobileclient_identity_seed(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
 
     /**
      * Whether a session is currently active.
@@ -1859,10 +1932,22 @@ open class MobileClient :
         }
     }
 
-    /**
-     * @suppress
-     */
-    companion object
+    companion object {
+        /**
+         * Create a client from a persisted 32-byte secret seed (see [`identity_seed`]), so
+         * the device keeps a **stable** `device_id` across launches — required for the
+         * desktop's trust/pairing to survive an app restart. A wrong-length seed falls back
+         * to a fresh identity (the caller should then persist the new [`identity_seed`]).
+         *
+         * [`identity_seed`]: MobileClient::identity_seed
+         */
+        fun `fromSeed`(`seed`: kotlin.ByteArray): MobileClient =
+            FfiConverterTypeMobileClient.lift(
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_mouser_ffi_fn_constructor_mobileclient_from_seed(FfiConverterByteArray.lower(`seed`), _status)
+                },
+            )
+    }
 }
 
 /**

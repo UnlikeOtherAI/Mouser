@@ -13,6 +13,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * App-lifecycle / connection state holder for the companion (audit R2 HIGH:
@@ -39,10 +40,19 @@ import kotlinx.coroutines.flow.asStateFlow
 class CompanionSession(
     private val mouser: MouserClient? = null,
     private val discovery: PeerDiscovery? = null,
+    private val lastDevice: LastDeviceStore? = null,
 ) {
 
     /** Off-main-thread scope for the QUIC dial (connect blocks on the FFI runtime). */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * One-shot guard so we auto-reconnect to the remembered device only **once per
+     * launch** (iOS parity: `didAutoReconnect`). Tapping a chip afterwards still picks
+     * any other device. `Atomic` so the peers-flow collector and a manual tap can't
+     * both fire the auto-reconnect.
+     */
+    private val didAutoReconnect = AtomicBoolean(false)
 
     /**
      * True while the app is in the foreground (resumed). The touchpad's inertia
@@ -68,11 +78,24 @@ class CompanionSession(
     /** The tap-to-connect phase the [PeerSelector] highlights. */
     val connection: StateFlow<ConnectionUiState> = _connection.asStateFlow()
 
+    init {
+        // Watch the live peer list and auto-reconnect to the remembered device the
+        // moment it reappears — once per launch, without auto-selecting anything else
+        // (iOS parity: `autoReconnect(into:)`). Tap-to-connect stays the way to pick a
+        // different computer.
+        discovery?.let { disc ->
+            scope.launch {
+                disc.peers.collect { discovered -> maybeAutoReconnect(discovered) }
+            }
+        }
+    }
+
     /**
      * Dial a discovered peer off the main thread (the FFI `connect` blocks on its
      * tokio runtime). Reflects the phase in [connection] / [isConnected]. A
      * no-op-safe disconnect of any prior session runs first so tapping a second
-     * peer cleanly switches.
+     * peer cleanly switches. On success the peer is remembered for next-launch
+     * auto-reconnect.
      */
     fun connect(peer: DiscoveredPeer) {
         val client = mouser ?: return
@@ -84,8 +107,23 @@ class CompanionSession(
             isConnected = up
             _connection.value =
                 if (up) ConnectionUiState.Connected(peer.id) else ConnectionUiState.Failed(peer.id)
+            if (up) lastDevice?.remember(peer.id)
             Log.d(TAG, "connect ${peer.id} → $up")
         }
+    }
+
+    /**
+     * If the remembered device is in [discovered] and we haven't auto-reconnected this
+     * launch (and aren't already connected), dial it. Guarded so it fires at most once;
+     * a manual tap that already connected short-circuits via [isConnected].
+     */
+    private fun maybeAutoReconnect(discovered: List<DiscoveredPeer>) {
+        if (isConnected) return
+        val lastId = lastDevice?.lastDeviceId ?: return
+        val peer = discovered.firstOrNull { it.id == lastId } ?: return
+        if (!didAutoReconnect.compareAndSet(false, true)) return
+        Log.d(TAG, "auto-reconnect to remembered $lastId")
+        connect(peer)
     }
 
     /**
