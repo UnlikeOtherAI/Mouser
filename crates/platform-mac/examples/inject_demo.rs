@@ -8,11 +8,7 @@
 //!
 //! Run: `cargo run -p platform-mac --example inject_demo`
 
-use std::thread::sleep;
-use std::time::Duration;
-
-use platform_mac::{cursor_position, left_click, main_display_bounds, move_cursor};
-
+#[cfg(target_os = "macos")]
 fn fmt_pos(p: Option<core_graphics::geometry::CGPoint>) -> String {
     match p {
         Some(p) => format!("({:.1}, {:.1})", p.x, p.y),
@@ -20,7 +16,13 @@ fn fmt_pos(p: Option<core_graphics::geometry::CGPoint>) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    use platform_mac::{cursor_position, left_click, main_display_bounds, move_cursor};
+
     let bounds = main_display_bounds();
     println!(
         "main display: id={} bounds=({:.0},{:.0}) {:.0}x{:.0}",
@@ -83,4 +85,9 @@ fn main() {
         );
         std::process::exit(2);
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("inject_demo is macOS-only; nothing to do on this host.");
 }

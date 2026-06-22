@@ -18,15 +18,16 @@
 //! - A **fully automated drop into Finder cannot be injected headlessly** — it needs a
 //!   GUI login session and, for the remote inject side, TCC Accessibility.
 
-use std::fs;
-use std::path::PathBuf;
-
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::NSPoint;
-use platform_mac::{begin_file_drag, read_dragged_file_urls, write_file_urls};
-
+#[cfg(target_os = "macos")]
 fn main() {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    use objc2_foundation::NSPoint;
+    use platform_mac::{begin_file_drag, read_dragged_file_urls, write_file_urls};
+
     let Some(mtm) = MainThreadMarker::new() else {
         eprintln!("RESULT: not on the main thread — AppKit drag is main-thread-only.");
         std::process::exit(2);
@@ -99,4 +100,9 @@ fn main() {
         eprintln!("RESULT: pasteboard round-trip failed — see output above");
         std::process::exit(2);
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("drag_demo is macOS-only; nothing to do on this host.");
 }
