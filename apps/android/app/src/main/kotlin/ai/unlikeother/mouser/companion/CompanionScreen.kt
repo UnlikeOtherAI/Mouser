@@ -26,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -83,6 +84,10 @@ fun CompanionScreen(
     LifecycleEventEffect(Lifecycle.Event.ON_STOP) { session.onStop() }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { session.onResume() }
 
+    // Live LAN peers + tap-to-connect phase, collected lifecycle-aware.
+    val peers by session.peers.collectAsStateWithLifecycle()
+    val connection by session.connection.collectAsStateWithLifecycle()
+
     val isLandscape =
         LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
@@ -107,7 +112,10 @@ fun CompanionScreen(
                 isForeground = session.isForeground,
                 tab = tab,
                 onTabChange = { tab = it },
-                clipboard = clipboard
+                clipboard = clipboard,
+                peers = peers,
+                connection = connection,
+                onConnect = session::connect
             )
         }
     }
@@ -143,7 +151,10 @@ private fun PortraitLayout(
     isForeground: Boolean,
     tab: CompanionTab,
     onTabChange: (CompanionTab) -> Unit,
-    clipboard: ClipboardUiState
+    clipboard: ClipboardUiState,
+    peers: List<DiscoveredPeer>,
+    connection: ConnectionUiState,
+    onConnect: (DiscoveredPeer) -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -161,7 +172,10 @@ private fun PortraitLayout(
                 onSelect = onSelect,
                 onEvent = onEvent,
                 isForeground = isForeground,
-                onKey = onKey
+                onKey = onKey,
+                peers = peers,
+                connection = connection,
+                onConnect = onConnect
             )
             // Mac-style wait indicator (mock transfer) + the §7.7 settings section.
             CompanionTab.CLIPBOARD -> ClipboardScreen(
@@ -172,14 +186,20 @@ private fun PortraitLayout(
     }
 }
 
-/** The original touchpad stack: pad, controlling banner, device row, capture field. */
+/**
+ * The original touchpad stack: pad, controlling banner, the discovered-peer
+ * tap-to-connect list, device row, capture field.
+ */
 @Composable
 private fun ColumnScope.TouchpadTab(
     selected: Device,
     onSelect: (Device) -> Unit,
     onEvent: (TouchpadEvent) -> Unit,
     isForeground: Boolean,
-    onKey: (Char) -> Unit
+    onKey: (Char) -> Unit,
+    peers: List<DiscoveredPeer>,
+    connection: ConnectionUiState,
+    onConnect: (DiscoveredPeer) -> Unit
 ) {
     TouchpadSurface(
         deviceName = selected.displayName,
@@ -191,6 +211,8 @@ private fun ColumnScope.TouchpadTab(
     )
     Spacer(modifier = Modifier.height(12.dp))
     ControllingBanner(deviceName = selected.displayName)
+    Spacer(modifier = Modifier.height(12.dp))
+    PeerSelector(peers = peers, connection = connection, onConnect = onConnect)
     Spacer(modifier = Modifier.height(12.dp))
     DeviceSelectorRow(selected = selected, onSelect = onSelect)
     Spacer(modifier = Modifier.height(12.dp))

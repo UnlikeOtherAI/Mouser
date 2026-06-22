@@ -25,7 +25,10 @@ class MainActivity : ComponentActivity() {
     // it survives recompositions/orientation changes and its tokio runtime + QUIC
     // connection live for the activity's lifetime.
     private val mouser = MouserClient()
-    private val session = CompanionSession(mouser)
+    // LAN peer discovery (NsdManager). Owned here for the same reason; its browse
+    // session + multicast lock are driven by the session's foreground/background hooks.
+    private val discovery by lazy { PeerDiscovery(this) }
+    private val session by lazy { CompanionSession(mouser, discovery) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
