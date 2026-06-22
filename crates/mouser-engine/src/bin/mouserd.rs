@@ -2,9 +2,10 @@
 //!
 //! v1 single-peer bring-up: **auto-discover a peer over mDNS** (`_mouser._udp.local`,
 //! §4), establish the device_id-pinned interactive QUIC connection (§3), and run the
-//! [`mouser_engine`] runtime wired to the host's real capture/injection adapters.
-//! On macOS that is `platform-mac` (`MacCapture` + `MacInjector`); on Windows it is
-//! `platform-win` (`WinCapture` + `WinInjector`).
+//! [`mouser_engine`] runtime wired to the host's real capture/injection adapters:
+//! - macOS → `platform-mac` (`MacCapture` + `MacInjector`),
+//! - Windows → `platform-win` (`WinCapture` + `WinInjector`),
+//! - Linux → `platform-linux` (`LinuxCapture` + `UinputInjector`).
 //!
 //! Usage:
 //! - `mouserd`          — auto: advertise + browse; the lower device_id becomes source.
@@ -12,31 +13,57 @@
 //! - `mouserd target`   — be the controlled screen (accept + inject).
 //!
 //! Discovery itself is platform-agnostic (it lives in the shared `mouser-engine`/
-//! `mouser-net` crates over `mdns-sd`). The §5 SAS pairing UI, CRDT layout, and
-//! Tauri/IPC sit above.
+//! `mouser-net` crates over `mdns-sd`), so the same serve loop runs on every host;
+//! only the concrete capture/injection adapters differ per OS (selected in `main`).
+//! The §5 SAS pairing UI, CRDT layout, and Tauri/IPC sit above.
 
 fn main() {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        desktop::run();
+        let injector = std::sync::Arc::new(platform_mac::adapter::MacInjector::new());
+        let capture = platform_mac::adapter::MacCapture::new();
+        engine::run(injector, Box::new(capture));
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        let injector = match platform_linux::UinputInjector::new() {
+            Ok(inj) => std::sync::Arc::new(inj),
+            Err(e) => {
+                eprintln!(
+                    "mouserd: cannot open /dev/uinput ({e}); add the user to the \
+                     `input` group (or run as root) and relaunch"
+                );
+                std::process::exit(1);
+            }
+        };
+        let capture = platform_linux::LinuxCapture::new();
+        engine::run(injector, Box::new(capture));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let injector = std::sync::Arc::new(platform_win::WinInjector::new());
+        let capture = platform_win::WinCapture::new();
+        engine::run(injector, Box::new(capture));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         eprintln!(
-            "mouserd: this host's platform adapters are not wired into the daemon yet. \
-             The engine library is platform-agnostic."
+            "mouserd: this host's platform adapters are not wired into the daemon yet \
+             (macOS, Windows and Linux are supported). The engine library is platform-agnostic."
         );
         std::process::exit(1);
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-mod desktop {
+/// Platform-agnostic daemon flow, parameterized over the host's concrete
+/// capture/injection adapters (the only per-OS difference).
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod engine {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
     use mouser_core::platform::{
-        CaptureDecision as CoreDecision, InputCapture, InputSink, LocalInputEvent,
+        CaptureDecision as CoreDecision, InputCapture, InputInjection, InputSink, LocalInputEvent,
     };
     use mouser_core::DeviceId;
     use mouser_engine::core::CaptureDecision;
@@ -45,16 +72,6 @@ mod desktop {
         Advertiser, Browser, DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PeerEvent,
         PinPolicy,
     };
-
-    #[cfg(target_os = "macos")]
-    use platform_mac::adapter::{MacCapture as PlatformCapture, MacInjector as PlatformInjector};
-    #[cfg(target_os = "windows")]
-    use platform_win::{WinCapture as PlatformCapture, WinInjector as PlatformInjector};
-
-    #[cfg(target_os = "macos")]
-    const DEFAULT_HOSTNAME: &str = "Mac";
-    #[cfg(target_os = "windows")]
-    const DEFAULT_HOSTNAME: &str = "Windows";
 
     /// Bridges the platform capture sink to the engine runtime: every local event is
     /// fed to the core, which decides suppress vs pass-through.
@@ -71,7 +88,8 @@ mod desktop {
         }
     }
 
-    pub fn run() {
+    /// Run the daemon with the host's `injector` and `capture` adapters.
+    pub fn run(injector: Arc<dyn InputInjection>, capture: Box<dyn InputCapture>) {
         let args: Vec<String> = std::env::args().collect();
         // Usage: mouserd [source|target]  (default: auto)
         let role = args.get(1).cloned().unwrap_or_else(|| "auto".to_string());
@@ -88,14 +106,18 @@ mod desktop {
         };
 
         rt.block_on(async move {
-            if let Err(e) = serve(&role).await {
+            if let Err(e) = serve(&role, injector, capture).await {
                 eprintln!("mouserd: {e}");
                 std::process::exit(1);
             }
         });
     }
 
-    async fn serve(role: &str) -> Result<(), String> {
+    async fn serve(
+        role: &str,
+        injector: Arc<dyn InputInjection>,
+        capture: Box<dyn InputCapture>,
+    ) -> Result<(), String> {
         let me = DeviceIdentity::generate();
         let my_id = me.device_id();
         let my_b32 = me.device_id_base32();
@@ -120,7 +142,7 @@ mod desktop {
         );
 
         let browser = Browser::browse().map_err(|e| e.to_string())?;
-        eprintln!("mouserd: searching for peers on the local network...");
+        eprintln!("mouserd: searching for peers on the local network…");
 
         // Form exactly one connection per role (whichever side dials/accepts).
         let (conn, is_source) = match role {
@@ -136,20 +158,12 @@ mod desktop {
                 false,
             ),
             _ => tokio::select! {
-                accepted = endpoint.accept_interactive() => (
-                    accepted.map_err(|e| e.to_string())?,
-                    false
-                ),
-                dialed = dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, false) => (
-                    dialed?,
-                    true
-                ),
+                accepted = endpoint.accept_interactive() => (accepted.map_err(|e| e.to_string())?, false),
+                dialed = dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, false) => (dialed?, true),
             },
         };
 
-        let peer = conn
-            .peer_device_id()
-            .ok_or("peer did not present a device_id")?;
+        let peer = conn.peer_device_id().ok_or("peer did not present a device_id")?;
         eprintln!(
             "mouserd: connected as {}",
             if is_source {
@@ -159,7 +173,6 @@ mod desktop {
             }
         );
 
-        let injector = Arc::new(PlatformInjector::new());
         let core = if is_source {
             EngineCore::new_source(my_id, peer, EdgeLayout::side_by_side(1512, 982, 1920, 1080))
         } else {
@@ -168,7 +181,6 @@ mod desktop {
         let runtime = Arc::new(RuntimeHandle::start(core, Arc::new(conn), injector));
 
         if is_source {
-            let capture = PlatformCapture::new();
             let sink: Arc<dyn InputSink> = Arc::new(EngineSink {
                 runtime: Arc::clone(&runtime),
             });
@@ -182,6 +194,8 @@ mod desktop {
 
         tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
         eprintln!("mouserd: shutting down");
+        // Restore local input (ungrab on Linux / drop the tap on macOS).
+        let _ = capture.stop();
         Ok(())
     }
 
@@ -203,7 +217,7 @@ mod desktop {
                         continue;
                     };
                     if !force && my_id >= peer_id {
-                        continue;
+                        continue; // the peer (lower id) will dial us; we accept instead
                     }
                     let Some(addr) = discovery::peer_socket_addr(&peer) else {
                         continue;
@@ -222,11 +236,10 @@ mod desktop {
 
     /// Best-effort host display name for the advertisement (advisory only, §4).
     fn hostname() -> String {
-        std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOST"))
+        std::env::var("HOST")
             .or_else(|_| std::env::var("HOSTNAME"))
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_HOSTNAME.to_string())
+            .unwrap_or_else(|| "mouser".to_string())
     }
 }

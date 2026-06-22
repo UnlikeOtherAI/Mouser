@@ -2430,6 +2430,7 @@ dependencies = [
  "mouser-core",
  "mouser-net",
  "mouser-protocol",
+ "platform-linux",
  "platform-mac",
  "platform-win",
  "serde",
