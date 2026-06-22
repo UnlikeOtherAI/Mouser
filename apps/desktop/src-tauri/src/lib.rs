@@ -215,9 +215,7 @@ fn mouserd_exe_name() -> &'static str {
 }
 
 /// Ensure the engine is running: if the IPC socket doesn't already answer, launch the
-/// bundled `mouserd` and keep its handle so [`run`] can stop it on exit. Windows starts
-/// in explicit receive-only target mode, avoiding global capture hooks until the user
-/// explicitly connects.
+/// bundled `mouserd` and keep its handle so [`run`] can stop it on exit.
 fn ensure_engine_running(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -227,9 +225,6 @@ fn ensure_engine_running(app: &tauri::AppHandle) {
         }
         let path = resolve_mouserd(&app);
         let mut command = std::process::Command::new(&path);
-        for arg in mouserd_launch_args() {
-            command.arg(arg);
-        }
         match command.spawn() {
             Ok(child) => {
                 *lock_recover(&app.state::<EngineProcess>().child) = Some(child);
@@ -241,14 +236,6 @@ fn ensure_engine_running(app: &tauri::AppHandle) {
             ),
         }
     });
-}
-
-fn mouserd_launch_args() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["target"]
-    } else {
-        &[]
-    }
 }
 
 /// Peers this app discovered directly over mDNS, keyed by DNS-SD instance fullname.

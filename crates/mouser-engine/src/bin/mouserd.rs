@@ -7,7 +7,7 @@
 //! - Linux   -> `platform-linux` (`LinuxCapture` + `UinputInjector`).
 //!
 //! Usage:
-//! - `mouserd`          - auto on macOS/Linux; receive-only target mode on Windows.
+//! - `mouserd`          - auto mode: advertise + browse; either connected side can control.
 //! - `mouserd auto`     - advertise + browse; either connected side can control.
 //! - `mouserd source`   - controller-only connection: capture + dial a discovered peer.
 //! - `mouserd target`   - receive-only connection: accept + inject, no input hooks.

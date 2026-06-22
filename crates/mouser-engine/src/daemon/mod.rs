@@ -158,15 +158,6 @@ fn handle_local_command(
 }
 
 fn role_from_arg(arg: &str) -> String {
-    #[cfg(target_os = "windows")]
-    if arg == "auto" {
-        eprintln!(
-            "mouserd: Windows auto mode is disabled because low-level capture hooks can \
-             interfere with Bluetooth keyboard/touchpad input; using target mode"
-        );
-        return "target".to_string();
-    }
-
     match arg {
         role @ ("auto" | "source" | "target") => role.to_string(),
         other => {
@@ -177,14 +168,7 @@ fn role_from_arg(arg: &str) -> String {
 }
 
 fn default_role() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        "target"
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        "auto"
-    }
+    "auto"
 }
 
 /// The source-side edge layout, seeded from the local display size when available.
