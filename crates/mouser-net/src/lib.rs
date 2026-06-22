@@ -47,7 +47,7 @@ pub use mouser_core::{DeviceId, DeviceIdentity};
 pub use pin::{DeviceIdPinVerifier, PinPolicy};
 pub use sas::compute_sas;
 pub use tls::ALPN_MOUSER_1;
-pub use transport::{loopback_addr, InteractiveConnection, InteractiveEndpoint};
+pub use transport::{client_bind_for, loopback_addr, InteractiveConnection, InteractiveEndpoint};
 
 /// Errors surfaced by the transport and discovery layers.
 #[derive(Debug, thiserror::Error)]

@@ -248,24 +248,25 @@ impl MobileClient {
         // Synchronous at the boundary: bind the endpoint and drive the async dial on the
         // held runtime. quinn's `Endpoint::client` must be created inside a tokio runtime
         // context, so the bind happens inside `block_on` too (not just the dial).
-        let connection =
-            self.rt.block_on(async {
-                // Ephemeral client-only QUIC endpoint (no listener; the phone dials out).
-                let endpoint = InteractiveEndpoint::bind_client(mouser_net::loopback_addr())
-                    .map_err(|e| MobileError::Bind {
-                        detail: e.to_string(),
-                    })?;
-                let conn = endpoint
-                    .connect_interactive(identity, addr, PinPolicy::Pinned(peer_id))
-                    .await
-                    .map_err(|e| MobileError::Connect {
-                        detail: e.to_string(),
-                    })?;
-                // Announce our display name so the target can label us in its pairing prompt.
-                // Advisory only (trust is the §3 cert pin); failure is non-fatal.
-                let _ = conn.send_control(TYPE_DEVICE_NAME, name.as_bytes()).await;
-                Ok(conn)
-            })?;
+        let connection = self.rt.block_on(async {
+            // Ephemeral client-only QUIC endpoint (no listener; the phone dials out).
+            // Bind the unspecified address of the peer's family so the OS routes
+            // egress out the real interface — a loopback bind cannot reach a LAN peer.
+            let endpoint = InteractiveEndpoint::bind_client(mouser_net::client_bind_for(addr))
+                .map_err(|e| MobileError::Bind {
+                    detail: e.to_string(),
+                })?;
+            let conn = endpoint
+                .connect_interactive(identity, addr, PinPolicy::Pinned(peer_id))
+                .await
+                .map_err(|e| MobileError::Connect {
+                    detail: e.to_string(),
+                })?;
+            // Announce our display name so the target can label us in its pairing prompt.
+            // Advisory only (trust is the §3 cert pin); failure is non-fatal.
+            let _ = conn.send_control(TYPE_DEVICE_NAME, name.as_bytes()).await;
+            Ok(conn)
+        })?;
         let connection = Arc::new(connection);
 
         // Source-mode engine: the peer sits to our "right" in a large virtual space, so

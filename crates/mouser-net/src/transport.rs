@@ -64,6 +64,17 @@ pub fn loopback_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
+/// Wildcard client-bind address matching the destination's family (port 0 →
+/// OS-assigned). A client that dials a LAN/remote peer must bind the *unspecified*
+/// address so the OS routes egress out the right interface — a loopback bind
+/// (`127.0.0.1`) can only reach the same host and silently fails to a remote peer.
+pub fn client_bind_for(dest: SocketAddr) -> SocketAddr {
+    match dest {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0)),
+    }
+}
+
 /// Build the shared [`TransportConfig`] applied to both endpoints (H1, A4).
 fn transport_config() -> Result<Arc<TransportConfig>, NetError> {
     let mut cfg = TransportConfig::default();
@@ -372,5 +383,28 @@ impl Drop for InteractiveConnection {
         // Best-effort graceful close (H6): tell the peer we're gone so it doesn't have
         // to wait out the idle timeout. quinn flushes the CONNECTION_CLOSE on drop.
         self.connection.close(0u32.into(), b"bye");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a client that dials a LAN/remote peer must bind the *unspecified*
+    // address, never loopback — a `127.0.0.1`-bound UDP socket cannot transmit to a
+    // remote host, so the mobile client could never reach a desktop over wifi.
+    #[test]
+    fn client_bind_is_routable_not_loopback() {
+        let v4_peer: SocketAddr = "192.168.1.229:61600".parse().unwrap();
+        let bind = client_bind_for(v4_peer);
+        assert!(bind.ip().is_unspecified(), "{bind} must be unspecified");
+        assert!(!bind.ip().is_loopback(), "{bind} must not be loopback");
+        assert!(bind.is_ipv4(), "IPv4 peer -> IPv4 bind");
+        assert_eq!(bind.port(), 0, "OS-assigned ephemeral port");
+
+        let v6_peer: SocketAddr = "[fe80::1]:61600".parse().unwrap();
+        let bind6 = client_bind_for(v6_peer);
+        assert!(bind6.ip().is_unspecified());
+        assert!(bind6.is_ipv6(), "IPv6 peer -> IPv6 bind");
     }
 }
