@@ -1,6 +1,7 @@
 import { useState } from "react";
+import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { useWorkspace } from "../lib/use-workspace";
-import { osGlyph, osLabel, stateMeta } from "../lib/os-meta";
+import { osIcon, osLabel, stateMeta } from "../lib/os-meta";
 import { cx } from "../lib/cx";
 import type { Peer } from "../lib/types";
 
@@ -51,9 +52,11 @@ export function DevicesSection(): React.JSX.Element {
               className="flex items-center justify-between rounded-xl border border-ink-line bg-ink-card px-4 py-3"
             >
               <div className="flex items-center gap-3">
-                <span aria-hidden="true" className="text-xl">
-                  {osGlyph(device.os)}
-                </span>
+                <FontAwesomeIcon
+                  icon={osIcon(device.os)}
+                  aria-hidden="true"
+                  className="w-5 text-lg text-slate-200"
+                />
                 <div>
                   <p className="text-sm font-semibold text-slate-100">
                     {device.name}
@@ -140,9 +143,11 @@ function PeerRow({
   return (
     <li className="flex items-center justify-between rounded-xl border border-ink-line bg-ink-card px-4 py-3">
       <div className="flex items-center gap-3">
-        <span aria-hidden="true" className="text-xl">
-          {osGlyph(peer.os)}
-        </span>
+        <FontAwesomeIcon
+          icon={osIcon(peer.os)}
+          aria-hidden="true"
+          className="w-5 text-lg text-slate-200"
+        />
         <div>
           <p className="text-sm font-semibold text-slate-100">{peer.name}</p>
           <p className="text-xs text-muted">

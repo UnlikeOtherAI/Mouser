@@ -1,12 +1,20 @@
+import type { IconDefinition } from "@fortawesome/fontawesome-svg-core";
+import {
+  faApple,
+  faLinux,
+  faWindows,
+} from "@fortawesome/free-brands-svg-icons";
+import { faMobileScreen } from "@fortawesome/free-solid-svg-icons";
+
 import type { ConnectionState, OsKind } from "./types";
 
-// Emoji glyphs match the brief's device-rectangle examples
-// (🪟 Windows, 🍎 macOS, 🐧 Linux, 📱 Phone).
-const OS_GLYPH: Record<OsKind, string> = {
-  macos: "🍎",
-  windows: "🪟",
-  linux: "🐧",
-  phone: "📱",
+// Font Awesome brand glyphs for each OS (Apple / Windows / Linux); phone falls back
+// to a solid mobile icon (there is no single mobile brand mark).
+const OS_ICON: Record<OsKind, IconDefinition> = {
+  macos: faApple,
+  windows: faWindows,
+  linux: faLinux,
+  phone: faMobileScreen,
 };
 
 const OS_LABEL: Record<OsKind, string> = {
@@ -16,8 +24,8 @@ const OS_LABEL: Record<OsKind, string> = {
   phone: "Phone",
 };
 
-export function osGlyph(os: OsKind): string {
-  return OS_GLYPH[os];
+export function osIcon(os: OsKind): IconDefinition {
+  return OS_ICON[os];
 }
 
 export function osLabel(os: OsKind): string {

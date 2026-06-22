@@ -1,5 +1,17 @@
-import { osGlyph, osLabel, stateMeta } from "../lib/os-meta";
+import { osIcon, osLabel, stateMeta } from "../lib/os-meta";
 import type { Device } from "../lib/types";
+
+/** The OS brand icon as a scaled SVG `<path>` for the canvas (≈18px, top-left). */
+function OsGlyph({ device }: { device: Device }): React.JSX.Element {
+  const [, height, , , raw] = osIcon(device.os).icon;
+  const path = Array.isArray(raw) ? raw[raw.length - 1] : raw;
+  const scale = 18 / height;
+  return (
+    <g transform={`translate(12, 10) scale(${scale})`}>
+      <path d={path} fill="#e2e8f0" />
+    </g>
+  );
+}
 
 interface DeviceRectProps {
   device: Device;
@@ -72,10 +84,8 @@ export function DeviceRect({
         }
       />
 
-      {/* OS glyph */}
-      <text x={12} y={26} fontSize={18}>
-        {osGlyph(device.os)}
-      </text>
+      {/* OS brand glyph (Font Awesome) */}
+      <OsGlyph device={device} />
 
       {/* Device name */}
       <text
