@@ -169,7 +169,7 @@ async fn next_connection(
                     }
                 }
             }
-            accepted = accept_trusted(endpoint, store) => {
+            accepted = accept_trusted(endpoint, store, bridge) => {
                 match accepted {
                     Ok(conn) => return Some((conn, false)),
                     Err(e) => { eprintln!("mouserd: accept error: {e}"); continue; }
@@ -369,12 +369,15 @@ async fn dial_discovered(
     }
 }
 
-/// Accept inbound connections until the peer id is explicitly trusted locally.
-/// Untrusted peers can complete the transport handshake (so `probe` can discover
-/// their id), but they are closed before the engine runtime can inject anything.
+/// Accept inbound connections until one is from a trusted (or just-approved) peer.
+/// A trusted peer is returned immediately. An untrusted peer triggers an interactive
+/// pairing approval over the UI (holding the connection open while the user confirms the
+/// SAS); on approval the peer is trusted and the same connection returned, otherwise it
+/// is closed. With no UI (headless) an untrusted peer is rejected as before.
 async fn accept_trusted(
     endpoint: &InteractiveEndpoint,
     store: &DaemonStore,
+    bridge: Option<&IpcBridge>,
 ) -> Result<InteractiveConnection, String> {
     loop {
         let conn = endpoint
@@ -390,11 +393,63 @@ async fn accept_trusted(
             return Ok(conn);
         }
 
-        let peer_text = format_device_id(&peer_id);
-        eprintln!(
-            "mouserd: rejected untrusted peer {peer_text}; run `mouserd trust {peer_text}` \
-             on this machine to allow control"
-        );
+        match bridge {
+            Some(bridge) if pair_via_ui(store, bridge, &conn, &peer_id).await? => {
+                return Ok(conn);
+            }
+            Some(_) => {} // denied or timed out
+            None => {
+                let peer_text = format_device_id(&peer_id);
+                eprintln!(
+                    "mouserd: rejected untrusted peer {peer_text}; run \
+                     `mouserd trust {peer_text}` to allow control (no UI to approve)"
+                );
+            }
+        }
         conn.close();
     }
+}
+
+/// How long an inbound pairing request waits for the user's Approve/Deny before closing.
+const PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Clears the pending pairing prompt when dropped, so a request that is decided, times
+/// out, **or** is abandoned (another connection formed first) never leaves a stale modal.
+struct PairingGuard<'a>(&'a IpcBridge);
+
+impl Drop for PairingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clear_pairing();
+    }
+}
+
+/// Drive an inbound pairing approval through the UI: publish the request (peer id + SAS),
+/// wait up to [`PAIRING_TIMEOUT`] for an Approve/Deny matching this peer, and on approval
+/// persist trust. Returns whether the connection was approved.
+async fn pair_via_ui(
+    store: &DaemonStore,
+    bridge: &IpcBridge,
+    conn: &InteractiveConnection,
+    peer_id: &DeviceId,
+) -> Result<bool, String> {
+    let peer_b32 = format_device_id(peer_id);
+    let sas = conn.sas().map_err(|e| e.to_string())?;
+    eprintln!("mouserd: pairing request from {peer_b32}; confirm code {sas}");
+    bridge.request_pairing(peer_b32.clone(), sas);
+    let _guard = PairingGuard(bridge);
+
+    let approved = loop {
+        match tokio::time::timeout(PAIRING_TIMEOUT, bridge.next_pairing_decision()).await {
+            Ok(Some((id, decision))) if id == peer_b32 => break decision,
+            Ok(Some(_)) => continue, // a decision for a different/stale request
+            Ok(None) | Err(_) => break false, // bridge gone, or timed out
+        }
+    };
+    if approved {
+        store.trust_peer(*peer_id).map_err(|e| e.to_string())?;
+        eprintln!("mouserd: paired with {peer_b32}");
+    } else {
+        eprintln!("mouserd: pairing with {peer_b32} not approved");
+    }
+    Ok(approved)
 }

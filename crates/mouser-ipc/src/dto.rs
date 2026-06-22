@@ -101,6 +101,23 @@ pub struct Snapshot {
     pub peers: Vec<PeerDto>,
     /// The current peer connection state.
     pub connection: ConnectionDto,
+    /// A pending inbound pairing request awaiting the user's approval, if any. Set when
+    /// an untrusted peer dials this machine; the UI shows an Approve/Deny prompt with the
+    /// SAS code, and answers with [`Command::ApprovePairing`]/[`Command::DenyPairing`].
+    #[serde(default)]
+    pub pairing: Option<PairingDto>,
+}
+
+/// An inbound pairing request from an untrusted peer that dialed this machine: the peer's
+/// base32 device id and the short authentication string (SAS) to confirm out-of-band (it
+/// is shown identically on both devices, so the user verifies they match before allowing
+/// control).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingDto {
+    /// Base32 device id of the peer requesting control.
+    pub peer_id: String,
+    /// The 6-digit SAS code, shown identically on both ends for verification.
+    pub sas: String,
 }
 
 /// A message the daemon sends to a connected UI client.
@@ -133,6 +150,16 @@ pub enum Command {
     /// a cached snapshot it only rebuilds on its own state changes).
     Trust {
         /// Base32 device id of the peer to trust.
+        peer_id: String,
+    },
+    /// Approve a pending inbound pairing request (trust the peer + accept its connection).
+    ApprovePairing {
+        /// Base32 device id of the peer to approve (matches [`PairingDto::peer_id`]).
+        peer_id: String,
+    },
+    /// Deny a pending inbound pairing request (close the connection, do not trust).
+    DenyPairing {
+        /// Base32 device id of the peer to deny.
         peer_id: String,
     },
     /// Ask the daemon to reply with the current [`Snapshot`] immediately.

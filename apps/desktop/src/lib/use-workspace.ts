@@ -51,11 +51,22 @@ interface RawEngineConnection {
   epoch: number | null;
   error: string | null;
 }
+interface RawEnginePairing {
+  peer_id: string;
+  sas: string;
+}
 interface RawEngineSnapshot {
   engine_running: boolean;
   local_id: string | null;
   peers: RawEnginePeer[];
   connection: RawEngineConnection;
+  pairing: RawEnginePairing | null;
+}
+
+/** A pending inbound pairing request awaiting the user's Approve/Deny. */
+export interface Pairing {
+  peerId: string;
+  sas: string;
 }
 
 // How often we re-poll the engine snapshot over IPC. The daemon pushes snapshots
@@ -148,6 +159,8 @@ export interface Workspace {
   localId: string | null;
   /** True when the daemon's IPC socket is reachable; false means it isn't running. */
   engineRunning: boolean;
+  /** A pending inbound pairing request awaiting Approve/Deny, if any. */
+  pairing: Pairing | null;
   /** True until the real device query resolves (or falls back). */
   loading: boolean;
   /** Ask the engine to connect to a discovered, trusted peer by id. */
@@ -156,6 +169,10 @@ export interface Workspace {
   disconnectPeer: () => Promise<void>;
   /** Pair (trust) a discovered peer on this machine by id. */
   trustPeer: (peerId: string) => Promise<void>;
+  /** Approve a pending inbound pairing request (trust the peer, accept its connection). */
+  approvePairing: (peerId: string) => Promise<void>;
+  /** Deny a pending inbound pairing request. */
+  denyPairing: (peerId: string) => Promise<void>;
 }
 
 async function tauriInvoke(): Promise<
@@ -183,6 +200,7 @@ export function useWorkspace(): Workspace {
   const [connection, setConnection] = useState<EngineConnection>(IDLE_CONNECTION);
   const [localId, setLocalId] = useState<string | null>(null);
   const [engineRunning, setEngineRunning] = useState(false);
+  const [pairing, setPairing] = useState<Pairing | null>(null);
   const [loading, setLoading] = useState(true);
   // Last logged engine/connection signatures, so the poll logs transitions only.
   const lastRunning = useRef<boolean | null>(null);
@@ -246,6 +264,11 @@ export function useWorkspace(): Workspace {
           setLocalId(raw.local_id);
           setPeers(raw.peers.map(toPeer));
           setConnection(toConnection(raw.connection));
+          setPairing(
+            raw.pairing
+              ? { peerId: raw.pairing.peer_id, sas: raw.pairing.sas }
+              : null,
+          );
         } catch {
           // Transient invoke failure — keep the last snapshot.
         }
@@ -297,15 +320,33 @@ export function useWorkspace(): Workspace {
     }
   }, []);
 
+  const approvePairing = useCallback(async (peerId: string): Promise<void> => {
+    const invoke = await tauriInvoke();
+    if (invoke === null) return;
+    // Optimistically clear the prompt; the next poll reflects the engine's real state.
+    setPairing((current) => (current?.peerId === peerId ? null : current));
+    await invoke("approve_pairing", { peerId });
+  }, []);
+
+  const denyPairing = useCallback(async (peerId: string): Promise<void> => {
+    const invoke = await tauriInvoke();
+    if (invoke === null) return;
+    setPairing((current) => (current?.peerId === peerId ? null : current));
+    await invoke("deny_pairing", { peerId });
+  }, []);
+
   return {
     devices,
     peers,
     connection,
     localId,
     engineRunning,
+    pairing,
     loading,
     connectPeer,
     disconnectPeer,
     trustPeer,
+    approvePairing,
+    denyPairing,
   };
 }

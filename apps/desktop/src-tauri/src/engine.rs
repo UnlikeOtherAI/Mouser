@@ -165,7 +165,10 @@ pub fn read_log_tail(path: &Path, max_bytes: usize) -> Result<String, String> {
         Err(e) => return Err(e.to_string()),
     };
     let start = bytes.len().saturating_sub(max_bytes);
-    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+    // `start <= len`, so this slice always exists; `.get` keeps it panic-free for the
+    // workspace's `indexing_slicing` lint.
+    let tail = bytes.get(start..).unwrap_or(&[]);
+    Ok(String::from_utf8_lossy(tail).into_owned())
 }
 
 /// Stop the engine we launched (called on app exit) so we don't orphan the daemon.

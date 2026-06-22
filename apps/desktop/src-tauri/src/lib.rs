@@ -76,6 +76,17 @@ struct EngineSnapshot {
     peers: Vec<EnginePeer>,
     /// Current connection state.
     connection: EngineConnection,
+    /// A pending inbound pairing request awaiting Approve/Deny, if any.
+    pairing: Option<EnginePairing>,
+}
+
+/// A pending inbound pairing request (mirrors [`mouser_ipc::PairingDto`]).
+#[derive(Serialize)]
+struct EnginePairing {
+    /// Base32 device id of the peer requesting control.
+    peer_id: String,
+    /// The 6-digit SAS code, shown identically on both ends for verification.
+    sas: String,
 }
 
 /// A peer as the engine reports it (mirrors [`mouser_ipc::PeerDto`]).
@@ -119,6 +130,7 @@ impl EngineSnapshot {
                 epoch: None,
                 error: None,
             },
+            pairing: None,
         }
     }
 
@@ -147,6 +159,10 @@ impl EngineSnapshot {
                 epoch: snapshot.connection.epoch,
                 error: snapshot.connection.error,
             },
+            pairing: snapshot.pairing.map(|p| EnginePairing {
+                peer_id: p.peer_id,
+                sas: p.sas,
+            }),
         }
     }
 }
@@ -253,15 +269,11 @@ async fn disconnect_peer() -> Result<(), String> {
 }
 
 /// Pair (trust) a discovered peer on this machine by its base32 id, so the engine
-/// will allow a connection to/from it. Runs `mouserd trust <peer-id>`, which writes
-/// the trust pin the running daemon reads fresh on its next check. NOTE: pairing is
-/// mutual — the *other* device must also trust this machine's id (see `local_id` in
-/// the engine snapshot) before a connection can be established (spec §3).
+/// will allow a connection to/from it. Routes through the running daemon so it updates
+/// its trust store AND republishes a fresh snapshot. NOTE: pairing is mutual — the
+/// *other* device must also trust this machine's id before a connection forms (spec §3).
 #[tauri::command]
 async fn trust_peer(peer_id: String) -> Result<(), String> {
-    // Route through the running daemon (not a separate `mouserd trust` process) so it
-    // updates its trust store AND republishes a fresh snapshot — otherwise the UI keeps
-    // showing the peer as "not paired" because the daemon serves a cached snapshot.
     send_command(Command::Trust { peer_id }).await
 }
 
@@ -273,6 +285,20 @@ async fn engine_log(app: tauri::AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || engine::read_log_tail(&path, 128 * 1024))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Approve a pending inbound pairing request: the engine trusts the peer and accepts its
+/// (held-open) connection. `peer_id` is the base32 id from the pairing prompt.
+#[tauri::command]
+async fn approve_pairing(peer_id: String) -> Result<(), String> {
+    send_command(Command::ApprovePairing { peer_id }).await
+}
+
+/// Deny a pending inbound pairing request: the engine closes the connection without
+/// trusting the peer.
+#[tauri::command]
+async fn deny_pairing(peer_id: String) -> Result<(), String> {
+    send_command(Command::DenyPairing { peer_id }).await
 }
 
 /// Open a short-lived IPC client, fetch one snapshot, and close. Commands are rare and
@@ -454,6 +480,8 @@ pub fn run() {
             disconnect_peer,
             trust_peer,
             engine_log,
+            approve_pairing,
+            deny_pairing,
             set_tray_icon_visible
         ])
         .build(tauri::generate_context!())

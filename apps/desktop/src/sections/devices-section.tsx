@@ -16,10 +16,13 @@ export function DevicesSection(): React.JSX.Element {
     connection,
     localId,
     engineRunning,
+    pairing,
     loading,
     connectPeer,
     disconnectPeer,
     trustPeer,
+    approvePairing,
+    denyPairing,
   } = useWorkspace();
 
   // Tracks the peer whose connect/disconnect/pair request is in flight, to disable
@@ -51,6 +54,13 @@ export function DevicesSection(): React.JSX.Element {
 
   return (
     <div className="space-y-3">
+      {pairing ? (
+        <PairingPrompt
+          sas={pairing.sas}
+          onApprove={() => void approvePairing(pairing.peerId)}
+          onDeny={() => void denyPairing(pairing.peerId)}
+        />
+      ) : null}
       <p className="text-sm text-muted">
         This computer is shown below. Other machines running Mouser on your
         network appear here as the engine discovers them.
@@ -242,5 +252,50 @@ function PeerRow({
         </div>
       ) : null}
     </li>
+  );
+}
+
+interface PairingPromptProps {
+  sas: string;
+  onApprove: () => void;
+  onDeny: () => void;
+}
+
+/** Approve/deny prompt for an untrusted device asking to control this machine. The SAS
+ *  code is shown identically on both ends — the user confirms they match before allowing
+ *  control, which both authorizes and authenticates the peer. */
+function PairingPrompt({
+  sas,
+  onApprove,
+  onDeny,
+}: PairingPromptProps): React.JSX.Element {
+  return (
+    <div className="rounded-xl border border-sky-500/50 bg-sky-500/10 px-4 py-3">
+      <p className="text-sm font-semibold text-fg">
+        A device wants to control this computer
+      </p>
+      <p className="mt-1 text-xs text-muted">
+        Allow it only if this code matches the one shown on that device:
+      </p>
+      <p className="my-2 text-center font-mono text-2xl tracking-[0.3em] text-sky-200">
+        {sas}
+      </p>
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onDeny}
+          className="rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-fg hover:bg-ink-line"
+        >
+          Deny
+        </button>
+        <button
+          type="button"
+          onClick={onApprove}
+          className="rounded-lg border border-sky-500/50 bg-sky-500/20 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-500/30"
+        >
+          Allow
+        </button>
+      </div>
+    </div>
   );
 }

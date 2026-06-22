@@ -150,11 +150,10 @@ pub struct MobileClient {
     session: Mutex<Option<Session>>,
 }
 
-#[uniffi::export]
 impl MobileClient {
-    /// Create a disconnected client with a fresh identity and a multi-thread runtime.
-    #[uniffi::constructor]
-    pub fn new() -> Arc<Self> {
+    /// Build a client around `identity` with a small multi-thread runtime (shared by the
+    /// `new`/`from_seed` constructors).
+    fn with_identity(identity: DeviceIdentity) -> Arc<Self> {
         // A small fixed pool: enough for the sender + the three receiver/ticker tasks
         // plus the dial, without spawning one thread per core on a phone.
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -174,10 +173,42 @@ impl MobileClient {
                     .expect("current-thread runtime")
             });
         Arc::new(Self {
-            identity: DeviceIdentity::generate(),
+            identity,
             rt,
             session: Mutex::new(None),
         })
+    }
+}
+
+#[uniffi::export]
+impl MobileClient {
+    /// Create a disconnected client with a fresh identity and a multi-thread runtime.
+    /// Prefer [`MobileClient::from_seed`] so the `device_id` is stable across launches.
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Self::with_identity(DeviceIdentity::generate())
+    }
+
+    /// Create a client from a persisted 32-byte secret seed (see [`identity_seed`]), so
+    /// the device keeps a **stable** `device_id` across launches — required for the
+    /// desktop's trust/pairing to survive an app restart. A wrong-length seed falls back
+    /// to a fresh identity (the caller should then persist the new [`identity_seed`]).
+    ///
+    /// [`identity_seed`]: MobileClient::identity_seed
+    #[uniffi::constructor]
+    pub fn from_seed(seed: Vec<u8>) -> Arc<Self> {
+        let identity = <[u8; 32]>::try_from(seed.as_slice())
+            .map(|s| DeviceIdentity::from_seed(&s))
+            .unwrap_or_else(|_| DeviceIdentity::generate());
+        Self::with_identity(identity)
+    }
+
+    /// The 32-byte secret seed for this identity. Persist it in the platform keystore
+    /// (iOS Keychain / Android Keystore) and restore it via [`MobileClient::from_seed`]
+    /// so the `device_id` — and the desktop's trust of this device — survives restarts.
+    /// This is private key material; store it securely.
+    pub fn identity_seed(&self) -> Vec<u8> {
+        self.identity.secret_seed().to_vec()
     }
 
     /// This device's own `device_id` as base32 (what the peer must pin against). The

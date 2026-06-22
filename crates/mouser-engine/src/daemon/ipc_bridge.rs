@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mouser_core::DeviceId;
 use mouser_ipc::{
-    Command, ConnectionDto, ConnectionStateDto, DeviceDto, PeerDto, Publisher, Server, Snapshot,
+    Command, ConnectionDto, ConnectionStateDto, DeviceDto, PairingDto, PeerDto, Publisher, Server,
+    Snapshot,
 };
 use tokio::sync::mpsc;
 
@@ -39,6 +40,8 @@ struct Shared {
     /// The host-wide discovery registry (one browse for the whole daemon).
     registry: PeerRegistry,
     connection: Mutex<ConnectionDto>,
+    /// A pending inbound pairing request awaiting the user's Approve/Deny, if any.
+    pairing: Mutex<Option<PairingDto>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -54,6 +57,8 @@ pub struct IpcBridge {
     // guard across the `recv().await` without breaking `Send`.
     connect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<ConnectRequest>>,
     disconnect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
+    /// Approve/Deny decisions for pending pairings: `(peer_id base32, approved)`.
+    decision_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, bool)>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -74,6 +79,7 @@ impl IpcBridge {
             },
             registry,
             connection: Mutex::new(ConnectionDto::default()),
+            pairing: Mutex::new(None),
         });
 
         let server = Server::bind(build_snapshot(&shared))
@@ -87,6 +93,7 @@ impl IpcBridge {
 
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
+        let (decision_tx, decision_rx) = mpsc::unbounded_channel();
 
         // The command loop owns the `Server` (it awaits `recv_command`); the bridge
         // and republish loop publish through cloned `Publisher`s, so reporting state
@@ -99,6 +106,7 @@ impl IpcBridge {
                 publisher.clone(),
                 connect_tx,
                 disconnect_tx,
+                decision_tx,
             )),
         ];
 
@@ -107,6 +115,7 @@ impl IpcBridge {
             publisher,
             connect_rx: tokio::sync::Mutex::new(connect_rx),
             disconnect_rx: tokio::sync::Mutex::new(disconnect_rx),
+            decision_rx: tokio::sync::Mutex::new(decision_rx),
             tasks,
         })
     }
@@ -168,6 +177,24 @@ impl IpcBridge {
         self.republish();
     }
 
+    /// Surface a pending inbound pairing request to connected UIs (Approve/Deny prompt).
+    pub fn request_pairing(&self, peer_id: String, sas: String) {
+        *lock(&self.shared.pairing) = Some(PairingDto { peer_id, sas });
+        self.republish();
+    }
+
+    /// Clear the pending pairing request (decided, timed out, or the dialer left).
+    pub fn clear_pairing(&self) {
+        *lock(&self.shared.pairing) = None;
+        self.republish();
+    }
+
+    /// Await the next pairing Approve/Deny decision from a UI: `(peer_id base32, approved)`.
+    pub async fn next_pairing_decision(&self) -> Option<(String, bool)> {
+        let mut guard = self.decision_rx.lock().await;
+        guard.recv().await
+    }
+
     fn republish(&self) {
         self.publisher.publish(build_snapshot(&self.shared));
     }
@@ -216,6 +243,7 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
         local: shared.local.clone(),
         peers,
         connection: lock(&shared.connection).clone(),
+        pairing: lock(&shared.pairing).clone(),
     }
 }
 
@@ -243,6 +271,7 @@ async fn command_loop(
     publisher: Publisher,
     connect_tx: mpsc::UnboundedSender<ConnectRequest>,
     disconnect_tx: mpsc::UnboundedSender<()>,
+    decision_tx: mpsc::UnboundedSender<(String, bool)>,
 ) {
     loop {
         match server.recv_command().await {
@@ -272,6 +301,12 @@ async fn command_loop(
                 },
                 None => eprintln!("mouserd: IPC Trust with invalid peer id: {peer_id}"),
             },
+            Some(Command::ApprovePairing { peer_id }) => {
+                let _ = decision_tx.send((peer_id, true));
+            }
+            Some(Command::DenyPairing { peer_id }) => {
+                let _ = decision_tx.send((peer_id, false));
+            }
             // GetSnapshot is answered by the server; nothing reaches here.
             Some(Command::GetSnapshot) => {}
             None => return, // server dropped
