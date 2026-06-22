@@ -8,10 +8,13 @@ import SwiftUI
 ///   • portrait  → `compact == true`, sits above the native keyboard,
 ///   • landscape → `compact == false`, fills the whole screen (one big trackpad).
 struct TouchpadView: View {
-    let deviceName: String
+    /// The controlled device's name, or `nil` when no peer is connected.
+    let deviceName: String?
     /// True in portrait (shorter readout, idle hint); false in landscape (full
     /// readout, edge-to-edge surface).
     var compact: Bool = true
+
+    private var connected: Bool { deviceName != nil }
 
     @StateObject private var state = TrackpadState()
     /// Injected by `CompanionView`; gates streaming and lets the lifecycle stop
@@ -101,19 +104,32 @@ struct TouchpadView: View {
             Image(systemName: "hand.point.up.left.fill")
                 .font(.system(size: compact ? 30 : 38, weight: .light))
                 .foregroundStyle(.white.opacity(0.30))
-            Text(compact ? "Drag to move \(deviceName)" : "Full-screen trackpad — drag, tap, scroll, pinch")
+            Text(idleHintText)
                 .font(compact ? .subheadline : .headline)
+                .multilineTextAlignment(.center)
                 .foregroundStyle(.white.opacity(0.38))
         }
         .allowsHitTesting(false)
     }
 
+    /// Idle-hint copy: names the controlled device when connected, otherwise says
+    /// so honestly. Landscape keeps the gesture-list hint regardless.
+    private var idleHintText: String {
+        if !compact {
+            return "Full-screen trackpad — drag, tap, scroll, pinch"
+        }
+        if let name = deviceName {
+            return "Drag to move \(name)"
+        }
+        return "Not connected — drag to preview the trackpad"
+    }
+
     /// Small overlay shown in landscape so the screenshot proves "entire screen
-    /// is one touchpad" (requirement §1) while still labelling the target device.
+    /// is one touchpad" (requirement §1) while honestly labelling connection state.
     private var fullScreenBadge: some View {
         HStack(spacing: 8) {
-            Circle().fill(Color.green).frame(width: 7, height: 7)
-            Text("Controlling \(deviceName)")
+            Circle().fill(connected ? Color.green : Color.gray).frame(width: 7, height: 7)
+            Text(deviceName.map { "Controlling \($0)" } ?? "Not connected")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.75))
             Text("· full-screen trackpad")

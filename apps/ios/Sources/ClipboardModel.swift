@@ -91,51 +91,23 @@ struct ClipboardTransfer: Equatable, Identifiable {
 }
 
 /// View-model backing the clipboard UI. Holds the editable settings and the
-/// current in-flight transfer with **mock** state so the views are demonstrable
-/// before networking exists. Once `mouser-ffi` lands, `settings` writes route to
-/// `ClipboardEngine::set_settings` and `transfer` is fed from `engine.progress(hash)`.
+/// current in-flight transfer. `transfer` stays `nil` until a real inbound pull
+/// arrives — once `mouser-ffi` lands, `settings` writes route to
+/// `ClipboardEngine::set_settings` and `transfer` is fed from
+/// `engine.progress(hash)`. No fabricated/demo transfers.
 @MainActor
 final class ClipboardModel: ObservableObject {
     @Published var settings = ClipboardSyncSettings()
     /// The current in-flight inbound transfer, if any (drives the wait indicator).
     @Published private(set) var transfer: ClipboardTransfer?
 
-    private var demoTimer: AnyCancellable?
-
-    // MARK: - Mock transfer (preview/demo only)
-
-    /// Kick off a mock inbound transfer that ticks to completion, so the progress
-    /// indicator can be seen without a real peer. Removed once the engine feeds
-    /// `transfer` from `engine.progress(hash)`.
-    func startMockTransfer(peer: String = "Mac", format: ClipFormat = .png, size: UInt64 = 4_200_000) {
-        guard settings.canReceive else { return }
-        demoTimer?.cancel()
-        transfer = ClipboardTransfer(peer: peer, format: format, receivedBytes: 0, size: size)
-        let step = max(size / 40, 1)
-        demoTimer = Timer.publish(every: 0.08, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in self?.advanceMock(by: step) }
-    }
-
-    private func advanceMock(by step: UInt64) {
-        guard var t = transfer else { return }
-        t.receivedBytes = min(t.receivedBytes + step, t.size)
-        transfer = t
-        if t.isComplete {
-            demoTimer?.cancel()
-            demoTimer = nil
-            // Hold the completed bar briefly, then clear (mirrors the indicator
-            // dismissing once `last` arrives and the hash verifies).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                self?.transfer = nil
-            }
-        }
+    /// Feed a progress update from the engine (single seam for real transfers).
+    func updateTransfer(_ transfer: ClipboardTransfer?) {
+        self.transfer = transfer
     }
 
     /// Clear the indicator (mirrors a failed/aborted pull clearing pending state).
     func clearTransfer() {
-        demoTimer?.cancel()
-        demoTimer = nil
         transfer = nil
     }
 }

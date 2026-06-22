@@ -1,22 +1,33 @@
 import SwiftUI
 
-/// Thin persistent "Controlling: <device>" banner (architecture §9), sitting
-/// between the touchpad and the device-selector row.
+/// Thin persistent status banner (architecture §9), between the touchpad and the
+/// device-selector row. Shows "Controlling: <device>" when a peer is selected, or
+/// an honest "Not connected" state when none has been discovered yet.
 struct ControllingBanner: View {
-    let deviceName: String
+    /// The controlled device's name, or `nil` when not connected to any peer.
+    let deviceName: String?
+
+    private var connected: Bool { deviceName != nil }
 
     var body: some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(Color.green)
+                .fill(connected ? Color.green : Color.gray)
                 .frame(width: 8, height: 8)
-            Text("Controlling: ")
-                .foregroundStyle(.white.opacity(0.6))
-            + Text(deviceName)
-                .foregroundStyle(.white)
-                .bold()
+            if let name = deviceName {
+                Text("Controlling: ")
+                    .foregroundStyle(.white.opacity(0.6))
+                + Text(name)
+                    .foregroundStyle(.white)
+                    .bold()
+            } else {
+                Text("Not connected")
+                    .foregroundStyle(.white.opacity(0.6))
+            }
             Spacer()
-            Image(systemName: "dot.radiowaves.left.and.right")
+            Image(systemName: connected
+                ? "dot.radiowaves.left.and.right"
+                : "antenna.radiowaves.left.and.right.slash")
                 .foregroundStyle(.white.opacity(0.5))
         }
         .font(.footnote)
@@ -28,6 +39,6 @@ struct ControllingBanner: View {
         )
         .accessibilityIdentifier("controlling.banner")
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Controlling \(deviceName)")
+        .accessibilityLabel(deviceName.map { "Controlling \($0)" } ?? "Not connected")
     }
 }

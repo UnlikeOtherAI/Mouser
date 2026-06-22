@@ -13,12 +13,12 @@ import SwiftUI
 ///   • Landscape (`.compact` height): the ENTIRE screen becomes one trackpad
 ///     (no keyboard, no chrome beyond a small overlay) to maximise the surface.
 struct CompanionView: View {
-    @State private var selected: Device = .mac
     @State private var captured: String = ""
     @FocusState private var keyboardFocused: Bool
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.scenePhase) private var scenePhase
 
+    @StateObject private var peers = PeerStore()
     @StateObject private var keyboard = KeyboardObserver()
     @StateObject private var lifecycle = AppLifecycle()
     @StateObject private var clipboard = ClipboardModel()
@@ -95,9 +95,6 @@ struct CompanionView: View {
                 )
         }
         .buttonStyle(.plain)
-        // Long-press demos the in-flight transfer indicator without a peer
-        // (mock); removed once the engine feeds real progress.
-        .onLongPressGesture { clipboard.startMockTransfer(peer: selected.rawValue) }
         .accessibilityIdentifier("clipboard.open")
         .accessibilityLabel("Clipboard settings")
     }
@@ -110,15 +107,15 @@ struct CompanionView: View {
         // BELOW the touchpad rather than floating over it. The touchpad takes all
         // remaining height above.
         VStack(spacing: 12) {
-            TouchpadView(deviceName: selected.rawValue, compact: true)
+            TouchpadView(deviceName: peers.selected?.name, compact: true)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             clipboardChrome
             HStack(spacing: 10) {
-                ControllingBanner(deviceName: selected.rawValue)
+                ControllingBanner(deviceName: peers.selected?.name)
                 clipboardButton
             }
-            DeviceSelectorRow(selected: $selected)
+            DeviceSelectorRow(store: peers)
             captureField
         }
         .padding(.horizontal, 14)
@@ -141,7 +138,7 @@ struct CompanionView: View {
         // while keeping the readout/badge inside the safe area, so we do NOT
         // ignore safe area here — that lets the inner GeometryReader still report
         // the notch insets the overlays need.
-        TouchpadView(deviceName: selected.rawValue, compact: false)
+        TouchpadView(deviceName: peers.selected?.name, compact: false)
             .accessibilityIdentifier("landscape.fullpad")
     }
 
