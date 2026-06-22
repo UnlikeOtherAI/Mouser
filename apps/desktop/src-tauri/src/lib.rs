@@ -258,12 +258,21 @@ async fn disconnect_peer() -> Result<(), String> {
 /// mutual — the *other* device must also trust this machine's id (see `local_id` in
 /// the engine snapshot) before a connection can be established (spec §3).
 #[tauri::command]
-async fn trust_peer(app: tauri::AppHandle, peer_id: String) -> Result<(), String> {
-    let path = engine::resolve_mouserd(&app);
-    tauri::async_runtime::spawn_blocking(move || engine::mouserd_query(&path, &["trust", &peer_id]))
+async fn trust_peer(peer_id: String) -> Result<(), String> {
+    // Route through the running daemon (not a separate `mouserd trust` process) so it
+    // updates its trust store AND republishes a fresh snapshot — otherwise the UI keeps
+    // showing the peer as "not paired" because the daemon serves a cached snapshot.
+    send_command(Command::Trust { peer_id }).await
+}
+
+/// Read the tail of the engine (`mouserd`) log — the daemon's own diagnostics
+/// (discovery, dials, trust checks, capture mode) — for the Diagnostics view.
+#[tauri::command]
+async fn engine_log(app: tauri::AppHandle) -> Result<String, String> {
+    let path = engine::engine_log_path(&app).ok_or("engine log directory unavailable")?;
+    tauri::async_runtime::spawn_blocking(move || engine::read_log_tail(&path, 128 * 1024))
         .await
         .map_err(|e| e.to_string())?
-        .map(|_| ())
 }
 
 /// Open a short-lived IPC client, fetch one snapshot, and close. Commands are rare and
@@ -443,6 +452,7 @@ pub fn run() {
             connect_peer,
             disconnect_peer,
             trust_peer,
+            engine_log,
             set_tray_icon_visible
         ])
         .build(tauri::generate_context!())

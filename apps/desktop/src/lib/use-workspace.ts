@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { logDebug } from "./debug-log";
 import type {
   Device,
   EngineConnection,
@@ -6,6 +7,15 @@ import type {
   OsKind,
   Peer,
 } from "./types";
+
+/** Short id for logs (full ids are long base32 strings). */
+function shortId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
+}
+
+function errMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 
 // Shape returned by the `local_device` Tauri command (src-tauri/src/lib.rs).
 interface RawMonitor {
@@ -174,6 +184,9 @@ export function useWorkspace(): Workspace {
   const [localId, setLocalId] = useState<string | null>(null);
   const [engineRunning, setEngineRunning] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Last logged engine/connection signatures, so the poll logs transitions only.
+  const lastRunning = useRef<boolean | null>(null);
+  const lastConnSig = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -209,6 +222,26 @@ export function useWorkspace(): Workspace {
         try {
           const raw = await invoke<RawEngineSnapshot>("engine_snapshot");
           if (cancelled) return;
+          if (lastRunning.current !== raw.engine_running) {
+            lastRunning.current = raw.engine_running;
+            logDebug(
+              raw.engine_running ? "info" : "error",
+              raw.engine_running
+                ? `engine reachable (${raw.peers.length} peer(s) discovered)`
+                : "engine not reachable over IPC",
+            );
+          }
+          const c = raw.connection;
+          const sig = `${c.state}|${c.peer_id ?? ""}|${c.error ?? ""}`;
+          if (lastConnSig.current !== sig) {
+            lastConnSig.current = sig;
+            const peer = c.peer_id ? ` peer=${shortId(c.peer_id)}` : "";
+            if (c.error) {
+              logDebug("error", `connection failed: ${c.error}`);
+            } else {
+              logDebug("info", `connection: ${c.state}${peer}`);
+            }
+          }
           setEngineRunning(raw.engine_running);
           setLocalId(raw.local_id);
           setPeers(raw.peers.map(toPeer));
@@ -229,19 +262,39 @@ export function useWorkspace(): Workspace {
   const connectPeer = useCallback(async (peerId: string): Promise<void> => {
     const invoke = await tauriInvoke();
     if (invoke === null) return;
-    await invoke("connect_peer", { peerId });
+    logDebug("info", `connect requested → ${shortId(peerId)}`);
+    try {
+      await invoke("connect_peer", { peerId });
+      logDebug("info", "connect command accepted by engine (dialing…)");
+    } catch (e) {
+      logDebug("error", `connect command rejected: ${errMessage(e)}`);
+      throw e;
+    }
   }, []);
 
   const disconnectPeer = useCallback(async (): Promise<void> => {
     const invoke = await tauriInvoke();
     if (invoke === null) return;
-    await invoke("disconnect_peer");
+    logDebug("info", "disconnect requested");
+    try {
+      await invoke("disconnect_peer");
+    } catch (e) {
+      logDebug("error", `disconnect failed: ${errMessage(e)}`);
+      throw e;
+    }
   }, []);
 
   const trustPeer = useCallback(async (peerId: string): Promise<void> => {
     const invoke = await tauriInvoke();
     if (invoke === null) return;
-    await invoke("trust_peer", { peerId });
+    logDebug("info", `pair (trust) requested → ${shortId(peerId)}`);
+    try {
+      await invoke("trust_peer", { peerId });
+      logDebug("info", `paired ${shortId(peerId)} (now trusted on this machine)`);
+    } catch (e) {
+      logDebug("error", `pair failed: ${errMessage(e)}`);
+      throw e;
+    }
   }, []);
 
   return {

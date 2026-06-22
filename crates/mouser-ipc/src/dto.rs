@@ -126,6 +126,15 @@ pub enum Command {
     },
     /// Request the engine tear down the current connection.
     Disconnect,
+    /// Pair (trust) a discovered peer on this machine by base32 id, so the engine
+    /// will allow a connection to/from it. The daemon updates its trust store and
+    /// republishes a fresh snapshot, so the UI reflects the new trust immediately
+    /// (a separate `mouserd trust` process could not, since the running daemon serves
+    /// a cached snapshot it only rebuilds on its own state changes).
+    Trust {
+        /// Base32 device id of the peer to trust.
+        peer_id: String,
+    },
     /// Ask the daemon to reply with the current [`Snapshot`] immediately.
     GetSnapshot,
 }

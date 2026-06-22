@@ -13,6 +13,12 @@ export const NAV_ITEMS: NavItem[] = [
   { id: "security", label: "Security" },
 ];
 
+/** Extra nav entry shown only when the Diagnostics preference is enabled. */
+export const DIAGNOSTICS_NAV_ITEM: NavItem = {
+  id: "diagnostics",
+  label: "Diagnostics",
+};
+
 // Spec defaults, matching `ClipboardSettings::default()` in
 // crates/mouser-clipboard/src/settings.rs (§7.7): sharing on, all formats on,
 // unlimited size, prefer-native on, bidirectional.

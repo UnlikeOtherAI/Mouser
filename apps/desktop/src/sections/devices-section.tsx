@@ -226,18 +226,20 @@ function PeerRow({
         </div>
       </div>
       {!peer.trusted && !connected ? (
-        <p className="mt-2 text-xs text-muted">
-          Pairing is mutual. After you pair here, open Mouser on{" "}
-          <span className="font-medium text-fg">{peer.name}</span> and pair this
-          device
+        <div className="mt-2 rounded-lg border border-ink-line bg-ink px-3 py-2 text-xs text-fg">
+          <p>
+            Pairing is mutual. Tap <span className="font-semibold">Pair</span>{" "}
+            here, then open Mouser on{" "}
+            <span className="font-semibold">{peer.name}</span> and pair this
+            device back before connecting.
+          </p>
           {localId ? (
-            <>
-              {" "}
-              (id <code className="text-fg-strong">{localId}</code>)
-            </>
-          ) : null}{" "}
-          before connecting.
-        </p>
+            <p className="mt-1 text-muted">
+              This device&apos;s id:{" "}
+              <code className="break-all text-fg-strong">{localId}</code>
+            </p>
+          ) : null}
+        </div>
       ) : null}
     </li>
   );

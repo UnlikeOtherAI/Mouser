@@ -90,7 +90,13 @@ impl IpcBridge {
         // never contends with command reception.
         let tasks = vec![
             tokio::spawn(republish_loop(Arc::clone(&shared), publisher.clone())),
-            tokio::spawn(command_loop(server, connect_tx, disconnect_tx)),
+            tokio::spawn(command_loop(
+                server,
+                Arc::clone(&shared),
+                publisher.clone(),
+                connect_tx,
+                disconnect_tx,
+            )),
         ];
 
         Ok(Self {
@@ -225,10 +231,13 @@ async fn republish_loop(shared: Arc<Shared>, publisher: Publisher) {
     }
 }
 
-/// Drain UI commands from the IPC server and forward Connect/Disconnect to the serve
-/// loop. `GetSnapshot` is handled inside the server itself.
+/// Drain UI commands from the IPC server. Forward Connect/Disconnect to the serve
+/// loop; handle Trust inline against the shared store (then republish so the UI sees
+/// the new trust immediately). `GetSnapshot` is handled inside the server itself.
 async fn command_loop(
     mut server: Server,
+    shared: Arc<Shared>,
+    publisher: Publisher,
     connect_tx: mpsc::UnboundedSender<ConnectRequest>,
     disconnect_tx: mpsc::UnboundedSender<()>,
 ) {
@@ -248,6 +257,18 @@ async fn command_loop(
             Some(Command::Disconnect) => {
                 let _ = disconnect_tx.send(());
             }
+            Some(Command::Trust { peer_id }) => match discovery::decode_device_id(&peer_id) {
+                Some(id) => match shared.store.trust_peer(id) {
+                    Ok(()) => {
+                        eprintln!("mouserd: trusted peer {peer_id} (paired via IPC)");
+                        // Rebuild + push so the UI flips the peer to "paired" at once;
+                        // the cached snapshot would otherwise not reflect the new trust.
+                        publisher.publish(build_snapshot(&shared));
+                    }
+                    Err(e) => eprintln!("mouserd: failed to trust peer {peer_id}: {e}"),
+                },
+                None => eprintln!("mouserd: IPC Trust with invalid peer id: {peer_id}"),
+            },
             // GetSnapshot is answered by the server; nothing reaches here.
             Some(Command::GetSnapshot) => {}
             None => return, // server dropped

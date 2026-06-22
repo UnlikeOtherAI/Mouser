@@ -10,6 +10,8 @@ interface GeneralSectionProps {
   onShowTrayIconChange: (next: boolean) => void;
   theme: ThemeChoice;
   onThemeChange: (next: ThemeChoice) => void;
+  showDiagnostics: boolean;
+  onShowDiagnosticsChange: (next: boolean) => void;
 }
 
 /** General application preferences. */
@@ -18,6 +20,8 @@ export function GeneralSection({
   onShowTrayIconChange,
   theme,
   onThemeChange,
+  showDiagnostics,
+  onShowDiagnosticsChange,
 }: GeneralSectionProps): React.JSX.Element {
   // "Launch at login" reflects the real OS autostart state (macOS LaunchAgent,
   // Windows Run key, Linux .desktop) via tauri-plugin-autostart — not local
@@ -118,6 +122,21 @@ export function GeneralSection({
               labelHidden
               checked={autoUpdate}
               onChange={setAutoUpdate}
+            />
+          }
+        />
+      </SectionCard>
+
+      <SectionCard title="Diagnostics">
+        <SettingRow
+          title="Show diagnostics"
+          description="Add a Diagnostics tab with the engine log, discovered peer ids, and a connect/pair activity log — for troubleshooting connections."
+          control={
+            <Toggle
+              label="Show diagnostics"
+              labelHidden
+              checked={showDiagnostics}
+              onChange={onShowDiagnosticsChange}
             />
           }
         />

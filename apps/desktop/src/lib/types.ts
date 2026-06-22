@@ -78,7 +78,8 @@ export type SectionId =
   | "layout"
   | "input"
   | "clipboard"
-  | "security";
+  | "security"
+  | "diagnostics";
 
 export interface NavItem {
   id: SectionId;

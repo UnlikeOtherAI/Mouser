@@ -3,7 +3,9 @@
 //! if it exits), and stops it on quit. Discovery, trust, and the live connection all live
 //! in the engine; the UI reads its state over `mouser_ipc`.
 
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -35,7 +37,7 @@ pub struct EngineProcess {
 
 /// Resolve the bundled `mouserd` engine from the installed app resources, else fall back
 /// to a `mouserd` on `PATH` (dev runs).
-pub fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
+fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(dir) = app.path().resource_dir() {
         let binaries = dir.join("binaries");
         let platform = binaries.join(mouserd_exe_name());
@@ -55,30 +57,6 @@ fn mouserd_exe_name() -> &'static str {
         "mouserd.exe"
     } else {
         "mouserd"
-    }
-}
-
-/// Run a short, blocking `mouserd` subcommand (e.g. `["trust", id]` or `["identity"]`)
-/// with no console window, returning its stdout on success or the stderr/message on
-/// failure. Used for one-shot control actions like pairing a peer.
-pub fn mouserd_query(path: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new(path);
-    for arg in args {
-        command.arg(arg);
-    }
-    // No console flash on Windows; `output()` supplies the piped stdio.
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-    let output = command.output().map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            "mouserd command failed".to_string()
-        } else {
-            stderr
-        })
     }
 }
 
@@ -129,10 +107,19 @@ fn respawn_if_needed(app: &tauri::AppHandle) {
         command.arg(arg);
     }
     // The engine is a headless daemon; detach its stdio and (on Windows) suppress the
-    // console window so it never flashes a terminal when (re)launched.
+    // console window so it never flashes a terminal when (re)launched. Its stderr (the
+    // daemon's own diagnostics: discovery, dials, trust checks, capture mode) is routed
+    // to a log file the Diagnostics view can read, instead of being discarded.
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
+    match engine_log_path(app).and_then(|p| open_log_file(&p)) {
+        Some(file) => {
+            command.stderr(Stdio::from(file));
+        }
+        None => {
+            command.stderr(Stdio::null());
+        }
+    }
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     match command.spawn() {
@@ -145,6 +132,40 @@ fn respawn_if_needed(app: &tauri::AppHandle) {
             path.display()
         ),
     }
+}
+
+/// Path to the file the bundled engine's stderr is routed to (the daemon's own
+/// diagnostics). `None` if the per-app log directory can't be resolved.
+pub fn engine_log_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_log_dir().ok()?;
+    Some(dir.join("mouserd.log"))
+}
+
+/// Open the engine log file for the daemon's stderr, creating the directory and
+/// truncating so each launch starts a fresh log. `None` on any I/O failure (then we
+/// fall back to discarding stderr — logging is best-effort, never fatal).
+fn open_log_file(path: &Path) -> Option<File> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .ok()
+}
+
+/// Read the tail (up to `max_bytes`) of the engine log. Returns an empty string when
+/// the log doesn't exist yet (engine not launched by us / just started).
+pub fn read_log_tail(path: &Path, max_bytes: usize) -> Result<String, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let start = bytes.len().saturating_sub(max_bytes);
+    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
 /// Stop the engine we launched (called on app exit) so we don't orphan the daemon.

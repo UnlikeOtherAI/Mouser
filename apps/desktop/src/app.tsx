@@ -1,12 +1,16 @@
 import { useEffect, useState } from "react";
 import { ClipboardProgress } from "./components/clipboard-progress";
 import { SideNav } from "./components/side-nav";
-import { NAV_ITEMS } from "./lib/mock-data";
+import { DIAGNOSTICS_NAV_ITEM, NAV_ITEMS } from "./lib/mock-data";
 import {
   readTrayIconPreference,
   syncTrayIconPreference,
   writeTrayIconPreference,
 } from "./lib/tray-preference";
+import {
+  readDiagnosticsPreference,
+  writeDiagnosticsPreference,
+} from "./lib/diagnostics-preference";
 import type { ThemeChoice } from "./lib/theme-preference";
 import { useTheme } from "./lib/use-theme";
 import type { ClipboardTransfer, SectionId } from "./lib/types";
@@ -16,6 +20,7 @@ import { LayoutSection } from "./sections/layout-section";
 import { InputSection } from "./sections/input-section";
 import { ClipboardSection } from "./sections/clipboard-section";
 import { SecuritySection } from "./sections/security-section";
+import { DiagnosticsSection } from "./sections/diagnostics-section";
 
 // No in-flight transfers without the engine; live progress arrives over IPC.
 const CLIPBOARD_TRANSFERS: ClipboardTransfer[] = [];
@@ -27,6 +32,7 @@ const SECTION_TITLES: Record<SectionId, string> = {
   input: "Input",
   clipboard: "Clipboard",
   security: "Security",
+  diagnostics: "Diagnostics",
 };
 
 interface GeneralSettingsProps {
@@ -34,6 +40,8 @@ interface GeneralSettingsProps {
   onShowTrayIconChange: (next: boolean) => void;
   theme: ThemeChoice;
   onThemeChange: (next: ThemeChoice) => void;
+  showDiagnostics: boolean;
+  onShowDiagnosticsChange: (next: boolean) => void;
 }
 
 function renderSection(
@@ -48,6 +56,8 @@ function renderSection(
           onShowTrayIconChange={general.onShowTrayIconChange}
           theme={general.theme}
           onThemeChange={general.onThemeChange}
+          showDiagnostics={general.showDiagnostics}
+          onShowDiagnosticsChange={general.onShowDiagnosticsChange}
         />
       );
     case "devices":
@@ -60,6 +70,8 @@ function renderSection(
       return <ClipboardSection />;
     case "security":
       return <SecuritySection />;
+    case "diagnostics":
+      return <DiagnosticsSection />;
   }
 }
 
@@ -67,6 +79,9 @@ function renderSection(
 export function App(): React.JSX.Element {
   const [active, setActive] = useState<SectionId>("layout");
   const [showTrayIcon, setShowTrayIcon] = useState(readTrayIconPreference);
+  const [showDiagnostics, setShowDiagnostics] = useState(
+    readDiagnosticsPreference,
+  );
   const { theme, setTheme } = useTheme();
 
   useEffect(() => {
@@ -82,9 +97,20 @@ export function App(): React.JSX.Element {
     writeTrayIconPreference(next);
   }
 
+  function handleShowDiagnosticsChange(next: boolean): void {
+    setShowDiagnostics(next);
+    writeDiagnosticsPreference(next);
+    // Don't strand the user on a now-hidden tab.
+    if (!next && active === "diagnostics") setActive("devices");
+  }
+
+  const navItems = showDiagnostics
+    ? [...NAV_ITEMS, DIAGNOSTICS_NAV_ITEM]
+    : NAV_ITEMS;
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-ink text-fg">
-      <SideNav items={NAV_ITEMS} active={active} onSelect={setActive} />
+      <SideNav items={navItems} active={active} onSelect={setActive} />
       <main
         id={`panel-${active}`}
         role="tabpanel"
@@ -101,6 +127,8 @@ export function App(): React.JSX.Element {
             onShowTrayIconChange: handleShowTrayIconChange,
             theme,
             onThemeChange: setTheme,
+            showDiagnostics,
+            onShowDiagnosticsChange: handleShowDiagnosticsChange,
           })}
         </div>
       </main>
