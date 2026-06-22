@@ -19,6 +19,7 @@ struct CompanionView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @StateObject private var peers = PeerStore()
+    @StateObject private var browser = PeerBrowser()
     @StateObject private var keyboard = KeyboardObserver()
     @StateObject private var lifecycle = AppLifecycle()
     @StateObject private var clipboard = ClipboardModel()
@@ -28,6 +29,18 @@ struct CompanionView: View {
     /// Landscape on iPhone collapses the height into `.compact`; that is our
     /// signal to go full-screen-trackpad.
     private var isLandscape: Bool { verticalSizeClass == .compact }
+
+    /// Name shown in the "Controlling:" chrome — only when the engine bridge
+    /// reports a live connection, so the banner reflects `mouser.isConnected`
+    /// rather than mere selection.
+    private var controllingName: String? {
+        mouser.isConnected ? peers.selected?.name : nil
+    }
+
+    /// Dial a tapped peer (host/port/device_id resolved by `PeerBrowser`).
+    private func connect(to peer: Peer) {
+        mouser.connect(host: peer.host, port: peer.port, peerId: peer.deviceId)
+    }
 
     var body: some View {
         Group {
@@ -45,7 +58,17 @@ struct CompanionView: View {
         // gone in the full-screen landscape pad. Drive focus straight off the
         // orientation — no timed DispatchQueue hack — on appear and on every
         // orientation change.
-        .onAppear { keyboardFocused = !isLandscape }
+        .onAppear {
+            keyboardFocused = !isLandscape
+            // Start Bonjour/mDNS discovery of computers running mouserd on the LAN.
+            browser.start()
+        }
+        .onDisappear { browser.stop() }
+        // Funnel resolved mDNS peers into the selector store (the single seam where
+        // real discovery results land).
+        .onChange(of: browser.peers) { _, discovered in
+            peers.replace(with: discovered)
+        }
         .onChange(of: isLandscape) { _, nowLandscape in
             keyboardFocused = !nowLandscape
             // Kill any in-flight momentum glide across the orientation switch so a
@@ -113,15 +136,15 @@ struct CompanionView: View {
         // BELOW the touchpad rather than floating over it. The touchpad takes all
         // remaining height above.
         VStack(spacing: 12) {
-            TouchpadView(deviceName: peers.selected?.name, compact: true, client: mouser)
+            TouchpadView(deviceName: controllingName, compact: true, client: mouser)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             clipboardChrome
             HStack(spacing: 10) {
-                ControllingBanner(deviceName: peers.selected?.name)
+                ControllingBanner(deviceName: controllingName)
                 clipboardButton
             }
-            DeviceSelectorRow(store: peers)
+            DeviceSelectorRow(store: peers, onSelect: connect)
             captureField
         }
         .padding(.horizontal, 14)
@@ -144,7 +167,7 @@ struct CompanionView: View {
         // while keeping the readout/badge inside the safe area, so we do NOT
         // ignore safe area here — that lets the inner GeometryReader still report
         // the notch insets the overlays need.
-        TouchpadView(deviceName: peers.selected?.name, compact: false, client: mouser)
+        TouchpadView(deviceName: controllingName, compact: false, client: mouser)
             .accessibilityIdentifier("landscape.fullpad")
     }
 

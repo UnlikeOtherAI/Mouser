@@ -1,11 +1,14 @@
 import SwiftUI
 
 /// Quick device-selection row (brief: "Tap a computer — instant ownership
-/// transfer"). Each tap selects a discovered peer (a real `OwnershipRequest`
-/// once the engine is wired). With no peers discovered yet it shows a "searching"
-/// state instead of fabricated devices.
+/// transfer"). Each tap selects a discovered peer and `onSelect` dials it through
+/// `MouserClient`. With no peers discovered yet it shows a "searching" state
+/// instead of fabricated devices.
 struct DeviceSelectorRow: View {
     @ObservedObject var store: PeerStore
+    /// Invoked when a chip is tapped, after the store records the selection — the
+    /// owner uses it to dial the peer (host/port/device_id) via `MouserClient`.
+    var onSelect: (Peer) -> Void = { _ in }
 
     var body: some View {
         Group {
@@ -47,6 +50,7 @@ struct DeviceSelectorRow: View {
         let isSelected = peer.id == store.selected?.id
         return Button {
             store.select(peer)
+            onSelect(peer)
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: peer.kind.symbolName)
