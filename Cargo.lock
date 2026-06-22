@@ -2618,6 +2618,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouser-mcp"
+version = "0.0.0"
+dependencies = [
+ "mouser-ipc",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mouser-net"
 version = "0.0.0"
 dependencies = [
