@@ -1,5 +1,10 @@
 # Mouser — Build Status
 
+> Current implementation truth table: see
+> [`docs/implementation-audit.md`](implementation-audit.md). This file contains
+> historical build-wave notes and some older readiness statements are now known
+> to be stale or over-broad.
+
 ## On `main` (all gated Codex+Claude PASS, workspace build/test/clippy green)
 | Crate / app | State |
 |-------------|-------|
