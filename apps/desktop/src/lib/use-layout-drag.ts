@@ -1,15 +1,26 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { Device } from "./types";
+import {
+  CANVAS_H,
+  CANVAS_W,
+  canvasToWorld,
+  clampWorldToCanvas,
+  computeViewport,
+  snapToEdges,
+  type Viewport,
+} from "./layout-geometry";
 
-const CANVAS_W = 1000;
-const CANVAS_H = 520;
-const NUDGE = 8;
-const NUDGE_LARGE = 32;
+// Keyboard nudge step, in logical points (world units).
+const NUDGE = 24;
+const NUDGE_LARGE = 96;
+// Pointer-snap pull radius, in canvas px (converted to world units per drag).
+const SNAP_PX = 11;
 
 export interface DragState {
   devices: Device[];
   selectedId: string | null;
   select: (id: string) => void;
+  viewport: Viewport;
   onRectPointerDown: (
     deviceId: string,
     monitorId: string,
@@ -28,38 +39,35 @@ interface ActiveDrag {
   deviceId: string;
   monitorId: string;
   pointerId: number;
-  /** Offset from the rect origin to the pointer, in canvas units. */
-  dx: number;
-  dy: number;
+  /** Grab offset from the rect's world origin to the pointer, in world units. */
+  grabX: number;
+  grabY: number;
   width: number;
   height: number;
 }
 
-/** Maps a client point to canvas-space coordinates for the given <svg>. */
+/** Maps a client point to this <svg>'s canvas-space coordinates. */
 function toCanvasPoint(
   svg: SVGSVGElement,
   clientX: number,
   clientY: number,
 ): { x: number; y: number } {
   const rect = svg.getBoundingClientRect();
-  const x = ((clientX - rect.left) / rect.width) * CANVAS_W;
-  const y = ((clientY - rect.top) / rect.height) * CANVAS_H;
-  return { x, y };
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+  return {
+    x: ((clientX - rect.left) / rect.width) * CANVAS_W,
+    y: ((clientY - rect.top) / rect.height) * CANVAS_H,
+  };
 }
 
 /**
- * Drag + keyboard movement logic for the layout canvas, kept out of the view
- * component. Movement is pointer-driven and also fully keyboard-operable
- * (arrow keys nudge, Shift = larger step) to satisfy the a11y gate.
+ * Drag + keyboard movement for the layout canvas. Positions are tracked in world
+ * (logical-point) units and rendered through a stable viewport, so a screen can
+ * be dropped next to another and it snaps their edges together. Fully
+ * keyboard-operable (arrow keys nudge, Shift = larger step) for the a11y gate.
  */
 export function useLayoutDrag(
   initial: Device[],
   svgRef: React.RefObject<SVGSVGElement | null>,
-  monitorSize: (width: number, height: number) => { w: number; h: number },
 ): DragState {
   const [devices, setDevices] = useState<Device[]>(initial);
   const [selectedId, setSelectedId] = useState<string | null>(
@@ -67,15 +75,23 @@ export function useLayoutDrag(
   );
   const drag = useRef<ActiveDrag | null>(null);
 
-  const moveMonitor = useCallback(
-    (
-      deviceId: string,
-      monitorId: string,
-      x: number,
-      y: number,
-      width: number,
-      height: number,
-    ) => {
+  // Stable for the life of this layout: derived from the initial arrangement so
+  // the viewport doesn't jump while a screen is being dragged.
+  const viewport = useMemo(() => computeViewport(initial), [initial]);
+
+  // World rects of every monitor except the one being dragged — snap targets.
+  const otherRects = useCallback(
+    (skipMonitorId: string) =>
+      devices.flatMap((d) =>
+        d.monitors
+          .filter((m) => m.id !== skipMonitorId)
+          .map((m) => ({ x: m.x, y: m.y, w: m.width, h: m.height })),
+      ),
+    [devices],
+  );
+
+  const setMonitorPos = useCallback(
+    (deviceId: string, monitorId: string, x: number, y: number) => {
       setDevices((prev) =>
         prev.map((d) =>
           d.id !== deviceId
@@ -83,13 +99,7 @@ export function useLayoutDrag(
             : {
                 ...d,
                 monitors: d.monitors.map((m) =>
-                  m.id !== monitorId
-                    ? m
-                    : {
-                        ...m,
-                        x: clamp(x, 0, CANVAS_W - width),
-                        y: clamp(y, 0, CANVAS_H - height),
-                      },
+                  m.id !== monitorId ? m : { ...m, x, y },
                 ),
               },
         ),
@@ -104,16 +114,28 @@ export function useLayoutDrag(
       const svg = svgRef.current;
       if (!active || !svg || event.pointerId !== active.pointerId) return;
       const p = toCanvasPoint(svg, event.clientX, event.clientY);
-      moveMonitor(
-        active.deviceId,
-        active.monitorId,
-        p.x - active.dx,
-        p.y - active.dy,
+      const world = canvasToWorld(p.x, p.y, viewport);
+      const proposed = {
+        x: world.x - active.grabX,
+        y: world.y - active.grabY,
+        w: active.width,
+        h: active.height,
+      };
+      const snapped = snapToEdges(
+        proposed,
+        otherRects(active.monitorId),
+        SNAP_PX / viewport.scale,
+      );
+      const final = clampWorldToCanvas(
+        snapped.x,
+        snapped.y,
         active.width,
         active.height,
+        viewport,
       );
+      setMonitorPos(active.deviceId, active.monitorId, final.x, final.y);
     },
-    [moveMonitor, svgRef],
+    [otherRects, setMonitorPos, svgRef, viewport],
   );
 
   const endDrag = useCallback(() => {
@@ -132,22 +154,22 @@ export function useLayoutDrag(
         const monitor = device?.monitors.find((m) => m.id === monitorId);
         if (!device || !monitor) return;
         setSelectedId(deviceId);
-        const size = monitorSize(monitor.width, monitor.height);
         const p = toCanvasPoint(svg, event.clientX, event.clientY);
+        const world = canvasToWorld(p.x, p.y, viewport);
         drag.current = {
           deviceId,
           monitorId,
           pointerId: event.pointerId,
-          dx: p.x - monitor.x,
-          dy: p.y - monitor.y,
-          width: size.w,
-          height: size.h,
+          grabX: world.x - monitor.x,
+          grabY: world.y - monitor.y,
+          width: monitor.width,
+          height: monitor.height,
         };
         window.addEventListener("pointermove", onPointerMove);
         window.addEventListener("pointerup", endDrag);
         window.addEventListener("pointercancel", endDrag);
       },
-    [devices, endDrag, monitorSize, onPointerMove, svgRef],
+    [devices, endDrag, onPointerMove, svgRef, viewport],
   );
 
   const onRectKeyDown = useCallback(
@@ -182,17 +204,16 @@ export function useLayoutDrag(
         const device = devices.find((d) => d.id === deviceId);
         const monitor = device?.monitors.find((m) => m.id === monitorId);
         if (!device || !monitor) return;
-        const size = monitorSize(monitor.width, monitor.height);
-        moveMonitor(
-          deviceId,
-          monitorId,
+        const final = clampWorldToCanvas(
           monitor.x + dx,
           monitor.y + dy,
-          size.w,
-          size.h,
+          monitor.width,
+          monitor.height,
+          viewport,
         );
+        setMonitorPos(deviceId, monitorId, final.x, final.y);
       },
-    [devices, monitorSize, moveMonitor],
+    [devices, setMonitorPos, viewport],
   );
 
   const reset = useCallback(() => setDevices(initial), [initial]);
@@ -201,6 +222,7 @@ export function useLayoutDrag(
     devices,
     selectedId,
     select: setSelectedId,
+    viewport,
     onRectPointerDown,
     onRectKeyDown,
     canvasWidth: CANVAS_W,

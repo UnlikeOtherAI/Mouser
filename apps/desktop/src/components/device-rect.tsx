@@ -1,9 +1,11 @@
 import { osGlyph, osLabel, stateMeta } from "../lib/os-meta";
-import type { Device, Monitor } from "../lib/types";
+import type { Device } from "../lib/types";
 
 interface DeviceRectProps {
   device: Device;
-  monitor: Monitor;
+  /** Top-left position on the canvas, in canvas px (viewport-transformed). */
+  x: number;
+  y: number;
   width: number;
   height: number;
   selected: boolean;
@@ -24,7 +26,8 @@ interface DeviceRectProps {
  */
 export function DeviceRect({
   device,
-  monitor,
+  x,
+  y,
   width,
   height,
   selected,
@@ -47,7 +50,7 @@ export function DeviceRect({
       tabIndex={0}
       aria-label={`${device.name}, ${osLabel(device.os)}, ${meta.label}, ${device.role}. Use arrow keys to move.`}
       aria-current={selected ? "true" : undefined}
-      transform={`translate(${monitor.x}, ${monitor.y})`}
+      transform={`translate(${x}, ${y})`}
       onPointerDown={onPointerDown}
       onKeyDown={onKeyDown}
       onClick={onSelect}

@@ -1,14 +1,17 @@
 import { useState } from "react";
 import { ClipboardProgress } from "./components/clipboard-progress";
 import { SideNav } from "./components/side-nav";
-import { MOCK_CLIPBOARD_TRANSFERS, NAV_ITEMS } from "./lib/mock-data";
-import type { SectionId } from "./lib/types";
+import { NAV_ITEMS } from "./lib/mock-data";
+import type { ClipboardTransfer, SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";
 import { LayoutSection } from "./sections/layout-section";
 import { InputSection } from "./sections/input-section";
 import { ClipboardSection } from "./sections/clipboard-section";
 import { SecuritySection } from "./sections/security-section";
+
+// No in-flight transfers without the engine; live progress arrives over IPC.
+const CLIPBOARD_TRANSFERS: ClipboardTransfer[] = [];
 
 const SECTION_TITLES: Record<SectionId, string> = {
   general: "General",
@@ -57,7 +60,7 @@ export function App(): React.JSX.Element {
           {renderSection(active)}
         </div>
       </main>
-      <ClipboardProgress transfers={MOCK_CLIPBOARD_TRANSFERS} />
+      <ClipboardProgress transfers={CLIPBOARD_TRANSFERS} />
     </div>
   );
 }

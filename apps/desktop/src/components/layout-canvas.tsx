@@ -1,5 +1,6 @@
-import { useCallback, useRef } from "react";
+import { useRef } from "react";
 import { useLayoutDrag } from "../lib/use-layout-drag";
+import { toCanvasRect } from "../lib/layout-geometry";
 import type { Device } from "../lib/types";
 import { DeviceRect } from "./device-rect";
 
@@ -7,42 +8,27 @@ interface LayoutCanvasProps {
   initialDevices: Device[];
 }
 
-// Scale physical pixels down to canvas units; clamp so a phone is still legible
-// and a 4K panel doesn't dominate.
-const SCALE = 0.12;
-const MIN_W = 90;
-const MIN_H = 60;
-
-function sizeFor(width: number, height: number): { w: number; h: number } {
-  return {
-    w: Math.max(MIN_W, Math.round(width * SCALE)),
-    h: Math.max(MIN_H, Math.round(height * SCALE)),
-  };
-}
-
 /**
- * The Workspace Layout canvas: a large gray surface where each device's
- * monitor is a draggable rectangle (docs/brief.md "Layout Canvas" /
- * "Drag Arrangement"). Pointer drag + arrow-key nudging are both supported.
+ * The Workspace Layout canvas: a gray surface that shows the real display
+ * arrangement (fit to the canvas) where each monitor is a draggable rectangle
+ * (docs/brief.md "Layout Canvas" / "Drag Arrangement"). Dragging snaps screen
+ * edges together; arrow keys nudge a focused screen.
  */
 export function LayoutCanvas({
   initialDevices,
 }: LayoutCanvasProps): React.JSX.Element {
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const monitorSize = useCallback(
-    (w: number, h: number) => sizeFor(w, h),
-    [],
-  );
   const {
     devices,
     selectedId,
     select,
+    viewport,
     onRectPointerDown,
     onRectKeyDown,
     canvasWidth,
     canvasHeight,
     reset,
-  } = useLayoutDrag(initialDevices, svgRef, monitorSize);
+  } = useLayoutDrag(initialDevices, svgRef);
 
   // Stable 1-based badge numbers, by device order.
   const badgeFor = (id: string): number =>
@@ -52,8 +38,8 @@ export function LayoutCanvas({
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
         <p className="text-sm text-muted">
-          Drag a screen to arrange it, or focus one and use the arrow keys
-          (hold Shift for larger steps).
+          Drag a screen to arrange it — edges snap together. Or focus one and use
+          the arrow keys (hold Shift for larger steps).
         </p>
         <button
           type="button"
@@ -89,22 +75,19 @@ export function LayoutCanvas({
               />
             </pattern>
           </defs>
-          <rect
-            width={canvasWidth}
-            height={canvasHeight}
-            fill="url(#grid)"
-          />
+          <rect width={canvasWidth} height={canvasHeight} fill="url(#grid)" />
 
           {devices.flatMap((device) =>
             device.monitors.map((monitor) => {
-              const size = sizeFor(monitor.width, monitor.height);
+              const rect = toCanvasRect(monitor, viewport);
               return (
                 <DeviceRect
                   key={monitor.id}
                   device={device}
-                  monitor={monitor}
-                  width={size.w}
-                  height={size.h}
+                  x={rect.x}
+                  y={rect.y}
+                  width={rect.w}
+                  height={rect.h}
                   selected={device.id === selectedId}
                   badge={badgeFor(device.id)}
                   onSelect={() => select(device.id)}

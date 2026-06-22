@@ -10,15 +10,20 @@ export type ConnectionState = "connected" | "connecting" | "offline";
 
 export type DeviceRole = "coordinator" | "member";
 
-/** A physical monitor attached to a device, placed on the layout canvas. */
+/**
+ * A physical monitor attached to a device, in **logical points** in the global
+ * desktop space — the same coordinate system the OS uses to arrange displays.
+ * The layout canvas fits these to its viewport, so positions may be negative and
+ * screens of different DPI line up 1:1. `x`/`y` is the top-left corner.
+ */
 export interface Monitor {
   id: string;
-  /** Logical resolution; used only to size the rectangle proportionally. */
   width: number;
   height: number;
-  /** Top-left position on the canvas, in canvas pixels. */
   x: number;
   y: number;
+  /** Backing scale factor (2 on Retina); informational. */
+  scale?: number;
 }
 
 /** A connected machine in the workspace. */

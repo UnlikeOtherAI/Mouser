@@ -1,15 +1,24 @@
 import { LayoutCanvas } from "../components/layout-canvas";
-import { MOCK_DEVICES } from "../lib/mock-data";
+import { useWorkspace } from "../lib/use-workspace";
 
 /**
- * Workspace Layout section — the brief's "central visual feature". Hosts the
- * draggable per-monitor canvas. Arrangement is local-only in this pass; it will
- * replicate cluster-wide once the engine is wired.
+ * Workspace Layout section — the brief's "central visual feature". Shows this
+ * machine's real display arrangement on the draggable canvas. Arrangement is
+ * local-only in this pass; it will replicate cluster-wide once the engine wires.
  */
 export function LayoutSection(): React.JSX.Element {
+  const { devices, loading } = useWorkspace();
+
   return (
     <div className="space-y-4">
-      <LayoutCanvas initialDevices={MOCK_DEVICES} />
+      {loading ? (
+        <p className="text-sm text-muted">Detecting displays…</p>
+      ) : (
+        <LayoutCanvas
+          key={devices.map((d) => d.id).join(",")}
+          initialDevices={devices}
+        />
+      )}
     </div>
   );
 }
