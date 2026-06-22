@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use mouser_core::DeviceId;
 use mouser_ipc::{
     Command, ConnectionDto, ConnectionStateDto, DeviceDto, PairingDto, PeerDto, Publisher, Server,
-    Snapshot,
+    SettingsDto, Snapshot,
 };
 use tokio::sync::mpsc;
 
@@ -42,6 +42,9 @@ struct Shared {
     connection: Mutex<ConnectionDto>,
     /// A pending inbound pairing request awaiting the user's Approve/Deny, if any.
     pairing: Mutex<Option<PairingDto>>,
+    /// Daemon-owned, persisted settings, surfaced in every snapshot and updated via
+    /// [`Command::UpdateSettings`] (the single source of truth for UI + MCP).
+    settings: Mutex<SettingsDto>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -70,6 +73,7 @@ impl IpcBridge {
         local_name: String,
         registry: PeerRegistry,
     ) -> Result<Self, String> {
+        let settings = store.load_settings();
         let shared = Arc::new(Shared {
             store,
             local: DeviceDto {
@@ -80,6 +84,7 @@ impl IpcBridge {
             registry,
             connection: Mutex::new(ConnectionDto::default()),
             pairing: Mutex::new(None),
+            settings: Mutex::new(settings),
         });
 
         let server = Server::bind(build_snapshot(&shared))
@@ -244,6 +249,7 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
         peers,
         connection: lock(&shared.connection).clone(),
         pairing: lock(&shared.pairing).clone(),
+        settings: lock(&shared.settings).clone(),
     }
 }
 
@@ -306,6 +312,14 @@ async fn command_loop(
             }
             Some(Command::DenyPairing { peer_id }) => {
                 let _ = decision_tx.send((peer_id, false));
+            }
+            Some(Command::UpdateSettings { settings }) => {
+                if let Err(e) = shared.store.save_settings(&settings) {
+                    eprintln!("mouserd: failed to persist settings: {e}");
+                }
+                *lock(&shared.settings) = settings;
+                // Republish so every connected surface (UI + MCP) reflects it at once.
+                publisher.publish(build_snapshot(&shared));
             }
             // GetSnapshot is answered by the server; nothing reaches here.
             Some(Command::GetSnapshot) => {}

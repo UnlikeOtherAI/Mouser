@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { logDebug } from "./debug-log";
-import type {
-  Device,
-  EngineConnection,
-  EngineConnectionState,
-  OsKind,
-  Peer,
+import {
+  DEFAULT_ENGINE_SETTINGS,
+  type Device,
+  type EngineConnection,
+  type EngineConnectionState,
+  type EngineSettings,
+  type OsKind,
+  type Peer,
 } from "./types";
 
 /** Short id for logs (full ids are long base32 strings). */
@@ -61,6 +63,7 @@ interface RawEngineSnapshot {
   peers: RawEnginePeer[];
   connection: RawEngineConnection;
   pairing: RawEnginePairing | null;
+  settings: EngineSettings;
 }
 
 /** A pending inbound pairing request awaiting the user's Approve/Deny. */
@@ -173,6 +176,10 @@ export interface Workspace {
   approvePairing: (peerId: string) => Promise<void>;
   /** Deny a pending inbound pairing request. */
   denyPairing: (peerId: string) => Promise<void>;
+  /** Daemon-owned settings (input/clipboard/security), polled from the engine. */
+  settings: EngineSettings;
+  /** Update one or more settings (merged over current) — persisted by the daemon. */
+  updateSettings: (patch: Partial<EngineSettings>) => Promise<void>;
 }
 
 async function tauriInvoke(): Promise<
@@ -201,10 +208,14 @@ export function useWorkspace(): Workspace {
   const [localId, setLocalId] = useState<string | null>(null);
   const [engineRunning, setEngineRunning] = useState(false);
   const [pairing, setPairing] = useState<Pairing | null>(null);
+  const [settings, setSettings] = useState<EngineSettings>(DEFAULT_ENGINE_SETTINGS);
   const [loading, setLoading] = useState(true);
   // Last logged engine/connection signatures, so the poll logs transitions only.
   const lastRunning = useRef<boolean | null>(null);
   const lastConnSig = useRef<string | null>(null);
+  // When the user just edited a setting, briefly let the optimistic value stand so
+  // a poll arriving before the daemon's republish doesn't flicker it back.
+  const settingsEditedAt = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -269,6 +280,9 @@ export function useWorkspace(): Workspace {
               ? { peerId: raw.pairing.peer_id, sas: raw.pairing.sas }
               : null,
           );
+          if (Date.now() - settingsEditedAt.current > 2500) {
+            setSettings(raw.settings);
+          }
         } catch {
           // Transient invoke failure — keep the last snapshot.
         }
@@ -335,6 +349,25 @@ export function useWorkspace(): Workspace {
     await invoke("deny_pairing", { peerId });
   }, []);
 
+  const updateSettings = useCallback(
+    async (patch: Partial<EngineSettings>): Promise<void> => {
+      const next: EngineSettings = { ...settings, ...patch };
+      // Optimistic: reflect immediately; the poll guard holds it until the daemon
+      // republishes the persisted value.
+      settingsEditedAt.current = Date.now();
+      setSettings(next);
+      const invoke = await tauriInvoke();
+      if (invoke === null) return; // browser dev — local-only
+      try {
+        await invoke("set_settings", { settings: next });
+      } catch (e) {
+        logDebug("error", `settings update failed: ${errMessage(e)}`);
+        throw e;
+      }
+    },
+    [settings],
+  );
+
   return {
     devices,
     peers,
@@ -348,5 +381,7 @@ export function useWorkspace(): Workspace {
     trustPeer,
     approvePairing,
     denyPairing,
+    settings,
+    updateSettings,
   };
 }

@@ -1,13 +1,11 @@
-import { useState } from "react";
 import { SectionCard } from "../components/section-card";
 import { SettingRow } from "../components/setting-row";
 import { Toggle } from "../components/toggle";
+import { useWorkspace } from "../lib/use-workspace";
 
-/** Trust & permission preferences (static placeholder). */
+/** Trust & permission preferences — daemon-owned, edited over IPC. */
 export function SecuritySection(): React.JSX.Element {
-  const [requireApproval, setRequireApproval] = useState(true);
-  const [encryptOnly, setEncryptOnly] = useState(true);
-  const [lockOnSleep, setLockOnSleep] = useState(true);
+  const { settings, updateSettings } = useWorkspace();
 
   return (
     <div className="space-y-6">
@@ -22,8 +20,8 @@ export function SecuritySection(): React.JSX.Element {
             <Toggle
               label="Require approval for new devices"
               labelHidden
-              checked={requireApproval}
-              onChange={setRequireApproval}
+              checked={settings.require_approval}
+              onChange={(next) => void updateSettings({ require_approval: next })}
             />
           }
         />
@@ -34,8 +32,8 @@ export function SecuritySection(): React.JSX.Element {
             <Toggle
               label="Encrypted connections only"
               labelHidden
-              checked={encryptOnly}
-              onChange={setEncryptOnly}
+              checked={settings.encrypted_only}
+              onChange={(next) => void updateSettings({ encrypted_only: next })}
             />
           }
         />
@@ -49,8 +47,8 @@ export function SecuritySection(): React.JSX.Element {
             <Toggle
               label="Release input when locked"
               labelHidden
-              checked={lockOnSleep}
-              onChange={setLockOnSleep}
+              checked={settings.release_on_lock}
+              onChange={(next) => void updateSettings({ release_on_lock: next })}
             />
           }
         />

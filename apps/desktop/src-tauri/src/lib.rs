@@ -15,7 +15,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use mouser_ipc::{Client, Command, Snapshot};
+use mouser_ipc::{Client, Command, SettingsDto, Snapshot};
 use serde::Serialize;
 use tauri::{
     menu::MenuBuilder,
@@ -78,6 +78,8 @@ struct EngineSnapshot {
     connection: EngineConnection,
     /// A pending inbound pairing request awaiting Approve/Deny, if any.
     pairing: Option<EnginePairing>,
+    /// Daemon-owned settings (input/clipboard/security) the UI reads + edits.
+    settings: SettingsDto,
 }
 
 /// A pending inbound pairing request (mirrors [`mouser_ipc::PairingDto`]).
@@ -131,6 +133,7 @@ impl EngineSnapshot {
                 error: None,
             },
             pairing: None,
+            settings: SettingsDto::default(),
         }
     }
 
@@ -163,6 +166,7 @@ impl EngineSnapshot {
                 peer_id: p.peer_id,
                 sas: p.sas,
             }),
+            settings: snapshot.settings,
         }
     }
 }
@@ -299,6 +303,14 @@ async fn approve_pairing(peer_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn deny_pairing(peer_id: String) -> Result<(), String> {
     send_command(Command::DenyPairing { peer_id }).await
+}
+
+/// Replace the daemon's persisted settings. The UI sends the full settings struct
+/// (current values with the changed field applied); the daemon saves + republishes,
+/// so the next snapshot poll reflects it — and the MCP server sees the same state.
+#[tauri::command]
+async fn set_settings(settings: SettingsDto) -> Result<(), String> {
+    send_command(Command::UpdateSettings { settings }).await
 }
 
 /// Open a short-lived IPC client, fetch one snapshot, and close. Commands are rare and
@@ -482,6 +494,7 @@ pub fn run() {
             engine_log,
             approve_pairing,
             deny_pairing,
+            set_settings,
             set_tray_icon_visible
         ])
         .build(tauri::generate_context!())

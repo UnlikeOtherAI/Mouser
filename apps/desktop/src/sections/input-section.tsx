@@ -1,17 +1,14 @@
-import { useState } from "react";
 import { SectionCard } from "../components/section-card";
 import { Segmented } from "../components/segmented";
 import { SettingRow } from "../components/setting-row";
 import { Toggle } from "../components/toggle";
+import { useWorkspace } from "../lib/use-workspace";
+import type { EdgeBehavior } from "../lib/types";
 
-type EdgeBehaviour = "instant" | "delayed" | "locked";
-
-/** Input ownership / pointer-crossing preferences (static placeholder). */
+/** Input ownership / pointer-crossing preferences — daemon-owned, edited over IPC
+ * (the same state the MCP server reads/writes). */
 export function InputSection(): React.JSX.Element {
-  const [crossOnEdge, setCrossOnEdge] = useState(true);
-  const [wrapAround, setWrapAround] = useState(false);
-  const [shareScroll, setShareScroll] = useState(true);
-  const [edge, setEdge] = useState<EdgeBehaviour>("instant");
+  const { settings, updateSettings } = useWorkspace();
 
   return (
     <div className="space-y-6">
@@ -23,8 +20,8 @@ export function InputSection(): React.JSX.Element {
             <Toggle
               label="Cross screens at edges"
               labelHidden
-              checked={crossOnEdge}
-              onChange={setCrossOnEdge}
+              checked={settings.cross_at_edges}
+              onChange={(next) => void updateSettings({ cross_at_edges: next })}
             />
           }
         />
@@ -32,10 +29,10 @@ export function InputSection(): React.JSX.Element {
           title="Edge behaviour"
           description="How quickly ownership transfers when the cursor hits an edge."
           control={
-            <Segmented<EdgeBehaviour>
+            <Segmented<EdgeBehavior>
               label="Edge behaviour"
-              value={edge}
-              onChange={setEdge}
+              value={settings.edge_behavior}
+              onChange={(next) => void updateSettings({ edge_behavior: next })}
               options={[
                 { value: "instant", label: "Instant" },
                 { value: "delayed", label: "Delayed" },
@@ -51,8 +48,8 @@ export function InputSection(): React.JSX.Element {
             <Toggle
               label="Wrap around"
               labelHidden
-              checked={wrapAround}
-              onChange={setWrapAround}
+              checked={settings.wrap_around}
+              onChange={(next) => void updateSettings({ wrap_around: next })}
             />
           }
         />
@@ -66,8 +63,8 @@ export function InputSection(): React.JSX.Element {
             <Toggle
               label="Share scroll wheel"
               labelHidden
-              checked={shareScroll}
-              onChange={setShareScroll}
+              checked={settings.share_scroll}
+              onChange={(next) => void updateSettings({ share_scroll: next })}
             />
           }
         />

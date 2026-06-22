@@ -72,6 +72,53 @@ export interface EngineConnection {
   error: string | null;
 }
 
+/** Edge transfer behaviour (mirrors `SettingsDto.edge_behavior`). */
+export type EdgeBehavior = "instant" | "delayed" | "locked";
+
+/**
+ * Daemon-owned settings, mirroring `mouser_ipc::SettingsDto` (snake_case to match
+ * the wire). The engine is the source of truth; the UI reads these from the
+ * snapshot and writes them with `updateSettings`, so buttons and the MCP server
+ * drive the same state.
+ */
+export interface EngineSettings {
+  // Pointer crossing (Input)
+  cross_at_edges: boolean;
+  edge_behavior: EdgeBehavior;
+  wrap_around: boolean;
+  share_scroll: boolean;
+  // Clipboard (§7.7)
+  shared_clipboard: boolean;
+  clipboard_direction: SyncDirection;
+  sync_text: boolean;
+  sync_images: boolean;
+  sync_files: boolean;
+  max_auto_sync_bytes: number;
+  prefer_native_apple: boolean;
+  // Security
+  require_approval: boolean;
+  encrypted_only: boolean;
+  release_on_lock: boolean;
+}
+
+/** Defaults matching `SettingsDto::default()` (used as the browser-dev fallback). */
+export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
+  cross_at_edges: true,
+  edge_behavior: "instant",
+  wrap_around: false,
+  share_scroll: true,
+  shared_clipboard: true,
+  clipboard_direction: "bidirectional",
+  sync_text: true,
+  sync_images: true,
+  sync_files: true,
+  max_auto_sync_bytes: 0,
+  prefer_native_apple: true,
+  require_approval: true,
+  encrypted_only: true,
+  release_on_lock: true,
+};
+
 export type SectionId =
   | "general"
   | "devices"

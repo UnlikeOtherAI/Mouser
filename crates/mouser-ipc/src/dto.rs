@@ -106,6 +106,10 @@ pub struct Snapshot {
     /// SAS code, and answers with [`Command::ApprovePairing`]/[`Command::DenyPairing`].
     #[serde(default)]
     pub pairing: Option<PairingDto>,
+    /// Daemon-owned, persisted settings (input/clipboard/security). The UI and the MCP
+    /// server both read these here and write them via [`Command::UpdateSettings`].
+    #[serde(default)]
+    pub settings: SettingsDto,
 }
 
 /// An inbound pairing request from an untrusted peer that dialed this machine: the peer's
@@ -118,6 +122,96 @@ pub struct PairingDto {
     pub peer_id: String,
     /// The 6-digit SAS code, shown identically on both ends for verification.
     pub sas: String,
+}
+
+/// Daemon-owned, persisted settings — the single source of truth that both the
+/// desktop UI and the MCP server read (from the snapshot) and write (via
+/// [`Command::UpdateSettings`]), replacing per-surface local toggles so the same
+/// state is editable from buttons and programmatically (spec §7.5–§7.7, §9).
+///
+/// Every field carries a serde default so older/newer daemons stay forward
+/// compatible. Persistence + exposure is daemon-owned; full *enforcement* in the
+/// engine/clipboard paths is incremental.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsDto {
+    // --- Pointer crossing (Input) ---
+    /// Cross to an adjacent device when the cursor reaches a shared edge.
+    #[serde(default = "yes")]
+    pub cross_at_edges: bool,
+    /// Edge transfer behaviour: `"instant" | "delayed" | "locked"`.
+    #[serde(default = "edge_default")]
+    pub edge_behavior: String,
+    /// Crossing the far edge returns the cursor to the opposite side.
+    #[serde(default)]
+    pub wrap_around: bool,
+    /// Forward scroll-wheel events to the device that owns the cursor.
+    #[serde(default = "yes")]
+    pub share_scroll: bool,
+
+    // --- Clipboard (§7.7) ---
+    /// Master clipboard switch. Off ⇒ nothing sent and inbound copies ignored.
+    #[serde(default = "yes")]
+    pub shared_clipboard: bool,
+    /// Direction: `"bidirectional" | "send_only" | "receive_only"`.
+    #[serde(default = "direction_default")]
+    pub clipboard_direction: String,
+    /// Sync text (plain/HTML/RTF).
+    #[serde(default = "yes")]
+    pub sync_text: bool,
+    /// Sync images (PNG).
+    #[serde(default = "yes")]
+    pub sync_images: bool,
+    /// Sync file references (uri-list).
+    #[serde(default = "yes")]
+    pub sync_files: bool,
+    /// Skip eager auto-pull above this many bytes (0 = unlimited).
+    #[serde(default)]
+    pub max_auto_sync_bytes: u64,
+    /// Prefer the OS Universal Clipboard between two Apple devices.
+    #[serde(default = "yes")]
+    pub prefer_native_apple: bool,
+
+    // --- Security ---
+    /// Require an approval prompt (SAS) before a new device may send input.
+    #[serde(default = "yes")]
+    pub require_approval: bool,
+    /// Refuse peers that fail certificate pinning (§3).
+    #[serde(default = "yes")]
+    pub encrypted_only: bool,
+    /// Return input ownership to the local device on sleep/lock.
+    #[serde(default = "yes")]
+    pub release_on_lock: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+fn edge_default() -> String {
+    "instant".to_string()
+}
+fn direction_default() -> String {
+    "bidirectional".to_string()
+}
+
+impl Default for SettingsDto {
+    fn default() -> Self {
+        Self {
+            cross_at_edges: true,
+            edge_behavior: edge_default(),
+            wrap_around: false,
+            share_scroll: true,
+            shared_clipboard: true,
+            clipboard_direction: direction_default(),
+            sync_text: true,
+            sync_images: true,
+            sync_files: true,
+            max_auto_sync_bytes: 0,
+            prefer_native_apple: true,
+            require_approval: true,
+            encrypted_only: true,
+            release_on_lock: true,
+        }
+    }
 }
 
 /// A message the daemon sends to a connected UI client.
@@ -161,6 +255,13 @@ pub enum Command {
     DenyPairing {
         /// Base32 device id of the peer to deny.
         peer_id: String,
+    },
+    /// Replace the daemon's persisted settings (full struct). The daemon saves them
+    /// and republishes a fresh snapshot so every connected surface (UI + MCP) reflects
+    /// the change. Callers read the current settings from the snapshot, modify, send.
+    UpdateSettings {
+        /// The complete new settings.
+        settings: SettingsDto,
     },
     /// Ask the daemon to reply with the current [`Snapshot`] immediately.
     GetSnapshot,

@@ -1,10 +1,9 @@
-import { useState } from "react";
 import { SectionCard } from "../components/section-card";
 import { Segmented } from "../components/segmented";
 import { SettingRow } from "../components/setting-row";
 import { Toggle } from "../components/toggle";
-import { DEFAULT_CLIPBOARD_SETTINGS } from "../lib/mock-data";
-import type { ClipboardSettings, SyncDirection } from "../lib/types";
+import { useWorkspace } from "../lib/use-workspace";
+import type { SyncDirection } from "../lib/types";
 
 // Size presets for `max_auto_sync_bytes` (§7.7; 0 = unlimited). Keyed by string
 // so they fit the `Segmented` radio-group contract.
@@ -23,25 +22,15 @@ function sizeKeyFor(bytes: number): SizeKey {
 }
 
 /**
- * Shared clipboard preferences (§7.7), mirroring `ClipboardSettings` in
- * crates/mouser-clipboard/src/settings.rs. State is local — no backend wiring
- * yet; the engine enforces these on send and on receipt once IPC lands.
+ * Shared clipboard preferences (§7.7) — daemon-owned, edited over IPC (the same
+ * state the MCP server reads/writes). The engine enforces these on send/receipt.
  */
 export function ClipboardSection(): React.JSX.Element {
-  const [settings, setSettings] = useState<ClipboardSettings>(
-    DEFAULT_CLIPBOARD_SETTINGS,
-  );
-
-  function update<K extends keyof ClipboardSettings>(
-    key: K,
-    value: ClipboardSettings[K],
-  ): void {
-    setSettings((prev) => ({ ...prev, [key]: value }));
-  }
+  const { settings, updateSettings } = useWorkspace();
 
   // Master switch gates every other control (§7.7: master off ⇒ no offer sent,
   // inbound offers ignored).
-  const enabled = settings.sharedClipboard;
+  const enabled = settings.shared_clipboard;
 
   return (
     <div className="space-y-6">
@@ -56,8 +45,8 @@ export function ClipboardSection(): React.JSX.Element {
             <Toggle
               label="Shared clipboard"
               labelHidden
-              checked={settings.sharedClipboard}
-              onChange={(next) => update("sharedClipboard", next)}
+              checked={settings.shared_clipboard}
+              onChange={(next) => void updateSettings({ shared_clipboard: next })}
             />
           }
         />
@@ -67,8 +56,8 @@ export function ClipboardSection(): React.JSX.Element {
           control={
             <Segmented<SyncDirection>
               label="Clipboard direction"
-              value={settings.direction}
-              onChange={(next) => update("direction", next)}
+              value={settings.clipboard_direction}
+              onChange={(next) => void updateSettings({ clipboard_direction: next })}
               disabled={!enabled}
               options={[
                 { value: "bidirectional", label: "Bidirectional" },
@@ -91,9 +80,9 @@ export function ClipboardSection(): React.JSX.Element {
             <Toggle
               label="Sync text"
               labelHidden
-              checked={settings.syncText}
+              checked={settings.sync_text}
               disabled={!enabled}
-              onChange={(next) => update("syncText", next)}
+              onChange={(next) => void updateSettings({ sync_text: next })}
             />
           }
         />
@@ -104,9 +93,9 @@ export function ClipboardSection(): React.JSX.Element {
             <Toggle
               label="Sync images"
               labelHidden
-              checked={settings.syncImages}
+              checked={settings.sync_images}
               disabled={!enabled}
-              onChange={(next) => update("syncImages", next)}
+              onChange={(next) => void updateSettings({ sync_images: next })}
             />
           }
         />
@@ -117,9 +106,9 @@ export function ClipboardSection(): React.JSX.Element {
             <Toggle
               label="Sync files"
               labelHidden
-              checked={settings.syncFiles}
+              checked={settings.sync_files}
               disabled={!enabled}
-              onChange={(next) => update("syncFiles", next)}
+              onChange={(next) => void updateSettings({ sync_files: next })}
             />
           }
         />
@@ -132,10 +121,12 @@ export function ClipboardSection(): React.JSX.Element {
           control={
             <Segmented<SizeKey>
               label="Auto-sync size limit"
-              value={sizeKeyFor(settings.maxAutoSyncBytes)}
+              value={sizeKeyFor(settings.max_auto_sync_bytes)}
               onChange={(next) => {
                 const preset = SIZE_PRESETS.find((p) => p.value === next);
-                update("maxAutoSyncBytes", preset ? preset.bytes : 0);
+                void updateSettings({
+                  max_auto_sync_bytes: preset ? preset.bytes : 0,
+                });
               }}
               disabled={!enabled}
               options={SIZE_PRESETS.map((p) => ({
@@ -152,9 +143,9 @@ export function ClipboardSection(): React.JSX.Element {
             <Toggle
               label="Prefer Universal Clipboard between Apple devices"
               labelHidden
-              checked={settings.preferNativeApple}
+              checked={settings.prefer_native_apple}
               disabled={!enabled}
-              onChange={(next) => update("preferNativeApple", next)}
+              onChange={(next) => void updateSettings({ prefer_native_apple: next })}
             />
           }
         />

@@ -2583,6 +2583,7 @@ dependencies = [
  "platform-mac",
  "platform-win",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]

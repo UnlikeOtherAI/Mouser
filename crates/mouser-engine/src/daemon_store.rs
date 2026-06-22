@@ -16,6 +16,7 @@ use crate::discovery;
 
 const IDENTITY_SEED_FILE: &str = "identity.seed";
 const TRUSTED_PEERS_FILE: &str = "trusted-peers.txt";
+const SETTINGS_FILE: &str = "settings.json";
 
 /// Errors loading or saving the daemon's persistent identity and trust pins.
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +120,38 @@ impl DaemonStore {
     /// Return all trusted peers, sorted by their raw id.
     pub fn trusted_peer_ids(&self) -> Result<Vec<DeviceId>, DaemonStoreError> {
         Ok(self.load_trusted_peers()?.into_iter().collect())
+    }
+
+    /// Load the persisted daemon settings, falling back to defaults when the file is
+    /// absent or unreadable/corrupt (settings are best-effort, never fatal).
+    pub fn load_settings(&self) -> mouser_ipc::SettingsDto {
+        match fs::read(self.settings_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => mouser_ipc::SettingsDto::default(),
+        }
+    }
+
+    /// Persist the daemon settings as pretty JSON (human-editable on disk too).
+    pub fn save_settings(
+        &self,
+        settings: &mouser_ipc::SettingsDto,
+    ) -> Result<(), DaemonStoreError> {
+        self.ensure_dir()?;
+        let path = self.settings_path();
+        let body = serde_json::to_vec_pretty(settings).map_err(|e| DaemonStoreError::Io {
+            op: "serialize settings",
+            path: path.clone(),
+            source: io::Error::other(e),
+        })?;
+        fs::write(&path, body).map_err(|source| DaemonStoreError::Io {
+            op: "write",
+            path,
+            source,
+        })
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.dir.join(SETTINGS_FILE)
     }
 
     fn identity_seed_path(&self) -> PathBuf {
