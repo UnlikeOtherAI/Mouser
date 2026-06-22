@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "appreveal",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/UnlikeOtherAI/AppReveal.git",
+      "state" : {
+        "revision" : "dbf5620942ad86eedd113627c633dffb27a4d8c8",
+        "version" : "0.9.8"
+      }
+    }
+  ],
+  "version" : 2
+}

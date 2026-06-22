@@ -6,10 +6,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# This crate is unsafe-free, so it adopts the workspace lints
-# (`unsafe_code = "forbid"`) like the protocol/core crates.
-[lints]
-workspace = true
+# This crate is unsafe-free on every platform EXCEPT the debug macOS build, where
+# it links the AppReveal Swift shim and must call its `extern "C"` entry point —
+# an `unsafe` FFI call (see src/appreveal.rs). The workspace `[lints]` `forbid`s
+# `unsafe_code`, and `forbid` can't be locally relaxed, so this crate cannot adopt
+# `[lints] workspace = true`. It instead replicates the workspace denies inline
+# (`#![deny(unsafe_code)]` + the panic-free clippy denies in src/lib.rs) and only
+# permits `unsafe` inside the debug-only `appreveal` module via a local
+# `#[allow(unsafe_code)]`. This is the same pattern platform-mac/-win/-linux use
+# for their C/Objective-C `unsafe`.
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
 
 # The library is what mobile/other shells could embed; the binary is the app.
 [lib]

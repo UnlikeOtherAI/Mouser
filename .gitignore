@@ -44,3 +44,7 @@ apps/ios/Frameworks/
 
 # Bundled mouserd engine (copied in at build time, not committed)
 apps/desktop/src-tauri/binaries/
+
+# SwiftPM build output for the debug-only AppReveal shim (Package.resolved IS
+# committed to pin the AppReveal version; the .build cache is not)
+apps/desktop/src-tauri/appreveal-shim/.build/

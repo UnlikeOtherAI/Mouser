@@ -11,6 +11,17 @@
 //! describes peers, not this machine's monitors. When the daemon is not running the
 //! snapshot command reports `engine_running: false` so the UI can degrade gracefully
 //! (show the local device + an "engine not running" hint).
+//!
+//! This crate can't adopt `[lints] workspace = true`: the debug macOS build links
+//! the AppReveal Swift shim ([`appreveal`]) and must call its `extern "C"` entry
+//! point — an `unsafe` FFI call — and the workspace `forbid`s `unsafe_code`
+//! (`forbid` can't be locally relaxed). Instead it `#![deny(unsafe_code)]`
+//! crate-wide (so every other path stays unsafe-free) and the `appreveal` module
+//! locally `#[allow(unsafe_code)]` for the single FFI call. The workspace
+//! panic-free clippy denies are replicated here too. Same pattern as platform-mac.
+
+#![deny(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -23,6 +34,7 @@ use tauri::{
     Manager, WindowEvent,
 };
 
+mod appreveal;
 mod engine;
 use engine::{stop_engine, supervise_engine, EngineProcess};
 
@@ -464,6 +476,10 @@ pub fn run() {
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
+            // Debug macOS builds only: start AppReveal, the in-app MCP server, so the
+            // live window + its WKWebView are inspectable over `_appreveal._tcp` (parity
+            // with the iOS/Android apps). No-op on release / non-macOS — see [`appreveal`].
+            appreveal::start();
             // The app administers the engine: launch + supervise the headless `mouserd`
             // daemon (relaunch it if it dies), so the user never starts a daemon by hand.
             // The engine owns mDNS discovery; the app reads peers from its IPC snapshot
