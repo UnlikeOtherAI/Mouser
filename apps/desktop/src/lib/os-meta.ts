@@ -42,7 +42,7 @@ interface StateMeta {
 const STATE_META: Record<ConnectionState, StateMeta> = {
   connected: { label: "Connected", dot: "bg-emerald-400", text: "text-emerald-300" },
   connecting: { label: "Connecting", dot: "bg-amber-400", text: "text-amber-300" },
-  offline: { label: "Offline", dot: "bg-slate-500", text: "text-slate-400" },
+  offline: { label: "Offline", dot: "bg-slate-500", text: "text-muted" },
 };
 
 export function stateMeta(state: ConnectionState): StateMeta {

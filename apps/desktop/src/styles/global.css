@@ -42,8 +42,54 @@
 @tailwind utilities;
 
 @layer base {
+  /*
+   * Theme tokens. The whole surface palette is driven by CSS variables so the
+   * useTheme hook can flip the app between dark and light by toggling a class on
+   * <html> (`theme-light` / `theme-dark`). Tailwind's custom colors
+   * (ink.*, accent.*, muted, canvas, fg, fg-strong) are backed by these vars in
+   * tailwind.config.js. Dark is the default (:root); the `.theme-light` override
+   * supplies the light palette. WCAG 2.2 AA contrast checked for text on surface.
+   */
   :root {
     color-scheme: dark;
+
+    --ink: #0f121c;
+    --ink-soft: #161a26;
+    --ink-card: #1c2130;
+    --ink-line: #2a3142;
+
+    --accent: #4f8cff;
+    --accent-hover: #6aa0ff;
+    --accent-soft: #23314f;
+
+    --muted: #8a93a6;
+    --canvas: #3a3f4b;
+
+    /* Semantic foreground tokens (replace hardcoded near-white text). */
+    --fg: #e2e8f0; /* default body / labels (was text-slate-100) */
+    --fg-strong: #f8fafc; /* high-emphasis / on-accent (was text-white) */
+    /* Text that sits on an accent fill — stays light in both themes. */
+    --on-accent: #ffffff;
+  }
+
+  :root.theme-light {
+    color-scheme: light;
+
+    --ink: #f6f7f9; /* app background */
+    --ink-soft: #eceef2; /* nav rail / inset surfaces */
+    --ink-card: #ffffff; /* cards */
+    --ink-line: #d6dae2; /* borders / dividers */
+
+    --accent: #2f6fe0;
+    --accent-hover: #2861cc;
+    --accent-soft: #dbe6fb;
+
+    --muted: #5a6273; /* secondary text, AA on light surfaces */
+    --canvas: #e3e6ec; /* layout canvas plane */
+
+    --fg: #1c2130; /* default body / labels */
+    --fg-strong: #0b0e16; /* high-emphasis headings */
+    --on-accent: #ffffff;
   }
 
   html,
@@ -53,7 +99,7 @@
   }
 
   body {
-    @apply bg-ink text-slate-100 font-sans antialiased;
+    @apply bg-ink text-fg font-sans antialiased;
     margin: 0;
     /* Desktop chrome should not feel like a web page. */
     user-select: none;

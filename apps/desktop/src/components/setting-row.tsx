@@ -19,7 +19,7 @@ export function SettingRow({
       <div className="min-w-0">
         <label
           htmlFor={htmlFor}
-          className="block text-sm font-medium text-slate-100"
+          className="block text-sm font-medium text-fg"
         >
           {title}
         </label>

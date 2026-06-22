@@ -51,8 +51,8 @@ export function Segmented<T extends string>({
               "focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
               disabled && "cursor-not-allowed",
               active
-                ? "bg-accent text-white"
-                : "text-muted hover:text-slate-200",
+                ? "bg-accent text-on-accent"
+                : "text-muted hover:text-fg-strong",
             )}
           >
             {opt.label}

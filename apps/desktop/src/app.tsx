@@ -7,6 +7,8 @@ import {
   syncTrayIconPreference,
   writeTrayIconPreference,
 } from "./lib/tray-preference";
+import type { ThemeChoice } from "./lib/theme-preference";
+import { useTheme } from "./lib/use-theme";
 import type { ClipboardTransfer, SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";
@@ -30,6 +32,8 @@ const SECTION_TITLES: Record<SectionId, string> = {
 interface GeneralSettingsProps {
   showTrayIcon: boolean;
   onShowTrayIconChange: (next: boolean) => void;
+  theme: ThemeChoice;
+  onThemeChange: (next: ThemeChoice) => void;
 }
 
 function renderSection(
@@ -42,6 +46,8 @@ function renderSection(
         <GeneralSection
           showTrayIcon={general.showTrayIcon}
           onShowTrayIconChange={general.onShowTrayIconChange}
+          theme={general.theme}
+          onThemeChange={general.onThemeChange}
         />
       );
     case "devices":
@@ -61,10 +67,28 @@ function renderSection(
 export function App(): React.JSX.Element {
   const [active, setActive] = useState<SectionId>("layout");
   const [showTrayIcon, setShowTrayIcon] = useState(readTrayIconPreference);
+  const { theme, setTheme } = useTheme();
 
   useEffect(() => {
     void syncTrayIconPreference(showTrayIcon);
   }, [showTrayIcon]);
+
+  // First run only: default launch-at-login ON (Mouser is a background KVM agent).
+  // After this the toggle in General is authoritative and we never re-force it.
+  useEffect(() => {
+    const CONFIGURED = "mouser.launchAtLogin.configured";
+    if (localStorage.getItem(CONFIGURED) !== null) return;
+    void (async () => {
+      try {
+        const { isEnabled, enable } = await import("@tauri-apps/plugin-autostart");
+        if (!(await isEnabled())) await enable();
+      } catch {
+        // No Tauri (browser dev) or OS rejected it — leave as-is.
+      } finally {
+        localStorage.setItem(CONFIGURED, "1");
+      }
+    })();
+  }, []);
 
   function handleShowTrayIconChange(next: boolean): void {
     setShowTrayIcon(next);
@@ -72,7 +96,7 @@ export function App(): React.JSX.Element {
   }
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-ink text-slate-100">
+    <div className="flex h-screen w-screen overflow-hidden bg-ink text-fg">
       <SideNav items={NAV_ITEMS} active={active} onSelect={setActive} />
       <main
         id={`panel-${active}`}
@@ -88,6 +112,8 @@ export function App(): React.JSX.Element {
           {renderSection(active, {
             showTrayIcon,
             onShowTrayIconChange: handleShowTrayIconChange,
+            theme,
+            onThemeChange: setTheme,
           })}
         </div>
       </main>

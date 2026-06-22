@@ -63,8 +63,8 @@ export function SideNav({
                 "mb-0.5 flex w-full items-center rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors",
                 "focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
                 selected
-                  ? "bg-accent-soft text-slate-100"
-                  : "text-muted hover:bg-ink-line/60 hover:text-slate-200",
+                  ? "bg-accent-soft text-fg-strong"
+                  : "text-muted hover:bg-ink-line/60 hover:text-fg-strong",
               )}
             >
               {item.label}

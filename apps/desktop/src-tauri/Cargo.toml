@@ -22,6 +22,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+# Cross-platform "launch at login": macOS LaunchAgent, Windows registry Run key,
+# Linux XDG autostart .desktop — handled entirely by the plugin (docs/tech-stack.md §5).
+tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 whoami = "1"

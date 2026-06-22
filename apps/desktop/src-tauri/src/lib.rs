@@ -472,6 +472,13 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Cross-platform "Launch at login": the plugin manages the macOS LaunchAgent,
+        // the Windows registry Run key, and the Linux XDG autostart entry. The General
+        // settings toggle drives it over the JS API (enable/disable/isEnabled).
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(DesktopPreferences::default())
         .manage(DiscoveredPeers::default())
         .manage(EngineProcess::default())

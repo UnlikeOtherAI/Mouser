@@ -55,10 +55,10 @@ export function DevicesSection(): React.JSX.Element {
                 <FontAwesomeIcon
                   icon={osIcon(device.os)}
                   aria-hidden="true"
-                  className="w-5 text-lg text-slate-200"
+                  className="w-5 text-lg text-fg-strong"
                 />
                 <div>
-                  <p className="text-sm font-semibold text-slate-100">
+                  <p className="text-sm font-semibold text-fg">
                     {device.name}
                   </p>
                   <p className="text-xs text-muted">
@@ -138,7 +138,7 @@ function PeerRow({
       ? { label: "Connecting", dot: "bg-amber-400", text: "text-amber-300" }
       : peer.trusted
         ? { label: "Trusted", dot: "bg-sky-400", text: "text-sky-300" }
-        : { label: "Untrusted", dot: "bg-slate-500", text: "text-slate-400" };
+        : { label: "Untrusted", dot: "bg-slate-500", text: "text-muted" };
 
   return (
     <li className="flex items-center justify-between rounded-xl border border-ink-line bg-ink-card px-4 py-3">
@@ -146,10 +146,10 @@ function PeerRow({
         <FontAwesomeIcon
           icon={osIcon(peer.os)}
           aria-hidden="true"
-          className="w-5 text-lg text-slate-200"
+          className="w-5 text-lg text-fg-strong"
         />
         <div>
-          <p className="text-sm font-semibold text-slate-100">{peer.name}</p>
+          <p className="text-sm font-semibold text-fg">{peer.name}</p>
           <p className="text-xs text-muted">
             {osLabel(peer.os)} · {peer.host}:{peer.port}
           </p>
@@ -170,7 +170,7 @@ function PeerRow({
             type="button"
             disabled={busy}
             onClick={onDisconnect}
-            className="rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-slate-200 hover:bg-ink-line disabled:opacity-50"
+            className="rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-fg hover:bg-ink-line disabled:opacity-50"
           >
             Disconnect
           </button>

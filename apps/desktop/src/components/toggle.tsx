@@ -38,7 +38,7 @@ export function Toggle({
       <span
         aria-hidden="true"
         className={cx(
-          "inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform",
+          "inline-block h-5 w-5 transform rounded-full bg-fg-strong shadow transition-transform",
           checked ? "translate-x-5" : "translate-x-0.5",
         )}
       />
