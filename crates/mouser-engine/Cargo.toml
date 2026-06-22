@@ -19,9 +19,12 @@ data-encoding = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 thiserror = "2"
 
-# The daemon binary plugs the real macOS adapters into the runtime.
+# The daemon binary plugs the real desktop adapters into the runtime.
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-mac = { path = "../platform-mac" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+platform-win = { path = "../platform-win" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

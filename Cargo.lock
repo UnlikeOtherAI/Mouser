@@ -2309,6 +2309,7 @@ dependencies = [
  "mouser-net",
  "mouser-protocol",
  "platform-mac",
+ "platform-win",
  "serde",
  "thiserror 2.0.18",
  "tokio",
