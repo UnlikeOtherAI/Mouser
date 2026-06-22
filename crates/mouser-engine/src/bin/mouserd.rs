@@ -8,8 +8,8 @@
 //! - Linux -> `platform-linux` (`LinuxCapture` + `UinputInjector`).
 //!
 //! Usage:
-//! - `mouserd`          - auto: advertise + browse; either connected side can control.
-//! - `mouserd auto`     - same as default; lower device_id dials to avoid duplicates.
+//! - `mouserd`          - auto on macOS/Linux; receive-only target mode on Windows.
+//! - `mouserd auto`     - advertise + browse; either connected side can control.
 //! - `mouserd source`   - controller-only connection: capture + dial a discovered peer.
 //! - `mouserd target`   - receive-only connection: accept + inject, no input hooks.
 //! - `mouserd connect <host:port>` - direct controller-only connection, no mDNS.
@@ -159,7 +159,14 @@ mod engine {
     }
 
     fn default_role() -> &'static str {
-        "auto"
+        #[cfg(target_os = "windows")]
+        {
+            "target"
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "auto"
+        }
     }
 
     /// Connect to an explicit peer (TrustOnFirstUse) and report the handshake, then
