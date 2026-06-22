@@ -1,5 +1,11 @@
-import { useEffect, useState } from "react";
-import type { Device, OsKind, Peer } from "./types";
+import { useCallback, useEffect, useState } from "react";
+import type {
+  Device,
+  EngineConnection,
+  EngineConnectionState,
+  OsKind,
+  Peer,
+} from "./types";
 
 // Shape returned by the `local_device` Tauri command (src-tauri/src/lib.rs).
 interface RawMonitor {
@@ -18,18 +24,31 @@ interface RawLocalDevice {
   monitors: RawMonitor[];
 }
 
-// Shape returned by the `discovered_peers` Tauri command (src-tauri/src/lib.rs).
-interface RawPeer {
+// Shape returned by the `engine_snapshot` Tauri command (src-tauri/src/lib.rs),
+// which proxies the engine's `mouser_ipc::Snapshot` over the local IPC link.
+interface RawEnginePeer {
   id: string;
   name: string;
   os: string;
   host: string;
   port: number;
+  trusted: boolean;
+}
+interface RawEngineConnection {
+  state: string;
+  peer_id: string | null;
+  owner: string | null;
+  epoch: number | null;
+}
+interface RawEngineSnapshot {
+  engine_running: boolean;
+  peers: RawEnginePeer[];
+  connection: RawEngineConnection;
 }
 
-// How often we re-poll the backend's mDNS peer snapshot. UI-side shortcut until
-// the engine pushes peers over `mouser-ipc` (no event subscription yet).
-const PEER_POLL_MS = 2000;
+// How often we re-poll the engine snapshot over IPC. The daemon pushes snapshots
+// on change, but the UI uses a simple request/reply poll (no event subscription).
+const SNAPSHOT_POLL_MS = 2000;
 
 // Browser/dev fallback when there is no Tauri runtime (e.g. `pnpm dev` in a
 // plain browser). Two screens side by side so snapping is exercised.
@@ -71,46 +90,94 @@ function toDevice(raw: RawLocalDevice): Device {
   };
 }
 
-function toPeer(raw: RawPeer): Peer {
+function toPeer(raw: RawEnginePeer): Peer {
   return {
     id: raw.id,
     name: raw.name || raw.host,
     os: osKindOf(raw.os),
     host: raw.host,
     port: raw.port,
+    trusted: raw.trusted,
   };
 }
+
+function connectionStateOf(state: string): EngineConnectionState {
+  if (state === "connected") return "connected";
+  if (state === "connecting") return "connecting";
+  return "idle";
+}
+
+function toConnection(raw: RawEngineConnection): EngineConnection {
+  return {
+    state: connectionStateOf(raw.state),
+    peerId: raw.peer_id,
+    owner: raw.owner,
+    epoch: raw.epoch,
+  };
+}
+
+const IDLE_CONNECTION: EngineConnection = {
+  state: "idle",
+  peerId: null,
+  owner: null,
+  epoch: null,
+};
 
 export interface Workspace {
   /** The local machine, plus any peers once the engine is wired. */
   devices: Device[];
-  /** Peers discovered on the LAN over mDNS (UI-side shortcut, polled). */
+  /** Peers the engine has discovered on the LAN (with trust), polled over IPC. */
   peers: Peer[];
+  /** The engine's current connection state. */
+  connection: EngineConnection;
+  /** True when the daemon's IPC socket is reachable; false means it isn't running. */
+  engineRunning: boolean;
   /** True until the real device query resolves (or falls back). */
   loading: boolean;
+  /** Ask the engine to connect to a discovered, trusted peer by id. */
+  connectPeer: (peerId: string) => Promise<void>;
+  /** Ask the engine to tear down the current connection. */
+  disconnectPeer: () => Promise<void>;
+}
+
+async function tauriInvoke(): Promise<
+  typeof import("@tauri-apps/api/core").invoke | null
+> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Loads the real local device (name, OS, physical display layout) from the
- * Tauri backend. Falls back to a representative two-screen Mac when running
- * outside Tauri so the UI is still usable in a browser.
+ * Loads the real local device (name, OS, physical display layout) and the engine's
+ * live state (discovered peers + trust + connection) over the local IPC link.
+ *
+ * Outside Tauri (browser dev) it falls back to a representative two-screen Mac and an
+ * empty/offline engine so the UI is still usable. When the daemon is not running the
+ * engine snapshot reports `engine_running: false`, which the UI surfaces as a hint.
  */
 export function useWorkspace(): Workspace {
   const [devices, setDevices] = useState<Device[]>(FALLBACK);
   const [peers, setPeers] = useState<Peer[]>([]);
+  const [connection, setConnection] = useState<EngineConnection>(IDLE_CONNECTION);
+  const [engineRunning, setEngineRunning] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const { invoke } = await import("@tauri-apps/api/core");
+        const invoke = await tauriInvoke();
+        if (invoke === null) return; // browser dev — keep the fallback device
         const raw = await invoke<RawLocalDevice>("local_device");
         if (!cancelled && raw.monitors.length > 0) {
           setDevices([toDevice(raw)]);
         }
       } catch {
-        // No Tauri runtime (browser dev) — keep the fallback device.
+        // No Tauri runtime / query failed — keep the fallback device.
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -120,29 +187,28 @@ export function useWorkspace(): Workspace {
     };
   }, []);
 
-  // Poll the backend's mDNS peer snapshot. UI-side shortcut: the engine will
-  // eventually push peers over `mouser-ipc`, replacing this interval.
+  // Poll the engine snapshot over IPC. The daemon answers `GetSnapshot` immediately
+  // with the current state; if it is not running the command returns an offline
+  // snapshot (engine_running: false) rather than throwing.
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | undefined;
     void (async () => {
-      let invoke: typeof import("@tauri-apps/api/core").invoke;
-      try {
-        ({ invoke } = await import("@tauri-apps/api/core"));
-      } catch {
-        // No Tauri runtime (browser dev) — there are no LAN peers to show.
-        return;
-      }
+      const invoke = await tauriInvoke();
+      if (invoke === null) return; // browser dev — no engine to poll
       const poll = async (): Promise<void> => {
         try {
-          const raw = await invoke<RawPeer[]>("discovered_peers");
-          if (!cancelled) setPeers(raw.map(toPeer));
+          const raw = await invoke<RawEngineSnapshot>("engine_snapshot");
+          if (cancelled) return;
+          setEngineRunning(raw.engine_running);
+          setPeers(raw.peers.map(toPeer));
+          setConnection(toConnection(raw.connection));
         } catch {
           // Transient invoke failure — keep the last snapshot.
         }
       };
       await poll();
-      if (!cancelled) timer = setInterval(() => void poll(), PEER_POLL_MS);
+      if (!cancelled) timer = setInterval(() => void poll(), SNAPSHOT_POLL_MS);
     })();
     return () => {
       cancelled = true;
@@ -150,5 +216,25 @@ export function useWorkspace(): Workspace {
     };
   }, []);
 
-  return { devices, peers, loading };
+  const connectPeer = useCallback(async (peerId: string): Promise<void> => {
+    const invoke = await tauriInvoke();
+    if (invoke === null) return;
+    await invoke("connect_peer", { peerId });
+  }, []);
+
+  const disconnectPeer = useCallback(async (): Promise<void> => {
+    const invoke = await tauriInvoke();
+    if (invoke === null) return;
+    await invoke("disconnect_peer");
+  }, []);
+
+  return {
+    devices,
+    peers,
+    connection,
+    engineRunning,
+    loading,
+    connectPeer,
+    disconnectPeer,
+  };
 }

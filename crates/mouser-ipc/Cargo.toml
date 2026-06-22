@@ -1,0 +1,21 @@
+[package]
+name = "mouser-ipc"
+version = "0.0.0"
+description = "Local IPC link between the headless mouserd engine daemon and the Tauri desktop UI: typed DTOs over a length-prefixed CBOR Unix-socket protocol."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pure async IO + serde DTOs, unsafe-free, so it adopts the workspace lints
+# (panic-free discipline + `forbid(unsafe_code)`).
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }

@@ -2414,12 +2414,13 @@ dependencies = [
 name = "mouser-desktop"
 version = "0.0.0"
 dependencies = [
- "mouser-net",
+ "mouser-ipc",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tokio",
  "whoami",
 ]
 
@@ -2429,6 +2430,7 @@ version = "0.0.0"
 dependencies = [
  "data-encoding",
  "mouser-core",
+ "mouser-ipc",
  "mouser-net",
  "mouser-protocol",
  "platform-linux",
@@ -2457,6 +2459,16 @@ version = "0.0.0"
 dependencies = [
  "mouser-protocol",
  "sha2",
+]
+
+[[package]]
+name = "mouser-ipc"
+version = "0.0.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

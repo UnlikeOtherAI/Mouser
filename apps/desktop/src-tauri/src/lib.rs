@@ -1,18 +1,21 @@
 //! Mouser desktop UI shell (Tauri v2).
 //!
-//! Per `docs/tech-stack.md` §5 and `docs/architecture.md` §3/§8 this crate does
-//! NOT own the daemon lifecycle and does NOT embed `mouser-core`. When wiring
-//! lands it will talk to the engine over `mouser-ipc` (typed DTOs).
+//! Per `docs/tech-stack.md` §5 and `docs/architecture.md` §3/§8 this crate does NOT own
+//! the daemon lifecycle and does NOT embed `mouser-core`. It talks to the headless
+//! `mouserd` engine over [`mouser_ipc`] (typed DTOs over a local Unix-domain socket):
+//! the engine owns discovery, trust, and the live connection; this shell reflects that
+//! state ([`engine_snapshot`]) and drives it ([`connect_peer`] / [`disconnect_peer`]).
 //!
-//! Until then it still surfaces the **real local machine** — its name, OS and
-//! physical display arrangement — via [`local_device`] so the Devices list and
-//! Layout canvas reflect this computer instead of placeholder data. Remote peers
-//! still require the engine; the UI shows an honest "no peers yet" state.
+//! [`local_device`] still surfaces the **real local machine** (name, OS, physical
+//! display arrangement) directly from the windowing system, since the engine snapshot
+//! describes peers, not this machine's monitors. When the daemon is not running the
+//! snapshot command reports `engine_running: false` so the UI can degrade gracefully
+//! (show the local device + an "engine not running" hint).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-use mouser_net::{Browser, PeerEvent};
+use mouser_ipc::{Client, Command, Snapshot};
 use serde::Serialize;
 use tauri::{
     menu::MenuBuilder,
@@ -28,6 +31,9 @@ const OS_KIND: &str = if cfg!(target_os = "macos") {
 } else {
     "linux"
 };
+
+/// How long a `connect_peer`/`disconnect_peer` command may take before giving up.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One physical display, in DPI-normalized **logical points** so screens of
 /// different scale factors lay out 1:1 with how the OS arranges them.
@@ -52,33 +58,80 @@ struct LocalDevice {
     monitors: Vec<MonitorInfo>,
 }
 
-/// A peer discovered on the LAN over mDNS (`_mouser._udp`), surfaced to the
-/// Devices list. `host`/`port` are the first resolved address and the
-/// interactive (`iport`) port — enough to show "who is out there", not to dial.
-#[derive(Clone, Serialize)]
-struct PeerInfo {
+/// The engine's live state, plus whether the daemon is reachable, surfaced to the UI.
+///
+/// Mirrors [`mouser_ipc::Snapshot`] but with a JSON-friendly connection shape and the
+/// `engine_running` flag so the frontend can show an honest "engine not running" hint.
+#[derive(Serialize)]
+struct EngineSnapshot {
+    /// True when the daemon's IPC socket answered; false means it is not running.
+    engine_running: bool,
+    /// Peers the engine has discovered, with trust + connection-relevant fields.
+    peers: Vec<EnginePeer>,
+    /// Current connection state.
+    connection: EngineConnection,
+}
+
+/// A peer as the engine reports it (mirrors [`mouser_ipc::PeerDto`]).
+#[derive(Serialize)]
+struct EnginePeer {
     id: String,
     name: String,
     os: String,
     host: String,
     port: u16,
+    trusted: bool,
 }
 
-/// Deduped set of LAN peers, keyed by DNS-SD instance fullname.
-///
-/// NOTE: This is a **UI-side mDNS shortcut**. The architecture's intended path
-/// (docs/architecture.md §8) is for the engine to own discovery and hand peers
-/// to the UI over `mouser-ipc`; the Tauri shell does not talk QUIC. Until that
-/// wiring lands this browse loop makes real peers visible now without claiming
-/// any trust/connection (TXT is advisory only, §4/§5).
-///
-/// The inner map is an `Arc<Mutex<…>>` so the background browse task can hold a
-/// clone with a `'static` lifetime while the `discovered_peers` command reads
-/// the same map through Tauri managed state.
-#[derive(Clone, Default)]
-struct DiscoveredPeers {
-    /// `fullname` (the string `PeerEvent::Removed` carries) -> peer snapshot.
-    by_fullname: Arc<Mutex<HashMap<String, PeerInfo>>>,
+/// The engine connection state for the UI (mirrors [`mouser_ipc::ConnectionDto`]).
+#[derive(Serialize)]
+struct EngineConnection {
+    /// `"idle" | "connecting" | "connected"`.
+    state: String,
+    peer_id: Option<String>,
+    owner: Option<String>,
+    epoch: Option<u64>,
+}
+
+impl EngineSnapshot {
+    /// The state when the daemon is not reachable: no peers, idle connection.
+    fn engine_offline() -> Self {
+        Self {
+            engine_running: false,
+            peers: Vec::new(),
+            connection: EngineConnection {
+                state: "idle".to_string(),
+                peer_id: None,
+                owner: None,
+                epoch: None,
+            },
+        }
+    }
+
+    /// Convert a live engine [`Snapshot`] into the UI shape.
+    fn from_snapshot(snapshot: Snapshot) -> Self {
+        Self {
+            engine_running: true,
+            peers: snapshot
+                .peers
+                .into_iter()
+                .map(|p| EnginePeer {
+                    id: p.id,
+                    name: p.name,
+                    os: p.os,
+                    host: p.host,
+                    port: p.port,
+                    trusted: p.trusted,
+                })
+                .collect(),
+            connection: EngineConnection {
+                state: snapshot.connection.state.as_str().to_string(),
+                peer_id: snapshot.connection.peer_id,
+                owner: snapshot.connection.owner,
+                epoch: snapshot.connection.epoch,
+            },
+        }
+    }
 }
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -147,55 +200,48 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
     })
 }
 
-/// Snapshot of the LAN peers discovered so far, for the Devices list.
-///
-/// UI-side mDNS shortcut (see [`DiscoveredPeers`]): real peers become visible
-/// here before the engine owns discovery over `mouser-ipc`.
+/// The engine's live snapshot (discovered peers + trust + connection state), fetched
+/// over the local IPC link. If the daemon is not running this returns an offline
+/// snapshot (`engine_running: false`) rather than failing, so the UI can show the
+/// local device with an "engine not running" hint.
 #[tauri::command]
-fn discovered_peers(state: tauri::State<'_, DiscoveredPeers>) -> Vec<PeerInfo> {
-    lock_recover(&state.by_fullname)
-        .values()
-        .cloned()
-        .collect()
+async fn engine_snapshot() -> EngineSnapshot {
+    match fetch_engine_snapshot().await {
+        Ok(snapshot) => EngineSnapshot::from_snapshot(snapshot),
+        Err(_) => EngineSnapshot::engine_offline(),
+    }
 }
 
-/// Background mDNS browse loop: drives a [`Browser`] and folds `Found`/`Removed`
-/// events into the shared [`DiscoveredPeers`] set. Runs for the app's lifetime
-/// on the Tauri async runtime; returns (ending the loop) only if the browse
-/// channel closes or the browser fails to start.
-async fn run_discovery(peers: DiscoveredPeers) {
-    let browser = match Browser::browse() {
-        Ok(browser) => browser,
-        // No mDNS daemon (no network / permissions): leave the set empty so the
-        // UI honestly shows "no peers" rather than crashing the shell.
-        Err(_) => return,
-    };
+/// Ask the engine to connect to a discovered, trusted peer by its base32 id.
+#[tauri::command]
+async fn connect_peer(peer_id: String) -> Result<(), String> {
+    send_command(Command::Connect { peer_id }).await
+}
 
-    while let Some(event) = browser.next_event().await {
-        match event {
-            PeerEvent::Found(advert) => {
-                // `addrs` is guaranteed non-empty by `from_service_info` (an
-                // address-less peer is skipped upstream), but stay panic-free.
-                let Some(host) = advert.addrs.first().map(|ip| ip.to_string()) else {
-                    continue;
-                };
-                // Key by the DNS-SD fullname so `Removed` (which carries only the
-                // fullname) can prune the exact entry.
-                let fullname = format!("{}.{}", advert.instance_name(), mouser_net::SERVICE_TYPE);
-                let info = PeerInfo {
-                    id: advert.id,
-                    name: advert.name,
-                    os: advert.os,
-                    host,
-                    port: advert.iport,
-                };
-                lock_recover(&peers.by_fullname).insert(fullname, info);
-            }
-            PeerEvent::Removed(fullname) => {
-                lock_recover(&peers.by_fullname).remove(&fullname);
-            }
-        }
-    }
+/// Ask the engine to tear down the current connection.
+#[tauri::command]
+async fn disconnect_peer() -> Result<(), String> {
+    send_command(Command::Disconnect).await
+}
+
+/// Open a short-lived IPC client, fetch one snapshot, and close. Commands are rare and
+/// the snapshot is small, so a fresh connection per call keeps the shell stateless and
+/// avoids a background reader task fighting the command path over one socket.
+async fn fetch_engine_snapshot() -> Result<Snapshot, String> {
+    let mut client = Client::connect().await.map_err(|e| e.to_string())?;
+    tokio::time::timeout(COMMAND_TIMEOUT, client.fetch_snapshot())
+        .await
+        .map_err(|_| "engine did not reply in time".to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Open a short-lived IPC client and send one command.
+async fn send_command(command: Command) -> Result<(), String> {
+    let mut client = Client::connect().await.map_err(|e| e.to_string())?;
+    tokio::time::timeout(COMMAND_TIMEOUT, client.send_command(&command))
+        .await
+        .map_err(|_| "engine did not accept the command in time".to_string())?
+        .map_err(|e| e.to_string())
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -295,17 +341,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(DesktopPreferences::default())
-        .manage(DiscoveredPeers::default())
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
-            // Spawn the LAN mDNS browse loop (UI-side shortcut — see
-            // `DiscoveredPeers`). Clone the managed `Arc` so the task holds a
-            // `'static` handle to the same map the command reads.
-            let peers = app.state::<DiscoveredPeers>().inner().clone();
-            tauri::async_runtime::spawn(async move {
-                run_discovery(peers).await;
-            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -323,7 +361,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             local_device,
-            discovered_peers,
+            engine_snapshot,
+            connect_peer,
+            disconnect_peer,
             set_tray_icon_visible
         ])
         .run(tauri::generate_context!())
