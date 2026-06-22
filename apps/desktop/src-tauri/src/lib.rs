@@ -13,6 +13,8 @@
 //! (show the local device + an "engine not running" hint).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Child;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -173,6 +175,47 @@ impl Default for DesktopPreferences {
 
 fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Handle to the `mouserd` engine the app launches and supervises, so the user never
+/// has to start a daemon themselves — the app administers it (spawn on launch, stop on
+/// quit). `None` when an engine was already running and we attached to it instead.
+#[derive(Default)]
+struct EngineProcess {
+    child: Mutex<Option<Child>>,
+}
+
+/// Resolve the bundled `mouserd` engine: `Resources/binaries/mouserd` in the installed
+/// app, else fall back to a `mouserd` on `PATH` (dev runs).
+fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
+    if let Ok(dir) = app.path().resource_dir() {
+        let bundled = dir.join("binaries").join("mouserd");
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+    PathBuf::from("mouserd")
+}
+
+/// Ensure the engine is running: if the IPC socket doesn't already answer, launch the
+/// bundled `mouserd auto` and keep its handle so [`run`] can stop it on exit. The app
+/// owns the daemon lifecycle (the user just opens the app).
+fn ensure_engine_running(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // An engine is already up (a prior app instance, or a user-run daemon) — attach.
+        if mouser_ipc::Client::connect().await.is_ok() {
+            return;
+        }
+        let path = resolve_mouserd(&app);
+        match std::process::Command::new(&path).arg("auto").spawn() {
+            Ok(child) => {
+                *lock_recover(&app.state::<EngineProcess>().child) = Some(child);
+                eprintln!("mouser-desktop: launched engine {}", path.display());
+            }
+            Err(e) => eprintln!("mouser-desktop: failed to launch engine {}: {e}", path.display()),
+        }
+    });
 }
 
 /// Peers this app discovered directly over mDNS, keyed by DNS-SD instance fullname.
@@ -392,15 +435,19 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 /// without a `main` symbol clash on mobile.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(DesktopPreferences::default())
         .manage(DiscoveredPeers::default())
+        .manage(EngineProcess::default())
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
-            // Browse mDNS directly so the Devices list is populated even without the
-            // headless engine running (the engine snapshot takes over when it is up).
+            // The app administers the engine: launch the headless `mouserd` daemon if it
+            // isn't already running, so the user never starts a daemon by hand.
+            ensure_engine_running(app.handle());
+            // Browse mDNS directly so the Devices list is populated even before the
+            // engine's snapshot arrives (the engine snapshot takes over once it is up).
             let peers = app.state::<DiscoveredPeers>().inner.clone();
             tauri::async_runtime::spawn(mdns_browse_loop(peers));
             Ok(())
@@ -425,6 +472,15 @@ pub fn run() {
             disconnect_peer,
             set_tray_icon_visible
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Mouser desktop shell");
+        .build(tauri::generate_context!())
+        .expect("error while building Mouser desktop shell");
+
+    // Stop the engine we launched when the app exits, so we don't orphan the daemon.
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(mut child) = lock_recover(&app_handle.state::<EngineProcess>().child).take() {
+                let _ = child.kill();
+            }
+        }
+    });
 }
