@@ -31,6 +31,6 @@ pub use identity::{
 };
 pub use ownership::{Ownership, OwnershipUpdate, RejectReason};
 pub use platform::{
-    CaptureDecision, ClipFormat, Clipboard, InputCapture, InputInjection, InputSink,
+    CaptureDecision, CaptureMode, ClipFormat, Clipboard, InputCapture, InputInjection, InputSink,
     LocalInputEvent, PlatformError, PlatformResult, ScrollUnit, Tray, TrayState,
 };

@@ -291,11 +291,13 @@ fn configure_engine_command(command: &mut std::process::Command) {
 }
 
 fn mouserd_launch_args() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["target"]
-    } else {
-        &[]
-    }
+    // No explicit role on any platform: the daemon defaults to `auto` (advertise +
+    // browse, either side can control). Windows used to be pinned to `target` as a
+    // safety workaround because becoming a source installed always-on low-level
+    // hooks that degraded local input. Capture is now ownership-driven (passive edge
+    // sensing while idle, suppressing hooks only while actively controlling), so
+    // Windows is a first-class controller and the workaround is gone.
+    &[]
 }
 
 /// Peers this app discovered directly over mDNS, keyed by DNS-SD instance fullname.

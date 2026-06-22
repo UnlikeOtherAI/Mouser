@@ -73,22 +73,9 @@ export function App(): React.JSX.Element {
     void syncTrayIconPreference(showTrayIcon);
   }, [showTrayIcon]);
 
-  // First run only: default launch-at-login ON (Mouser is a background KVM agent).
-  // After this the toggle in General is authoritative and we never re-force it.
-  useEffect(() => {
-    const CONFIGURED = "mouser.launchAtLogin.configured";
-    if (localStorage.getItem(CONFIGURED) !== null) return;
-    void (async () => {
-      try {
-        const { isEnabled, enable } = await import("@tauri-apps/plugin-autostart");
-        if (!(await isEnabled())) await enable();
-      } catch {
-        // No Tauri (browser dev) or OS rejected it — leave as-is.
-      } finally {
-        localStorage.setItem(CONFIGURED, "1");
-      }
-    })();
-  }, []);
+  // Launch-at-login is strictly opt-in: Mouser never enables it automatically. The
+  // user turns it on from the "Launch at login" toggle in General settings, which
+  // reflects and drives the real OS autostart state via tauri-plugin-autostart.
 
   function handleShowTrayIconChange(next: boolean): void {
     setShowTrayIcon(next);

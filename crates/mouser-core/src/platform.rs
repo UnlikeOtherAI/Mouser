@@ -137,28 +137,86 @@ pub trait InputSink: Send + Sync {
     fn on_event(&self, event: LocalInputEvent) -> CaptureDecision;
 }
 
+/// How aggressively local input is captured — the central lever of the
+/// **"edge sensing is not input forwarding"** architecture.
+///
+/// The engine derives the mode purely from ownership state (see
+/// `mouser_engine::EngineCore::capture_mode`) and commands it via
+/// [`InputCapture::set_mode`]. The contract each adapter must honor:
+///
+/// - [`CaptureMode::Off`] — install nothing. Pure target/receiver, or a node
+///   with no peer. No threads, no hooks, no polling.
+/// - [`CaptureMode::PassiveEdge`] — observe only what is needed to detect a
+///   screen-edge crossing (cursor position). It **must not** install a global
+///   keyboard hook, **must not** suppress, and **must not** add per-event
+///   latency to normal local input. On Windows this means polling
+///   `GetCursorPos` rather than a `WH_MOUSE_LL`/`WH_KEYBOARD_LL` hook; on macOS
+///   a listen-only `CGEventTap`; on Linux reading evdev without `EVIOCGRAB`.
+///   This is the mode a connected-but-idle controller sits in, so local
+///   keyboard/touchpad behave exactly as if Mouser were not running.
+/// - [`CaptureMode::ActiveForward`] — full capture **with** suppression, used
+///   **only** while this machine actively owns and drives a remote peer (after
+///   an ownership handoff). This is where the heavyweight global hooks live
+///   (Windows `WH_*_LL`, macOS default tap, Linux grab). It is installed on the
+///   handoff and torn back down to [`CaptureMode::PassiveEdge`] the instant
+///   ownership returns locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// No capture of any kind.
+    Off,
+    /// Passive, non-suppressing edge sensing (cursor position only).
+    PassiveEdge,
+    /// Full suppressing capture while controlling a remote peer.
+    ActiveForward,
+}
+
 /// Captures local input so the engine can detect edge crossings, local reclaim, and
 /// the panic hotkey, and forward events while this machine is the owner.
 ///
-/// For each event the adapter calls [`InputSink::on_event`] and honors the
-/// returned [`CaptureDecision`]. Whether [`CaptureDecision::Suppress`] is
-/// actually enforceable is platform- and permission-dependent; adapters expose
-/// that via [`InputCapture::can_suppress`] so the engine can downgrade behavior
-/// instead of assuming local input is gone (audit H3).
+/// Capture is **mode-driven** ([`CaptureMode`]): the engine never installs an
+/// always-on global hook. It commands [`CaptureMode::PassiveEdge`] while merely
+/// connected (so local input is untouched) and only escalates to
+/// [`CaptureMode::ActiveForward`] for the window during which this machine is the
+/// active input owner of a remote peer. For each forwarded event the adapter calls
+/// [`InputSink::on_event`] and honors the returned [`CaptureDecision`]. Whether
+/// [`CaptureDecision::Suppress`] is actually enforceable is platform- and
+/// permission-dependent; adapters expose that via [`InputCapture::can_suppress`] so
+/// the engine can downgrade behavior instead of assuming local input is gone
+/// (audit H3).
 pub trait InputCapture: Send + Sync {
-    /// Begin capturing local input, delivering events to `sink`. Idempotent: calling
-    /// `start` while already capturing is a no-op.
-    fn start(&self, sink: std::sync::Arc<dyn InputSink>) -> PlatformResult<()>;
+    /// Transition capture to `mode`, delivering observed events to `sink`.
+    ///
+    /// Idempotent: re-entering the current mode is a no-op. Transitioning to
+    /// [`CaptureMode::Off`] tears everything down (equivalent to [`stop`]).
+    ///
+    /// This may be called from the engine runtime in response to an ownership
+    /// change. Adapters must tolerate being driven through
+    /// `PassiveEdge → ActiveForward → PassiveEdge` repeatedly within one session
+    /// without leaking threads, hooks, or half-installed state.
+    ///
+    /// [`stop`]: InputCapture::stop
+    fn set_mode(
+        &self,
+        mode: CaptureMode,
+        sink: &std::sync::Arc<dyn InputSink>,
+    ) -> PlatformResult<()>;
 
-    /// Stop capturing local input. Idempotent.
+    /// Stop capturing local input entirely ([`CaptureMode::Off`]). Idempotent.
     fn stop(&self) -> PlatformResult<()>;
 
-    /// Whether this capture backend can actually swallow local input
-    /// ([`CaptureDecision::Suppress`]) in its current state. `false` means
-    /// suppression requests are observed but pass through (e.g. listen-only tap,
-    /// or missing Accessibility on macOS); the engine should surface the reduced
-    /// capability rather than rely on suppression.
+    /// Whether the **current** mode can actually swallow local input
+    /// ([`CaptureDecision::Suppress`]). Only ever `true` in
+    /// [`CaptureMode::ActiveForward`] with the suppression mechanism installed;
+    /// `false` in [`CaptureMode::Off`]/[`CaptureMode::PassiveEdge`] and when a
+    /// permission/grant is missing (e.g. listen-only tap, missing Accessibility).
+    /// The engine surfaces the reduced capability rather than relying on
+    /// suppression.
     fn can_suppress(&self) -> bool;
+
+    /// The [`CaptureMode`] the adapter is currently in. Observability hook used by
+    /// the engine/tests to assert that idle/connected operation never escalates to
+    /// [`CaptureMode::ActiveForward`].
+    fn current_mode(&self) -> CaptureMode;
 }
 
 /// Read and write the system clipboard (spec §7.7).

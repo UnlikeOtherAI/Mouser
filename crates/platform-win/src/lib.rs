@@ -2,8 +2,10 @@
 //!
 //! [`adapter::WinInjector`] implements `mouser_core::InputInjection` over the
 //! `SendInput` backend in [`inject`]. [`adapter::WinCapture`] implements
-//! `mouser_core::InputCapture` with low-level keyboard/mouse hooks. [`keymap`]
-//! is the Windows HID↔scancode/VK table, and [`clipboard`] is the Win32
+//! `mouser_core::InputCapture` as a `CaptureMode` state machine: passive
+//! `GetCursorPos` edge sensing while connected (no hooks, no suppression) and
+//! low-level keyboard/mouse hooks only while actively forwarding to a peer.
+//! [`keymap`] is the Windows HID↔scancode/VK table, and [`clipboard`] is the Win32
 //! clipboard adapter.
 //!
 //! It deliberately does **not** set `[lints] workspace = true`: the workspace

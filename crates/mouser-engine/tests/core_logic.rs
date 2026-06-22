@@ -1,7 +1,7 @@
 //! Unit tests for the pure [`EngineCore`] state machine: edge-crossing handoff,
 //! input forwarding, injection, anti-replay, and heartbeat-timeout reclaim.
 
-use mouser_core::platform::LocalInputEvent;
+use mouser_core::platform::{CaptureMode, LocalInputEvent};
 use mouser_engine::core::{Action, CaptureDecision, EngineCore, Inject};
 use mouser_engine::EdgeLayout;
 use mouser_protocol::{
@@ -24,6 +24,18 @@ fn has_capture(actions: &[Action], want: CaptureDecision) -> bool {
     actions
         .iter()
         .any(|a| matches!(a, Action::Capture(d) if *d == want))
+}
+
+fn has_set_mode(actions: &[Action], want: CaptureMode) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, Action::SetCaptureMode(m) if *m == want))
+}
+
+fn has_any_set_mode(actions: &[Action]) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, Action::SetCaptureMode(_)))
 }
 
 fn cursor(x: i32, y: i32) -> LocalInputEvent {
@@ -288,4 +300,95 @@ fn peer_heartbeat_prevents_reclaim() {
         e.on_control(mouser_protocol::TYPE_HEARTBEAT, &hb);
     }
     assert!(!e.is_owner(), "a live peer keeps ownership");
+}
+
+// --- Capture-mode lifecycle (edge sensing is not input forwarding) ---
+
+#[test]
+fn source_starts_in_passive_edge_sensing() {
+    let e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
+    assert!(
+        has_set_mode(&e.initial_actions(), CaptureMode::PassiveEdge),
+        "a source comes up in passive edge sensing, not forwarding capture"
+    );
+}
+
+#[test]
+fn target_starts_and_stays_capture_off() {
+    let mut t = EngineCore::new_target(ME, PEER);
+    assert_eq!(t.capture_mode(), CaptureMode::Off);
+    assert!(has_set_mode(&t.initial_actions(), CaptureMode::Off));
+
+    // Accepting a grant makes the target the owner, but it still never captures.
+    let grant = to_cbor(&OwnershipTransfer {
+        to: ME.to_vec(),
+        owner_epoch: 1,
+        layout_rev: 0,
+        reason: TransferReason::EdgeCross,
+    })
+    .unwrap();
+    let a = t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
+    assert!(t.is_owner());
+    assert!(
+        !has_any_set_mode(&a),
+        "a target never emits a capture-mode change"
+    );
+    assert_eq!(t.capture_mode(), CaptureMode::Off);
+}
+
+#[test]
+fn idle_cursor_on_own_screen_does_not_escalate_capture() {
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    let a = e.on_local_input(cursor(50, 50));
+    assert!(
+        !has_any_set_mode(&a),
+        "a cursor that has not reached the edge keeps passive sensing"
+    );
+    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
+}
+
+#[test]
+fn edge_cross_escalates_to_active_forward_first() {
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    let a = e.on_local_input(cursor(99, 40));
+    assert!(
+        matches!(a.first(), Some(Action::SetCaptureMode(CaptureMode::ActiveForward))),
+        "the capture escalates to ActiveForward before suppressing/forwarding the crossing"
+    );
+    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
+    assert!(!e.is_owner());
+}
+
+#[test]
+fn reclaim_by_crossing_back_drops_to_passive_edge() {
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    e.on_local_input(cursor(99, 40)); // cross to peer → ActiveForward
+    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
+
+    // Move the (suppressed) cursor back across the near edge → reclaim locally.
+    let a = e.on_local_input(cursor(98, 40));
+    assert!(
+        matches!(a.first(), Some(Action::SetCaptureMode(CaptureMode::PassiveEdge))),
+        "reclaim drops suppressing capture back to passive edge sensing first"
+    );
+    assert!(e.is_owner());
+    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
+}
+
+#[test]
+fn heartbeat_timeout_reclaim_drops_to_passive_edge() {
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    e.on_local_input(cursor(99, 40)); // hand off → ActiveForward
+    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
+
+    e.on_tick();
+    e.on_tick();
+    let a = e.on_tick(); // third missed heartbeat → reclaim
+    assert!(e.is_owner());
+    assert!(
+        has_set_mode(&a, CaptureMode::PassiveEdge),
+        "a heartbeat-timeout reclaim tears down forwarding capture"
+    );
+    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
 }

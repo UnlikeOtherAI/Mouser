@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mouser_core::platform::{InputCapture, InputInjection, InputSink};
+use mouser_core::platform::{InputCapture, InputInjection};
 use mouser_core::DeviceId;
 use mouser_net::{
     Advertiser, Browser, DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PeerEvent,
@@ -17,7 +17,7 @@ use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::{discovery, EngineCore, RuntimeHandle};
 
 use super::ipc_bridge::{ConnectRequest, IpcBridge};
-use super::{hostname, source_layout, windows_firewall_hint, EngineSink};
+use super::{hostname, source_layout, windows_firewall_hint};
 
 /// A serve role (`auto`/`source`/`target`): advertise + discover over mDNS, run the
 /// [`IpcBridge`] so the desktop UI reflects/drives the engine, then form one peer
@@ -28,7 +28,7 @@ pub(super) async fn serve(
     store: &DaemonStore,
     role: &str,
     injector: Arc<dyn InputInjection>,
-    capture: Box<dyn InputCapture>,
+    capture: Arc<dyn InputCapture>,
 ) -> Result<(), String> {
     let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
     let my_id = me.device_id();
@@ -110,7 +110,7 @@ pub(super) async fn serve(
         can_control,
         conn,
         injector,
-        capture.as_ref(),
+        Arc::clone(&capture),
         bridge.as_ref(),
     )
     .await;
@@ -233,15 +233,20 @@ async fn browser_addr_for(browser: &Browser, peer_id: &DeviceId) -> Option<Socke
     }
 }
 
-/// Run the connected session: start the engine runtime, (for a controller) the capture
-/// hooks, and wait until ctrl-c or an IPC `Disconnect` ends it.
+/// Run the connected session: start the engine runtime (which owns the capture
+/// adapter and drives its mode from ownership), then wait until ctrl-c or an IPC
+/// `Disconnect` ends it.
+///
+/// The runtime never installs an always-on hook: a controller comes up in passive
+/// edge sensing (no suppression, local input untouched) and only escalates to
+/// suppressing capture while it is actively driving the peer.
 async fn run_session(
     my_id: DeviceId,
     peer: DeviceId,
     can_control: bool,
     conn: InteractiveConnection,
     injector: Arc<dyn InputInjection>,
-    capture: &dyn InputCapture,
+    capture: Arc<dyn InputCapture>,
     bridge: Option<&IpcBridge>,
 ) {
     let core = if can_control {
@@ -249,17 +254,13 @@ async fn run_session(
     } else {
         EngineCore::new_target(my_id, peer)
     };
-    let runtime = Arc::new(RuntimeHandle::start(core, Arc::new(conn), injector));
+    let runtime = RuntimeHandle::start(core, Arc::new(conn), injector, capture);
 
     if can_control {
-        let sink: Arc<dyn InputSink> = Arc::new(EngineSink {
-            runtime: Arc::clone(&runtime),
-        });
-        if let Err(e) = capture.start(sink) {
-            eprintln!("mouserd: capture failed to start: {e}");
-        } else {
-            eprintln!("mouserd: capture ready - local keys/buttons stay local until edge crossing");
-        }
+        eprintln!(
+            "mouserd: passive edge sensing active - local keyboard/mouse stay native; \
+             suppressing capture installs only while controlling the peer"
+        );
     } else {
         eprintln!("mouserd: target ready - injecting input received from the source");
     }
@@ -271,8 +272,8 @@ async fn run_session(
             eprintln!("mouserd: disconnect requested over IPC");
         }
     }
-    // Keep the runtime alive for the whole session (its tasks own the connection).
-    drop(runtime);
+    // Tear down the runtime tasks and the capture adapter (drops any hooks/poll).
+    runtime.shutdown();
 }
 
 /// Resolve when an IPC `Disconnect` command arrives (inert in headless mode).

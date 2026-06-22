@@ -14,32 +14,18 @@ mod serve;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mouser_core::platform::{
-    CaptureDecision as CoreDecision, InputCapture, InputInjection, InputSink, LocalInputEvent,
-};
+use mouser_core::platform::{InputCapture, InputInjection};
 
-use crate::core::CaptureDecision;
 use crate::daemon_store::{format_device_id, parse_peer_id_arg, DaemonStore};
-use crate::{EdgeLayout, RuntimeHandle};
-
-/// Bridges the platform capture sink to the engine runtime: every local event is fed
-/// to the core, which decides suppress vs pass-through. Shared by the serve and direct
-/// controller paths.
-struct EngineSink {
-    runtime: Arc<RuntimeHandle>,
-}
-
-impl InputSink for EngineSink {
-    fn on_event(&self, event: LocalInputEvent) -> CoreDecision {
-        match self.runtime.feed_local(event) {
-            CaptureDecision::Suppress => CoreDecision::Suppress,
-            CaptureDecision::PassThrough => CoreDecision::PassThrough,
-        }
-    }
-}
+use crate::EdgeLayout;
 
 /// Run the daemon with the host's `injector` and `capture` adapters.
-pub fn run(injector: Arc<dyn InputInjection>, capture: Box<dyn InputCapture>) {
+///
+/// `capture` is an [`Arc`] because the engine runtime holds it for the session
+/// lifetime to drive [`mouser_core::platform::CaptureMode`] transitions (the
+/// runtime, not the daemon, decides when forwarding hooks install) while the serve
+/// loop keeps its own handle to stop it on shutdown.
+pub fn run(injector: Arc<dyn InputInjection>, capture: Arc<dyn InputCapture>) {
     let args: Vec<String> = std::env::args().collect();
     let arg1 = args
         .get(1)
@@ -168,14 +154,13 @@ fn role_from_arg(arg: &str) -> String {
 }
 
 fn default_role() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        "target"
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        "auto"
-    }
+    // `auto` on every platform: a node both advertises and browses, and either side
+    // can become the controller. This used to default to `target` on Windows as a
+    // safety workaround because becoming a source installed always-on low-level
+    // hooks that degraded local input. Capture is now ownership-driven (passive edge
+    // sensing while connected, suppressing hooks only while actively controlling), so
+    // Windows is a first-class source and no longer needs the workaround.
+    "auto"
 }
 
 /// The source-side edge layout, seeded from the local display size when available.
