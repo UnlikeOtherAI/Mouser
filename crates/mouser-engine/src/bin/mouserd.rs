@@ -1,13 +1,18 @@
 //! `mouserd` — the Mouser engine daemon.
 //!
-//! v1 single-peer bring-up: discover or dial a peer, establish the interactive QUIC
-//! connection (device_id-pinned, §3), and run the [`mouser_engine`] runtime wired to
-//! the host's real capture/injection adapters. On macOS that is `platform-mac`
-//! (`MacCapture` + `MacInjector`); other hosts are not wired here yet (the Windows
-//! adapter is built but plugged in from a Windows build).
+//! v1 single-peer bring-up: **auto-discover a peer over mDNS** (`_mouser._udp.local`,
+//! §4), establish the device_id-pinned interactive QUIC connection (§3), and run the
+//! [`mouser_engine`] runtime wired to the host's real capture/injection adapters. On
+//! macOS that is `platform-mac` (`MacCapture` + `MacInjector`).
 //!
-//! This is intentionally minimal — argument parsing, the §5 SAS pairing UI, mDNS
-//! auto-discovery, and the Tauri/IPC surface land on top of the runtime, not inside it.
+//! Usage:
+//! - `mouserd`          — auto: advertise + browse; the lower device_id becomes source.
+//! - `mouserd source`   — be the controller (capture + dial the discovered peer).
+//! - `mouserd target`   — be the controlled screen (accept + inject).
+//!
+//! Discovery itself is platform-agnostic (it lives in the shared `mouser-engine`/
+//! `mouser-net` crates over `mdns-sd`), so the same logic runs on Windows/Linux once
+//! their daemon is built. The §5 SAS pairing UI, CRDT layout, and Tauri/IPC sit above.
 
 fn main() {
     #[cfg(target_os = "macos")]
@@ -26,12 +31,17 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     use mouser_core::platform::{CaptureDecision as CoreDecision, InputCapture, InputSink, LocalInputEvent};
+    use mouser_core::DeviceId;
     use mouser_engine::core::CaptureDecision;
-    use mouser_engine::{EdgeLayout, EngineCore, RuntimeHandle};
-    use mouser_net::{DeviceIdentity, InteractiveEndpoint, PinPolicy};
+    use mouser_engine::{discovery, EdgeLayout, EngineCore, RuntimeHandle};
+    use mouser_net::{
+        Advertiser, Browser, DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PeerEvent,
+        PinPolicy,
+    };
     use platform_mac::adapter::{MacCapture, MacInjector};
 
     /// Bridges the platform capture sink to the engine runtime: every local event is
@@ -51,9 +61,8 @@ mod macos {
 
     pub fn run() {
         let args: Vec<String> = std::env::args().collect();
-        // Usage: mouserd <listen|connect> [peer_addr]
-        let mode = args.get(1).cloned().unwrap_or_else(|| "listen".to_string());
-        let peer_addr = args.get(2).cloned();
+        // Usage: mouserd [source|target]  (default: auto)
+        let role = args.get(1).cloned().unwrap_or_else(|| "auto".to_string());
 
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -64,96 +73,112 @@ mod macos {
         };
 
         rt.block_on(async move {
-            if let Err(e) = serve(&mode, peer_addr).await {
+            if let Err(e) = serve(&role).await {
                 eprintln!("mouserd: {e}");
                 std::process::exit(1);
             }
         });
     }
 
-    async fn serve(mode: &str, peer_addr: Option<String>) -> Result<(), String> {
+    async fn serve(role: &str) -> Result<(), String> {
         let me = DeviceIdentity::generate();
-        eprintln!("mouserd: device_id {}", me.device_id_base32());
+        let my_id = me.device_id();
+        let my_b32 = me.device_id_base32();
+        eprintln!("mouserd: device_id {my_b32}");
 
-        // v1: pin-on-first-contact is approximated by accepting the peer's presented
-        // cert and deriving its device_id; real trust requires the §5 SAS pairing.
-        let conn = match mode {
-            "connect" => {
-                let addr = peer_addr
-                    .ok_or("connect mode needs a peer address, e.g. mouserd connect 192.168.1.50:9000")?
-                    .parse()
-                    .map_err(|e| format!("bad peer address: {e}"))?;
-                let endpoint = InteractiveEndpoint::bind_client(mouser_net::loopback_addr())
-                    .map_err(|e| e.to_string())?;
-                // Pin the peer once we learn it; for bring-up we expect a known id via env.
-                let peer = expected_peer()?;
-                endpoint
-                    .connect_interactive(&me, addr, PinPolicy::Pinned(peer))
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
-            _ => {
-                let peer = expected_peer()?;
-                let addr = "0.0.0.0:9000".parse().map_err(|e| format!("addr: {e}"))?;
-                let endpoint = InteractiveEndpoint::bind_server(&me, addr, PinPolicy::Pinned(peer))
-                    .map_err(|e| e.to_string())?;
-                eprintln!("mouserd: listening on {}", endpoint.local_addr().map_err(|e| e.to_string())?);
-                endpoint.accept_interactive().await.map_err(|e| e.to_string())?
-            }
+        // One endpoint both accepts (TrustOnFirstUse — trust is the §3 cert pin checked
+        // against the mDNS-advertised id) and dials.
+        let bind = SocketAddr::from(([0, 0, 0, 0], 0));
+        let endpoint = InteractiveEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
+            .map_err(|e| e.to_string())?;
+        let iport = endpoint.local_addr().map_err(|e| e.to_string())?.port();
+
+        // Advertise this device over mDNS (§4) so the peer can find us.
+        let host_ip = discovery::local_ipv4()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let advert = discovery::local_advert(&me, &hostname(), iport);
+        let _advertiser = Advertiser::advertise(&advert, &host_ip).map_err(|e| e.to_string())?;
+        eprintln!("mouserd: advertising {host_ip}:{iport} as {}", advert.instance_name());
+
+        let browser = Browser::browse().map_err(|e| e.to_string())?;
+        eprintln!("mouserd: searching for peers on the local network…");
+
+        // Form exactly one connection per role (whichever side dials/accepts).
+        let (conn, is_source) = match role {
+            "source" => (dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, true).await?, true),
+            "target" => (endpoint.accept_interactive().await.map_err(|e| e.to_string())?, false),
+            _ => tokio::select! {
+                accepted = endpoint.accept_interactive() => (accepted.map_err(|e| e.to_string())?, false),
+                dialed = dial_discovered(&endpoint, &me, my_id, &my_b32, &browser, false) => (dialed?, true),
+            },
         };
 
-        let peer = conn.peer_device_id().ok_or("peer did not present a pinned device_id")?;
-        eprintln!("mouserd: connected to peer; starting engine");
+        let peer = conn.peer_device_id().ok_or("peer did not present a device_id")?;
+        eprintln!(
+            "mouserd: connected as {}",
+            if is_source { "source (controller)" } else { "target (controlled)" }
+        );
 
         let injector = Arc::new(MacInjector::new());
-        let core = if mode == "connect" {
-            // The dialer is the source (has the keyboard/mouse) in this bring-up.
-            EngineCore::new_source(me.device_id(), peer, EdgeLayout::side_by_side(1512, 982, 1920, 1080))
+        let core = if is_source {
+            EngineCore::new_source(my_id, peer, EdgeLayout::side_by_side(1512, 982, 1920, 1080))
         } else {
-            EngineCore::new_target(me.device_id(), peer)
+            EngineCore::new_target(my_id, peer)
         };
-
         let runtime = Arc::new(RuntimeHandle::start(core, Arc::new(conn), injector));
 
-        // The source captures local input and feeds it to the engine.
-        if mode == "connect" {
+        if is_source {
             let capture = MacCapture::new();
             let sink: Arc<dyn InputSink> = Arc::new(EngineSink { runtime: Arc::clone(&runtime) });
             capture.start(sink).map_err(|e| e.to_string())?;
-            eprintln!("mouserd: capturing local input (move cursor to the right edge to cross)");
+            eprintln!("mouserd: capturing — move the cursor to the right edge to cross to the peer");
         } else {
-            eprintln!("mouserd: target ready; will inject input received from the source");
+            eprintln!("mouserd: target ready — injecting input received from the source");
         }
 
-        // Run until interrupted.
         tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
         eprintln!("mouserd: shutting down");
         Ok(())
     }
 
-    /// v1 bring-up pins the peer's device_id supplied out-of-band via `MOUSER_PEER`
-    /// (base32). Real discovery + SAS pairing replace this.
-    fn expected_peer() -> Result<[u8; 32], String> {
-        let raw = std::env::var("MOUSER_PEER")
-            .map_err(|_| "set MOUSER_PEER to the peer's device_id (base32) for v1 bring-up")?;
-        decode_base32_id(&raw)
-    }
-
-    fn decode_base32_id(s: &str) -> Result<[u8; 32], String> {
-        // RFC 4648 base32 (no padding, lowercase), matching `device_id_base32`.
-        const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-        let mut bits = 0u32;
-        let mut nbits = 0u32;
-        let mut out = Vec::with_capacity(32);
-        for ch in s.trim().bytes() {
-            let val = ALPHABET.iter().position(|&c| c == ch).ok_or("invalid base32 char")? as u32;
-            bits = (bits << 5) | val;
-            nbits += 5;
-            if nbits >= 8 {
-                nbits -= 8;
-                out.push(((bits >> nbits) & 0xFF) as u8);
+    /// Browse mDNS until a dialable peer appears and dial it (device_id-pinned, §3).
+    /// When `force` is false (auto mode) only the lower `device_id` dials, so the two
+    /// sides don't connect twice.
+    async fn dial_discovered(
+        endpoint: &InteractiveEndpoint,
+        me: &DeviceIdentity,
+        my_id: DeviceId,
+        my_b32: &str,
+        browser: &Browser,
+        force: bool,
+    ) -> Result<InteractiveConnection, String> {
+        loop {
+            match browser.next_event().await {
+                Some(PeerEvent::Found(peer)) if peer.id != my_b32 => {
+                    let Some(peer_id) = discovery::peer_device_id(&peer) else { continue };
+                    if !force && my_id >= peer_id {
+                        continue; // the peer (lower id) will dial us; we accept instead
+                    }
+                    let Some(addr) = discovery::peer_socket_addr(&peer) else { continue };
+                    eprintln!("mouserd: dialing {} at {addr}", peer.instance_name());
+                    return endpoint
+                        .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
+                        .await
+                        .map_err(|e| e.to_string());
+                }
+                Some(_) => continue,
+                None => return Err("mDNS browse channel closed".to_string()),
             }
         }
-        <[u8; 32]>::try_from(out.as_slice()).map_err(|_| "device_id must be 32 bytes".to_string())
+    }
+
+    /// Best-effort host display name for the advertisement (advisory only, §4).
+    fn hostname() -> String {
+        std::env::var("HOST")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Mac".to_string())
     }
 }

@@ -15,6 +15,7 @@ mouser-protocol = { path = "../mouser-protocol" }
 mouser-core = { path = "../mouser-core" }
 mouser-net = { path = "../mouser-net" }
 serde = { version = "1", features = ["derive"] }
+data-encoding = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 thiserror = "2"
 
