@@ -74,6 +74,22 @@ final class MouserClient: ObservableObject {
         inner.sendKey(usage: usage, down: down, mods: mods)
     }
 
+    /// Forward a typed character as a HID press+release, if it maps to a key on a
+    /// US layout (`HidKeymap`). Unmappable characters are silently skipped.
+    func type(_ character: Character) {
+        guard isConnected, let stroke = HidKeymap.stroke(for: character) else { return }
+        key(usage: stroke.usage, down: true, mods: stroke.mods)
+        key(usage: stroke.usage, down: false, mods: stroke.mods)
+    }
+
+    /// Forward a single named key (e.g. Return on submit, Backspace on delete) as a
+    /// press+release with no modifiers.
+    func tapKey(_ usage: UInt16) {
+        guard isConnected else { return }
+        key(usage: usage, down: true)
+        key(usage: usage, down: false)
+    }
+
     // MARK: - Safe conversions
 
     /// Round + clamp a CGFloat delta to a sane Int32 (guards NaN/∞ → never traps).

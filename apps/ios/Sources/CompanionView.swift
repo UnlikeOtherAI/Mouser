@@ -14,6 +14,12 @@ import SwiftUI
 ///     (no keyboard, no chrome beyond a small overlay) to maximise the surface.
 struct CompanionView: View {
     @State private var captured: String = ""
+    /// The text we have already forwarded to the peer. We diff every `captured`
+    /// change against this to derive the keystrokes to send (appended chars →
+    /// typed keys; removed chars → Backspace). Kept in lock-step with `captured`
+    /// so the field stays usable and what's on screen always reflects what was
+    /// sent. See `forwardKeystrokes(from:to:)`.
+    @State private var lastForwarded: String = ""
     @FocusState private var keyboardFocused: Bool
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.scenePhase) private var scenePhase
@@ -40,6 +46,29 @@ struct CompanionView: View {
     /// Dial a tapped peer (host/port/device_id resolved by `PeerBrowser`).
     private func connect(to peer: Peer) {
         mouser.connect(host: peer.host, port: peer.port, peerId: peer.deviceId)
+    }
+
+    /// Forward the difference between what we last sent (`lastForwarded`) and the
+    /// new field value as HID key events. We find the common prefix, send a
+    /// Backspace for every removed character, then type every newly-added
+    /// character. This one rule covers plain typing (append), deletion
+    /// (Backspace), and autocorrect/paste replacements (Backspaces + retype).
+    ///
+    /// We diff against `lastForwarded` (our state) rather than the value SwiftUI
+    /// hands `onChange`, so a programmatic clear that pre-sets `lastForwarded`
+    /// (e.g. on submit) produces no phantom keystrokes. `lastForwarded` is always
+    /// advanced to `new` so the on-screen text and the sent stream stay in sync.
+    private func forwardKeystrokes(to new: String) {
+        let old = lastForwarded
+        defer { lastForwarded = new }
+        guard mouser.isConnected else { return }
+
+        let common = old.commonPrefix(with: new)
+        let removed = old.count - common.count
+        for _ in 0..<removed { mouser.tapKey(HidKeymap.backspaceUsage) }
+        // `common` is a fresh String, so index `new` by the shared prefix length.
+        let addedStart = new.index(new.startIndex, offsetBy: common.count)
+        for character in new[addedStart...] { mouser.type(character) }
     }
 
     var body: some View {
@@ -185,6 +214,21 @@ struct CompanionView: View {
                 .focused($keyboardFocused)
                 .submitLabel(.send)
                 .accessibilityIdentifier("keyboard.field")
+                // Forward each field edit as keystrokes (diffed against what we
+                // last sent). Disabling autocorrect/autocapitalisation above keeps
+                // the diff a clean append/delete rather than surprise rewrites.
+                .onChange(of: captured) { _, new in
+                    forwardKeystrokes(to: new)
+                }
+                // Send on the keyboard's Send (Return) key, then clear the field
+                // for the next line. Reset `lastForwarded` to empty BEFORE clearing
+                // `captured` so the resulting `onChange` diffs ""→"" — no phantom
+                // Backspaces for the text we just sent as Return-terminated input.
+                .onSubmit {
+                    mouser.tapKey(HidKeymap.returnUsage)
+                    lastForwarded = ""
+                    captured = ""
+                }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
