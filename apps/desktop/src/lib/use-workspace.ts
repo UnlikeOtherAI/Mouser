@@ -39,9 +39,11 @@ interface RawEngineConnection {
   peer_id: string | null;
   owner: string | null;
   epoch: number | null;
+  error: string | null;
 }
 interface RawEngineSnapshot {
   engine_running: boolean;
+  local_id: string | null;
   peers: RawEnginePeer[];
   connection: RawEngineConnection;
 }
@@ -113,6 +115,7 @@ function toConnection(raw: RawEngineConnection): EngineConnection {
     peerId: raw.peer_id,
     owner: raw.owner,
     epoch: raw.epoch,
+    error: raw.error,
   };
 }
 
@@ -121,6 +124,7 @@ const IDLE_CONNECTION: EngineConnection = {
   peerId: null,
   owner: null,
   epoch: null,
+  error: null,
 };
 
 export interface Workspace {
@@ -130,6 +134,8 @@ export interface Workspace {
   peers: Peer[];
   /** The engine's current connection state. */
   connection: EngineConnection;
+  /** This machine's engine pairing id (base32) the other device must trust. */
+  localId: string | null;
   /** True when the daemon's IPC socket is reachable; false means it isn't running. */
   engineRunning: boolean;
   /** True until the real device query resolves (or falls back). */
@@ -138,6 +144,8 @@ export interface Workspace {
   connectPeer: (peerId: string) => Promise<void>;
   /** Ask the engine to tear down the current connection. */
   disconnectPeer: () => Promise<void>;
+  /** Pair (trust) a discovered peer on this machine by id. */
+  trustPeer: (peerId: string) => Promise<void>;
 }
 
 async function tauriInvoke(): Promise<
@@ -163,6 +171,7 @@ export function useWorkspace(): Workspace {
   const [devices, setDevices] = useState<Device[]>(FALLBACK);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [connection, setConnection] = useState<EngineConnection>(IDLE_CONNECTION);
+  const [localId, setLocalId] = useState<string | null>(null);
   const [engineRunning, setEngineRunning] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -201,6 +210,7 @@ export function useWorkspace(): Workspace {
           const raw = await invoke<RawEngineSnapshot>("engine_snapshot");
           if (cancelled) return;
           setEngineRunning(raw.engine_running);
+          setLocalId(raw.local_id);
           setPeers(raw.peers.map(toPeer));
           setConnection(toConnection(raw.connection));
         } catch {
@@ -228,13 +238,21 @@ export function useWorkspace(): Workspace {
     await invoke("disconnect_peer");
   }, []);
 
+  const trustPeer = useCallback(async (peerId: string): Promise<void> => {
+    const invoke = await tauriInvoke();
+    if (invoke === null) return;
+    await invoke("trust_peer", { peerId });
+  }, []);
+
   return {
     devices,
     peers,
     connection,
+    localId,
     engineRunning,
     loading,
     connectPeer,
     disconnectPeer,
+    trustPeer,
   };
 }

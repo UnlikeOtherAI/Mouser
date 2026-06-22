@@ -68,6 +68,8 @@ export interface EngineConnection {
   owner: string | null;
   /** Current ownership epoch, when connected. */
   epoch: number | null;
+  /** Why the last connection attempt failed, when known. */
+  error: string | null;
 }
 
 export type SectionId =

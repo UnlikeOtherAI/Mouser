@@ -122,6 +122,33 @@ impl IpcBridge {
             peer_id: Some(peer_id.to_string()),
             owner: Some(owner_id.to_string()),
             epoch: None,
+            error: None,
+        };
+        self.republish();
+    }
+
+    /// Report that a dial to `peer_id` is in progress; republish the snapshot so the
+    /// UI can show "connecting" and clear any prior failure.
+    pub fn set_connecting(&self, peer_id: &str) {
+        *lock(&self.shared.connection) = ConnectionDto {
+            state: ConnectionStateDto::Connecting,
+            peer_id: Some(peer_id.to_string()),
+            owner: None,
+            epoch: None,
+            error: None,
+        };
+        self.republish();
+    }
+
+    /// Report that the last connection attempt failed with `reason`; republish so the
+    /// UI can explain the failure instead of silently returning to idle.
+    pub fn set_connect_error(&self, reason: &str) {
+        *lock(&self.shared.connection) = ConnectionDto {
+            state: ConnectionStateDto::Idle,
+            peer_id: None,
+            owner: None,
+            epoch: None,
+            error: Some(reason.to_string()),
         };
         self.republish();
     }

@@ -72,6 +72,12 @@ pub struct ConnectionDto {
     pub owner: Option<String>,
     /// The current ownership epoch, when connected.
     pub epoch: Option<u64>,
+    /// The reason the last connection attempt failed, when known. Set when a dial
+    /// requested over IPC could not complete (e.g. the peer is not trusted, not
+    /// discoverable, or unreachable) so the UI can explain the failure instead of
+    /// silently returning to idle. Cleared on a new attempt or a successful connect.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl Default for ConnectionDto {
@@ -81,6 +87,7 @@ impl Default for ConnectionDto {
             peer_id: None,
             owner: None,
             epoch: None,
+            error: None,
         }
     }
 }

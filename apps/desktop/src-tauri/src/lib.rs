@@ -69,6 +69,9 @@ struct LocalDevice {
 struct EngineSnapshot {
     /// True when the daemon's IPC socket answered; false means it is not running.
     engine_running: bool,
+    /// This machine's engine device id (base32). The pairing id another device must
+    /// trust to allow a connection — surfaced so the UI can show it for pairing.
+    local_id: Option<String>,
     /// Peers the engine has discovered, with trust + connection-relevant fields.
     peers: Vec<EnginePeer>,
     /// Current connection state.
@@ -94,6 +97,8 @@ struct EngineConnection {
     peer_id: Option<String>,
     owner: Option<String>,
     epoch: Option<u64>,
+    /// Why the last connection attempt failed, when known (so the UI can explain it).
+    error: Option<String>,
 }
 
 impl EngineSnapshot {
@@ -105,20 +110,24 @@ impl EngineSnapshot {
     fn offline() -> Self {
         Self {
             engine_running: false,
+            local_id: None,
             peers: Vec::new(),
             connection: EngineConnection {
                 state: "idle".to_string(),
                 peer_id: None,
                 owner: None,
                 epoch: None,
+                error: None,
             },
         }
     }
 
     /// Convert a live engine [`Snapshot`] into the UI shape.
     fn from_snapshot(snapshot: Snapshot) -> Self {
+        let local_id = Some(snapshot.local.id.clone());
         Self {
             engine_running: true,
+            local_id,
             peers: snapshot
                 .peers
                 .into_iter()
@@ -136,6 +145,7 @@ impl EngineSnapshot {
                 peer_id: snapshot.connection.peer_id,
                 owner: snapshot.connection.owner,
                 epoch: snapshot.connection.epoch,
+                error: snapshot.connection.error,
             },
         }
     }
@@ -240,6 +250,20 @@ async fn connect_peer(peer_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn disconnect_peer() -> Result<(), String> {
     send_command(Command::Disconnect).await
+}
+
+/// Pair (trust) a discovered peer on this machine by its base32 id, so the engine
+/// will allow a connection to/from it. Runs `mouserd trust <peer-id>`, which writes
+/// the trust pin the running daemon reads fresh on its next check. NOTE: pairing is
+/// mutual — the *other* device must also trust this machine's id (see `local_id` in
+/// the engine snapshot) before a connection can be established (spec §3).
+#[tauri::command]
+async fn trust_peer(app: tauri::AppHandle, peer_id: String) -> Result<(), String> {
+    let path = engine::resolve_mouserd(&app);
+    tauri::async_runtime::spawn_blocking(move || engine::mouserd_query(&path, &["trust", &peer_id]))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|_| ())
 }
 
 /// Open a short-lived IPC client, fetch one snapshot, and close. Commands are rare and
@@ -418,6 +442,7 @@ pub fn run() {
             engine_snapshot,
             connect_peer,
             disconnect_peer,
+            trust_peer,
             set_tray_icon_visible
         ])
         .build(tauri::generate_context!())

@@ -118,6 +118,7 @@ mod loopback_tests {
             peer_id: Some("peerid".to_string()),
             owner: Some("localid".to_string()),
             epoch: Some(1),
+            error: None,
         };
         server.publish(updated.clone());
 

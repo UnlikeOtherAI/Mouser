@@ -149,11 +149,14 @@ async fn next_connection(
             }
             ipc = wait_for_connect(bridge) => {
                 if let Some(request) = ipc {
+                    let peer_text = format_device_id(&request.peer_id);
+                    if let Some(bridge) = bridge { bridge.set_connecting(&peer_text); }
                     match dial_connect_request(store, endpoint, me, registry, request).await {
                         Ok(conn) => return Some((conn, true)),
                         Err(e) => {
                             eprintln!("mouserd: IPC connect failed: {e}");
-                            if let Some(bridge) = bridge { bridge.set_idle(); }
+                            // Surface the reason to the UI instead of silently idling.
+                            if let Some(bridge) = bridge { bridge.set_connect_error(&e); }
                             continue;
                         }
                     }

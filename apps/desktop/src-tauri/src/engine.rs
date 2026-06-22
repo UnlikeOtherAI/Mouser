@@ -35,7 +35,7 @@ pub struct EngineProcess {
 
 /// Resolve the bundled `mouserd` engine from the installed app resources, else fall back
 /// to a `mouserd` on `PATH` (dev runs).
-fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
+pub fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(dir) = app.path().resource_dir() {
         let binaries = dir.join("binaries");
         let platform = binaries.join(mouserd_exe_name());
@@ -55,6 +55,30 @@ fn mouserd_exe_name() -> &'static str {
         "mouserd.exe"
     } else {
         "mouserd"
+    }
+}
+
+/// Run a short, blocking `mouserd` subcommand (e.g. `["trust", id]` or `["identity"]`)
+/// with no console window, returning its stdout on success or the stderr/message on
+/// failure. Used for one-shot control actions like pairing a peer.
+pub fn mouserd_query(path: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new(path);
+    for arg in args {
+        command.arg(arg);
+    }
+    // No console flash on Windows; `output()` supplies the piped stdio.
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "mouserd command failed".to_string()
+        } else {
+            stderr
+        })
     }
 }
 
