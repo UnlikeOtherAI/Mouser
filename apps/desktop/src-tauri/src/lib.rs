@@ -12,8 +12,6 @@
 //! snapshot command reports `engine_running: false` so the UI can degrade gracefully
 //! (show the local device + an "engine not running" hint).
 
-use std::path::PathBuf;
-use std::process::Child;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -24,6 +22,9 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WindowEvent,
 };
+
+mod engine;
+use engine::{stop_engine, supervise_engine, EngineProcess};
 
 /// Compile-time OS kind, matching the frontend `OsKind` union.
 const OS_KIND: &str = if cfg!(target_os = "macos") {
@@ -158,78 +159,8 @@ impl Default for DesktopPreferences {
     }
 }
 
-fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Handle to the `mouserd` engine the app launches and supervises, so the user never
-/// has to start a daemon themselves — the app administers it (spawn on launch, stop on
-/// quit). `None` when an engine was already running and we attached to it instead.
-#[derive(Default)]
-struct EngineProcess {
-    child: Mutex<Option<Child>>,
-}
-
-/// Resolve the bundled `mouserd` engine from the installed app resources, else fall
-/// back to a `mouserd` on `PATH` (dev runs).
-fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
-    if let Ok(dir) = app.path().resource_dir() {
-        let binaries = dir.join("binaries");
-        let platform = binaries.join(mouserd_exe_name());
-        if platform.exists() {
-            return platform;
-        }
-        let extensionless = binaries.join("mouserd");
-        if extensionless.exists() {
-            return extensionless;
-        }
-    }
-    PathBuf::from(mouserd_exe_name())
-}
-
-fn mouserd_exe_name() -> &'static str {
-    if cfg!(windows) {
-        "mouserd.exe"
-    } else {
-        "mouserd"
-    }
-}
-
-/// Ensure the engine is running: if the IPC socket doesn't already answer, launch the
-/// bundled `mouserd` and keep its handle so [`run`] can stop it on exit. Windows starts
-/// in explicit receive-only target mode, avoiding global capture hooks until the user
-/// explicitly connects.
-fn ensure_engine_running(app: &tauri::AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        // An engine is already up (a prior app instance, or a user-run daemon) — attach.
-        if mouser_ipc::Client::connect().await.is_ok() {
-            return;
-        }
-        let path = resolve_mouserd(&app);
-        let mut command = std::process::Command::new(&path);
-        for arg in mouserd_launch_args() {
-            command.arg(arg);
-        }
-        match command.spawn() {
-            Ok(child) => {
-                *lock_recover(&app.state::<EngineProcess>().child) = Some(child);
-                eprintln!("mouser-desktop: launched engine {}", path.display());
-            }
-            Err(e) => eprintln!(
-                "mouser-desktop: failed to launch engine {}: {e}",
-                path.display()
-            ),
-        }
-    });
-}
-
-fn mouserd_launch_args() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["target"]
-    } else {
-        &[]
-    }
 }
 
 /// Returns the real local device: friendly name, OS, and the physical monitor
@@ -453,11 +384,12 @@ pub fn run() {
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
-            // The app administers the engine: launch the headless `mouserd` daemon if it
-            // isn't already running, so the user never starts a daemon by hand. The engine
-            // owns mDNS discovery; the app reads peers from its IPC snapshot rather than
-            // running a second browse (which would race the engine's and miss peers).
-            ensure_engine_running(app.handle());
+            // The app administers the engine: launch + supervise the headless `mouserd`
+            // daemon (relaunch it if it dies), so the user never starts a daemon by hand.
+            // The engine owns mDNS discovery; the app reads peers from its IPC snapshot
+            // rather than running a second browse (which would race the engine's and miss
+            // peers).
+            supervise_engine(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -486,10 +418,7 @@ pub fn run() {
     // Stop the engine we launched when the app exits, so we don't orphan the daemon.
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            if let Some(mut child) = lock_recover(&app_handle.state::<EngineProcess>().child).take()
-            {
-                let _ = child.kill();
-            }
+            stop_engine(app_handle);
         }
     });
 }

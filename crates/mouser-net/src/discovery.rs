@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::{Mutex, PoisonError};
 
 use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
@@ -147,7 +148,9 @@ impl Advertiser {
         loopback: bool,
     ) -> Result<Self, NetError> {
         let daemon = new_daemon(loopback)?;
-        let (info, fullname) = build_service_info(advert, host_ip)?;
+        // Standalone advertiser (tests/loopback): pin the given address for deterministic
+        // same-host discovery rather than auto-tracking interfaces.
+        let (info, fullname) = build_service_info(advert, host_ip, false)?;
         daemon
             .register(info)
             .map_err(|e| NetError::Discovery(e.to_string()))?;
@@ -171,13 +174,17 @@ impl Drop for Advertiser {
 }
 
 /// Build the `_mouser._udp` [`ServiceInfo`] for `advert` on `host_ip` (§4), returning
-/// it alongside its DNS-SD fullname.
+/// it alongside its DNS-SD fullname. When `addr_auto` is set, the daemon keeps the A
+/// records in sync with the host's (enabled) interfaces, so the advertisement survives
+/// an interface/IP change (Wi-Fi↔Ethernet, DHCP renew) instead of pinning one address
+/// captured at startup. `host_ip` may be empty (no route yet) — auto-addr fills it in.
 fn build_service_info(
     advert: &PeerAdvert,
     host_ip: &str,
+    addr_auto: bool,
 ) -> Result<(ServiceInfo, String), NetError> {
     let host_name = format!("{}.local.", advert.id);
-    let info = ServiceInfo::new(
+    let mut info = ServiceInfo::new(
         SERVICE_TYPE,
         &advert.instance_name(),
         &host_name,
@@ -186,6 +193,9 @@ fn build_service_info(
         advert.txt_map(),
     )
     .map_err(|e| NetError::Discovery(e.to_string()))?;
+    if addr_auto {
+        info = info.enable_addr_auto();
+    }
     let fullname = info.get_fullname().to_string();
     Ok((info, fullname))
 }
@@ -197,6 +207,10 @@ fn build_service_info(
 /// is dropped, which shuts the daemon down (ending the browse too).
 pub struct Discovery {
     daemon: ServiceDaemon,
+    /// Fullnames of services registered through [`Discovery::advertise`], so [`Drop`] can
+    /// send mDNS goodbyes (TTL 0) before shutting the daemon down — `ServiceDaemon::exit`
+    /// does NOT goodbye on its own, so without this peers keep a stale record until TTL.
+    registered: Mutex<Vec<String>>,
 }
 
 impl Discovery {
@@ -204,6 +218,7 @@ impl Discovery {
     pub fn new() -> Result<Self, NetError> {
         Ok(Self {
             daemon: new_daemon(false)?,
+            registered: Mutex::new(Vec::new()),
         })
     }
 
@@ -211,15 +226,22 @@ impl Discovery {
     pub fn new_loopback() -> Result<Self, NetError> {
         Ok(Self {
             daemon: new_daemon(true)?,
+            registered: Mutex::new(Vec::new()),
         })
     }
 
-    /// Advertise this host (§4). The registration lasts until `self` is dropped.
+    /// Advertise this host (§4). The registration lasts until `self` is dropped. Uses
+    /// auto-addr so the A records follow the host's interfaces (survives IP changes);
+    /// `host_ip` is only an initial hint and may be empty.
     pub fn advertise(&self, advert: &PeerAdvert, host_ip: &str) -> Result<(), NetError> {
-        let (info, _fullname) = build_service_info(advert, host_ip)?;
+        let (info, fullname) = build_service_info(advert, host_ip, true)?;
         self.daemon
             .register(info)
             .map_err(|e| NetError::Discovery(e.to_string()))?;
+        self.registered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(fullname);
         Ok(())
     }
 
@@ -240,6 +262,17 @@ impl Discovery {
 
 impl Drop for Discovery {
     fn drop(&mut self) {
+        // Goodbye each advertised service (queued before Exit, so the daemon thread sends
+        // the TTL-0 records first) so peers prune us promptly instead of after cache TTL.
+        let registered = std::mem::take(
+            &mut *self
+                .registered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for fullname in registered {
+            let _ = self.daemon.unregister(&fullname);
+        }
         let _ = self.daemon.shutdown();
     }
 }

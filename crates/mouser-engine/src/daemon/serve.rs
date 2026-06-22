@@ -47,14 +47,18 @@ pub(super) async fn serve(
     // one peer registry that both the dialer and the IPC snapshot read. A host must use
     // ONE mDNS daemon: several browsing daemons race for inbound multicast and silently
     // drop peers on macOS. Kept alive for the whole serve() (drop ends advertise+browse).
+    // Initial address hint; empty when there's no route yet. The advertiser uses
+    // auto-addr, so it fills/updates the A records from the host's interfaces and never
+    // pins a stale or unspecified (0.0.0.0) address.
     let host_ip = discovery::local_ipv4()
         .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "0.0.0.0".to_string());
+        .unwrap_or_default();
     let advert = discovery::local_advert(&me, &hostname(), iport);
     let mdns = Discovery::new().map_err(|e| e.to_string())?;
     mdns.advertise(&advert, &host_ip).map_err(|e| e.to_string())?;
     eprintln!(
-        "mouserd: advertising {host_ip}:{iport} as {}",
+        "mouserd: advertising {}:{iport} as {}",
+        if host_ip.is_empty() { "auto" } else { &host_ip },
         advert.instance_name()
     );
     windows_firewall_hint(iport);
@@ -292,16 +296,32 @@ async fn dial_discovered(
             if !force && my_id >= peer_id {
                 continue; // the peer (lower id) will dial us; we accept instead
             }
-            if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
-                if warned_untrusted.insert(peer_id) {
-                    let peer_text = format_device_id(&peer_id);
-                    eprintln!(
-                        "mouserd: found untrusted peer {}; run `mouserd trust {peer_text}` \
-                         on this machine before connecting",
-                        peer.instance_name()
-                    );
+            // Skip-and-warn-once on both untrusted and trust-check errors. A propagating
+            // `?` here would bubble out of the function; `next_connection` re-enters this
+            // auto-dial arm immediately (no await), so a persistently failing trust check
+            // (e.g. an unreadable trusted-peers file) would spin the CPU.
+            match store.is_peer_trusted(&peer_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if warned_untrusted.insert(peer_id) {
+                        let peer_text = format_device_id(&peer_id);
+                        eprintln!(
+                            "mouserd: found untrusted peer {}; run `mouserd trust {peer_text}` \
+                             on this machine before connecting",
+                            peer.instance_name()
+                        );
+                    }
+                    continue;
                 }
-                continue;
+                Err(e) => {
+                    if warned_untrusted.insert(peer_id) {
+                        eprintln!(
+                            "mouserd: trust check failed for {}: {e}",
+                            peer.instance_name()
+                        );
+                    }
+                    continue;
+                }
             }
             let Some(addr) = discovery::peer_socket_addr(&peer) else {
                 continue;

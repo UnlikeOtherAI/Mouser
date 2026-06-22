@@ -175,11 +175,17 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
 }
 
 /// Republish a fresh snapshot whenever the shared discovery registry changes, so
-/// connected UIs see peers appear/leave live.
+/// connected UIs see peers appear/leave live. Publishes once up front (publish-then-wait)
+/// because the registry's browse runs before this loop subscribes, so peers discovered in
+/// that startup window are already folded in and would otherwise not surface until the
+/// next change (the bind-time snapshot was built from an empty registry).
 async fn republish_loop(shared: Arc<Shared>, publisher: Publisher) {
     let mut changes = shared.registry.subscribe();
-    while changes.changed().await.is_ok() {
+    loop {
         publisher.publish(build_snapshot(&shared));
+        if changes.changed().await.is_err() {
+            break; // registry sender dropped
+        }
     }
 }
 
