@@ -12,10 +12,12 @@
 //! snapshot command reports `engine_running: false` so the UI can degrade gracefully
 //! (show the local device + an "engine not running" hint).
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use mouser_ipc::{Client, Command, Snapshot};
+use mouser_net::{Browser, PeerAdvert, PeerEvent};
 use serde::Serialize;
 use tauri::{
     menu::MenuBuilder,
@@ -94,11 +96,28 @@ struct EngineConnection {
 }
 
 impl EngineSnapshot {
-    /// The state when the daemon is not reachable: no peers, idle connection.
-    fn engine_offline() -> Self {
+    /// The daemon is not running, but we discovered peers directly over mDNS. Show them
+    /// (read-only — `engine_running: false` tells the UI to prompt starting the engine
+    /// before connecting). `trusted` is unknown without the engine, so reported `false`.
+    fn from_mdns(adverts: Vec<PeerAdvert>) -> Self {
+        let mut peers: Vec<EnginePeer> = adverts
+            .into_iter()
+            .map(|a| {
+                let host = a.addrs.first().map(|ip| ip.to_string()).unwrap_or_default();
+                EnginePeer {
+                    name: if a.name.is_empty() { host.clone() } else { a.name },
+                    id: a.id,
+                    os: a.os,
+                    host,
+                    port: a.iport,
+                    trusted: false,
+                }
+            })
+            .collect();
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
         Self {
             engine_running: false,
-            peers: Vec::new(),
+            peers,
             connection: EngineConnection {
                 state: "idle".to_string(),
                 peer_id: None,
@@ -156,6 +175,38 @@ fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Peers this app discovered directly over mDNS, keyed by DNS-SD instance fullname.
+/// A standalone fallback so the Devices list is populated even when the headless
+/// `mouserd` engine isn't running (discovery needs no engine).
+#[derive(Default)]
+struct DiscoveredPeers {
+    inner: Arc<Mutex<HashMap<String, PeerAdvert>>>,
+}
+
+/// Snapshot the current mDNS-discovered peers.
+fn mdns_peers(state: &DiscoveredPeers) -> Vec<PeerAdvert> {
+    lock_recover(&state.inner).values().cloned().collect()
+}
+
+/// Continuously browse `_mouser._udp` and fold Found/Removed into the registry.
+async fn mdns_browse_loop(inner: Arc<Mutex<HashMap<String, PeerAdvert>>>) {
+    let browser = match Browser::browse() {
+        Ok(b) => b,
+        Err(_) => return, // no mDNS daemon available; leave the registry empty
+    };
+    while let Some(event) = browser.next_event().await {
+        match event {
+            PeerEvent::Found(advert) => {
+                let key = format!("{}.{}", advert.instance_name(), mouser_net::SERVICE_TYPE);
+                lock_recover(&inner).insert(key, advert);
+            }
+            PeerEvent::Removed(fullname) => {
+                lock_recover(&inner).remove(&fullname);
+            }
+        }
+    }
+}
+
 /// Returns the real local device: friendly name, OS, and the physical monitor
 /// layout reported by the windowing system (positions and sizes converted from
 /// physical pixels to logical points).
@@ -205,11 +256,14 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
 /// snapshot (`engine_running: false`) rather than failing, so the UI can show the
 /// local device with an "engine not running" hint.
 #[tauri::command]
-async fn engine_snapshot() -> EngineSnapshot {
-    match fetch_engine_snapshot().await {
+async fn engine_snapshot(peers: tauri::State<'_, DiscoveredPeers>) -> Result<EngineSnapshot, String> {
+    Ok(match fetch_engine_snapshot().await {
+        // Engine is up: it owns discovery + trust + the live connection.
         Ok(snapshot) => EngineSnapshot::from_snapshot(snapshot),
-        Err(_) => EngineSnapshot::engine_offline(),
-    }
+        // Engine is down: fall back to the peers we discovered over mDNS ourselves, so
+        // the Devices list is still populated (read-only until the engine is started).
+        Err(_) => EngineSnapshot::from_mdns(mdns_peers(&peers)),
+    })
 }
 
 /// Ask the engine to connect to a discovered, trusted peer by its base32 id.
@@ -341,9 +395,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(DesktopPreferences::default())
+        .manage(DiscoveredPeers::default())
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
+            // Browse mDNS directly so the Devices list is populated even without the
+            // headless engine running (the engine snapshot takes over when it is up).
+            let peers = app.state::<DiscoveredPeers>().inner.clone();
+            tauri::async_runtime::spawn(mdns_browse_loop(peers));
             Ok(())
         })
         .on_window_event(|window, event| {
