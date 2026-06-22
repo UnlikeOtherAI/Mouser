@@ -1,0 +1,337 @@
+//! `LinuxCapture` — the Linux [`InputCapture`] adapter (audit H3), the source-side
+//! counterpart to [`crate::adapter::UinputInjector`].
+//!
+//! It enumerates `/dev/input/event*`, opens the keyboard + pointer devices, reads
+//! evdev events on a background thread, translates them into the wire's
+//! [`LocalInputEvent`] model (HID usages on Usage Page 0x07, §7.5 button indices),
+//! and hands each to the [`InputSink`]. When the sink returns
+//! [`CaptureDecision::Suppress`] the adapter `EVIOCGRAB`-grabs the devices so the
+//! events no longer reach the local desktop (the machine is forwarding input to a
+//! remote peer); on [`CaptureDecision::PassThrough`] it ungrabs. Grabbing is the
+//! Linux suppression primitive, so [`InputCapture::can_suppress`] is `true` once
+//! at least one device is open.
+//!
+//! ## Suppression granularity (vs macOS)
+//! Unlike the macOS `CGEventTap` — which sits inline and can `Drop` the *very*
+//! event the sink rejected — evdev hands the reader a *copy* of each event; a
+//! grab only stops *future* delivery to the desktop. So the first event that
+//! flips the engine into "suppress" still reaches the local desktop, and the
+//! grab takes effect from the next event onward. For sustained ownership (the
+//! steady state of a handoff) the devices stay grabbed and local input is fully
+//! swallowed; only the single boundary event leaks. This is inherent to the
+//! evdev model and acceptable for the active-device handoff (the boundary event
+//! is what crosses the edge in the first place).
+//!
+//! Linux-only: it needs `/dev/input/event*` and `input_linux::EvdevHandle`.
+//!
+//! ## Coordinate model (documented limitation)
+//! evdev pointers report **relative** motion (`REL_X`/`REL_Y`); there is no
+//! per-display layout at this layer (cf. the injector's single global pointer
+//! space). The adapter integrates the deltas into a virtual absolute position
+//! clamped to a desktop bound and emits [`LocalInputEvent::CursorMoved`] on
+//! `display_id: 0`. True per-display routing needs the compositor layout
+//! (Wayland/X11) and is out of scope for this adapter (mirrors mac M1 / the
+//! injector).
+
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use input_linux::{EvdevHandle, Key};
+use mouser_core::platform::{
+    CaptureDecision, InputCapture, InputSink, PlatformError, PlatformResult,
+};
+
+use crate::capture_translate::{to_local_event, VirtualCursor};
+
+/// Directory the kernel exposes evdev device nodes under.
+const INPUT_DIR: &str = "/dev/input";
+
+/// `O_NONBLOCK` — opened non-blocking so the read loop can poll a stop flag
+/// instead of parking forever in `read` (mirrors `uinput::libc_nonblock`).
+fn o_nonblock() -> i32 {
+    0o0004000
+}
+
+/// How long the read loop sleeps between empty (`WouldBlock`) polls. Short enough
+/// that `stop()` is observed promptly; the cost is only paid when idle (real
+/// events return immediately).
+const IDLE_POLL: Duration = Duration::from_millis(4);
+
+/// Default virtual-desktop bound the integrated relative motion is clamped into,
+/// in logical pixels, when no explicit bound is supplied.
+const DEFAULT_DESKTOP_W: i32 = 1920;
+const DEFAULT_DESKTOP_H: i32 = 1080;
+
+/// One opened evdev device the capture reads from and (when suppressing) grabs.
+struct CaptureDevice {
+    /// Path of the node, for diagnostics.
+    path: PathBuf,
+    /// The evdev handle (owns the open fd).
+    handle: EvdevHandle<File>,
+    /// Whether this device is currently `EVIOCGRAB`-grabbed.
+    grabbed: bool,
+}
+
+/// Mutable run state shared between [`LinuxCapture`] and its reader thread.
+struct CaptureRun {
+    /// Set to `false` by [`LinuxCapture::stop`] to ask the reader thread to exit.
+    running: Arc<AtomicBool>,
+    /// Join handle for the reader thread, so `stop` can wait for it to drain.
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Whether suppression is possible (at least one device opened/grabbable).
+    can_suppress: bool,
+}
+
+/// Linux input capture over the raw evdev devices (audit H3).
+pub struct LinuxCapture {
+    inner: Arc<Mutex<CaptureRun>>,
+    desktop_w: i32,
+    desktop_h: i32,
+}
+
+impl Default for LinuxCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LinuxCapture {
+    /// A not-yet-started capture handle with the default desktop bound.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_desktop_bounds(DEFAULT_DESKTOP_W, DEFAULT_DESKTOP_H)
+    }
+
+    /// A not-yet-started capture handle integrating relative motion against a
+    /// `desktop_w × desktop_h` logical-pixel bound (clamps the virtual cursor).
+    #[must_use]
+    pub fn with_desktop_bounds(desktop_w: i32, desktop_h: i32) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CaptureRun {
+                running: Arc::new(AtomicBool::new(false)),
+                thread: None,
+                can_suppress: false,
+            })),
+            desktop_w: desktop_w.max(1),
+            desktop_h: desktop_h.max(1),
+        }
+    }
+}
+
+/// Lock a capture mutex on a runtime path without ever panicking.
+///
+/// The guarded [`CaptureRun`] carries no broken invariant after a panic (it is a
+/// thread handle + a couple of flags), so recovering the poisoned guard via
+/// [`PoisonError::into_inner`] is correct and keeps capture from aborting — the
+/// same discipline `platform-mac` and the uinput injector use.
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Capture could not open any usable input device — almost always missing
+/// permission on `/dev/input/event*` (needs the `input` group or root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoCaptureDevices;
+
+impl std::fmt::Display for NoCaptureDevices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no readable /dev/input/event* devices — add the user to the `input` \
+             group (or run as root) and relaunch"
+        )
+    }
+}
+
+impl std::error::Error for NoCaptureDevices {}
+
+/// Decide whether an opened device is one we want to read (a keyboard or a
+/// pointer). A device qualifies if it reports relative X+Y axes (a pointer) or
+/// any of the canonical keyboard keys (a keyboard). Devices we can't query are
+/// skipped (returns `false`) rather than erroring.
+fn is_input_of_interest(handle: &EvdevHandle<File>) -> bool {
+    // Pointer: has relative X and Y.
+    if let Ok(rel) = handle.relative_bits() {
+        if rel.get(input_linux::RelativeAxis::X) && rel.get(input_linux::RelativeAxis::Y) {
+            return true;
+        }
+    }
+    // Keyboard: reports a representative letter key (KEY_A) or Esc.
+    if let Ok(keys) = handle.key_bits() {
+        if keys.get(Key::A) || keys.get(Key::Esc) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Enumerate `/dev/input/event*`, open each non-blocking, and keep the keyboards
+/// and pointers. Unreadable nodes (permission, hot-unplug) are skipped, never
+/// fatal — robust enumeration (audit: don't panic on a bad device).
+fn open_devices(dir: &Path) -> Vec<CaptureDevice> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_event_node = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("event"));
+        if !is_event_node {
+            continue;
+        }
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .custom_flags(o_nonblock())
+            .open(&path)
+        else {
+            continue; // permission / transient — skip, don't fail capture.
+        };
+        let handle = EvdevHandle::new(file);
+        if is_input_of_interest(&handle) {
+            out.push(CaptureDevice {
+                path,
+                handle,
+                grabbed: false,
+            });
+        }
+    }
+    out
+}
+
+/// Apply the sink's [`CaptureDecision`] to the device grab state: grab all
+/// devices when suppressing, ungrab when passing through. Grab failures are
+/// logged-by-ignoring (best-effort) so a single uncooperative device can't abort
+/// capture; the engine still learns suppression may be partial via
+/// [`InputCapture::can_suppress`].
+fn apply_decision(devices: &mut [CaptureDevice], decision: CaptureDecision) {
+    let want_grab = matches!(decision, CaptureDecision::Suppress);
+    for dev in devices.iter_mut() {
+        if dev.grabbed != want_grab {
+            match dev.handle.grab(want_grab) {
+                Ok(()) => dev.grabbed = want_grab,
+                Err(e) => eprintln!(
+                    "mouser-capture: {} EVIOCGRAB failed on {}: {e}",
+                    if want_grab { "grab" } else { "ungrab" },
+                    dev.path.display()
+                ),
+            }
+        }
+    }
+}
+
+/// Read one batch of pending events from a single device and feed them to the
+/// sink, accumulating the strongest decision (Suppress wins, so a frame that
+/// should be swallowed is). Returns the decision for the batch; on `WouldBlock`
+/// (no pending events) returns `PassThrough` and `read_any = false`.
+fn drain_device(
+    dev: &EvdevHandle<File>,
+    sink: &dyn InputSink,
+    cursor: &VirtualCursor,
+) -> (CaptureDecision, bool) {
+    let mut decision = CaptureDecision::PassThrough;
+    let mut read_any = false;
+    // Drain everything currently buffered, then return to the poll loop. The
+    // loop ends on the first `Err` — `WouldBlock` (nothing pending on the
+    // non-blocking fd) or a transient read hiccup.
+    while let Ok(ev) = dev.read_input_event() {
+        read_any = true;
+        if let Some(local) = to_local_event(ev.kind, ev.code, ev.value, cursor) {
+            if matches!(sink.on_event(local), CaptureDecision::Suppress) {
+                decision = CaptureDecision::Suppress;
+            }
+        }
+    }
+    (decision, read_any)
+}
+
+impl InputCapture for LinuxCapture {
+    fn start(&self, sink: Arc<dyn InputSink>) -> PlatformResult<()> {
+        let mut guard = lock_recover(&self.inner);
+        // Idempotent: already capturing.
+        if guard.thread.is_some() {
+            return Ok(());
+        }
+
+        let mut devices = open_devices(Path::new(INPUT_DIR));
+        if devices.is_empty() {
+            return Err(Box::new(NoCaptureDevices));
+        }
+
+        let running = Arc::new(AtomicBool::new(true));
+        guard.running = Arc::clone(&running);
+        guard.can_suppress = true; // grabbing is available once a device is open
+
+        let cursor = VirtualCursor::new(self.desktop_w, self.desktop_h);
+
+        let handle = std::thread::Builder::new()
+            .name("mouser-linux-capture".into())
+            .spawn(move || {
+                while running.load(Ordering::Relaxed) {
+                    let mut any = false;
+                    let mut frame = CaptureDecision::PassThrough;
+                    for dev in devices.iter() {
+                        let (decision, read_any) =
+                            drain_device(&dev.handle, sink.as_ref(), &cursor);
+                        any |= read_any;
+                        if matches!(decision, CaptureDecision::Suppress) {
+                            frame = CaptureDecision::Suppress;
+                        }
+                    }
+                    // Honor the engine's swallow-vs-passthrough decision by
+                    // grabbing/ungrabbing the devices.
+                    apply_decision(&mut devices, frame);
+                    if !any {
+                        std::thread::sleep(IDLE_POLL);
+                    }
+                }
+                // Exiting: ungrab everything so local input is restored.
+                apply_decision(&mut devices, CaptureDecision::PassThrough);
+            })
+            .map_err(|e| -> PlatformError { Box::new(e) })?;
+
+        guard.thread = Some(handle);
+        Ok(())
+    }
+
+    fn stop(&self) -> PlatformResult<()> {
+        let thread = {
+            let mut guard = lock_recover(&self.inner);
+            guard.running.store(false, Ordering::Relaxed);
+            guard.can_suppress = false;
+            guard.thread.take()
+        };
+        if let Some(handle) = thread {
+            // The reader thread wakes within `IDLE_POLL` and ungrabs on exit.
+            let _ = handle.join();
+        }
+        Ok(())
+    }
+
+    fn can_suppress(&self) -> bool {
+        lock_recover(&self.inner).can_suppress
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_devices_is_a_clear_error() {
+        // An empty/nonexistent dir yields no devices; start surfaces the
+        // permission-style error rather than panicking.
+        let cap = LinuxCapture::new();
+        let devices = open_devices(Path::new("/nonexistent-mouser-test-dir"));
+        assert!(devices.is_empty());
+        // can_suppress is false before start.
+        assert!(!cap.can_suppress());
+        assert!(cap.stop().is_ok());
+    }
+}

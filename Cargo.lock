@@ -2308,6 +2308,7 @@ dependencies = [
  "mouser-core",
  "mouser-net",
  "mouser-protocol",
+ "platform-linux",
  "platform-mac",
  "serde",
  "thiserror 2.0.18",
