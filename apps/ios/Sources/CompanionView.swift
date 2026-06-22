@@ -113,6 +113,12 @@ struct CompanionView: View {
             // Goodbye), matching the Android lifecycle.
             if phase == .background {
                 mouser.disconnect()
+            } else if phase == .active {
+                // Re-arm discovery on foreground: NWBrowser is suspended while
+                // backgrounded, and a first-launch browser may have been waiting on the
+                // Local Network permission the user has since granted. `start()` is
+                // idempotent when already running.
+                browser.start()
             }
         }
         // Clipboard settings hook (UI/view-model only; no networking yet).

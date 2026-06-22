@@ -17,6 +17,9 @@ final class PeerBrowser: ObservableObject {
     @Published private(set) var peers: [Peer] = []
 
     private var browser: NWBrowser?
+    /// Whether browsing is desired. Set by `start()`, cleared by `stop()`; gates the
+    /// rebuild-on-failure retry so a deliberate `stop()` is not undone by a pending one.
+    private var isActive = false
     private let queue = DispatchQueue(label: "ai.unlikeother.mouser.peerbrowser")
 
     /// Endpoints still being resolved (so we don't kick off a second resolve for the
@@ -28,8 +31,15 @@ final class PeerBrowser: ObservableObject {
     /// Resolved peers keyed by their service endpoint (one chip per service).
     private var resolved: [NWEndpoint: Peer] = [:]
 
-    /// Begin browsing. Idempotent: a second call while running is a no-op.
+    /// Begin browsing. Idempotent: a second call while already running is a no-op, but
+    /// it also re-arms a browser that stopped (e.g. call it again on app foreground).
     func start() {
+        isActive = true
+        launch()
+    }
+
+    /// Build and start a fresh `NWBrowser`. No-op if one is already running.
+    private func launch() {
         guard browser == nil else { return }
 
         let params = NWParameters.udp
@@ -44,17 +54,42 @@ final class PeerBrowser: ObservableObject {
             Task { @MainActor in self?.handle(results: results) }
         }
         browser.stateUpdateHandler = { [weak self] state in
-            // On a hard failure, tear down so a later start() can rebuild a fresh
-            // browser (e.g. after the user grants Local Network permission).
-            if case .failed = state {
-                Task { @MainActor in self?.stop() }
-            }
+            Task { @MainActor in self?.handle(state: state) }
         }
         browser.start(queue: queue)
     }
 
+    /// React to browser state. On a hard `.failed` or while `.waiting` — most commonly
+    /// the pending or denied **Local Network** permission on first launch — rebuild a
+    /// fresh browser shortly. Once the user grants permission the next attempt reaches
+    /// `.ready` and starts delivering results, so discovery recovers without an app
+    /// restart. The previous behaviour tore down permanently and required a relaunch.
+    private func handle(state: NWBrowser.State) {
+        switch state {
+        case .failed, .waiting:
+            scheduleRelaunch()
+        default:
+            break
+        }
+    }
+
+    /// Drop the dead browser (keeping already-resolved peers so the list doesn't
+    /// flicker) and rebuild after a short delay, as long as browsing is still wanted.
+    private func scheduleRelaunch() {
+        guard isActive else { return }
+        browser?.cancel()
+        browser = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isActive, self.browser == nil else { return }
+                self.launch()
+            }
+        }
+    }
+
     /// Stop browsing and drop all in-flight resolvers and results.
     func stop() {
+        isActive = false
         browser?.cancel()
         browser = nil
         for connection in resolvers.values { connection.cancel() }
