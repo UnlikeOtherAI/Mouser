@@ -78,6 +78,10 @@ fn transport_config() -> Result<Arc<TransportConfig>, NetError> {
 /// A bound QUIC endpoint that can accept inbound interactive connections and dial out.
 pub struct InteractiveEndpoint {
     endpoint: Endpoint,
+    /// This endpoint's own `device_id` (§3), set when bound as a server so an accepted
+    /// connection knows its local id for the §5 SAS derivation. A client-only endpoint
+    /// dials with an explicit `identity`, so it carries the local id per-connect instead.
+    my_device_id: Option<DeviceId>,
 }
 
 impl InteractiveEndpoint {
@@ -92,13 +96,19 @@ impl InteractiveEndpoint {
         let server_config = build_server_config(&cert, peer_policy)?;
         let endpoint =
             Endpoint::server(server_config, addr).map_err(|e| NetError::Io(e.to_string()))?;
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            my_device_id: Some(identity.device_id()),
+        })
     }
 
     /// Bind a client-only endpoint (no listener) for dialing peers.
     pub fn bind_client(addr: SocketAddr) -> Result<Self, NetError> {
         let endpoint = Endpoint::client(addr).map_err(|e| NetError::Io(e.to_string()))?;
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            my_device_id: None,
+        })
     }
 
     /// The locally bound socket address (resolves the OS-assigned port).
@@ -126,7 +136,8 @@ impl InteractiveEndpoint {
         let connection = connecting
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
-        InteractiveConnection::establish(connection, ConnectionEnd::Initiator).await
+        InteractiveConnection::establish(connection, ConnectionEnd::Initiator, identity.device_id())
+            .await
     }
 
     /// Accept the next inbound interactive connection (§6.1). The control stream is
@@ -140,7 +151,12 @@ impl InteractiveEndpoint {
         let connection = incoming
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
-        InteractiveConnection::establish(connection, ConnectionEnd::Acceptor).await
+        // A server endpoint always carries its own `device_id` (set at `bind_server`); a
+        // client-only endpoint cannot accept, so this is `Some` on every real accept path.
+        let my_device_id = self
+            .my_device_id
+            .ok_or_else(|| NetError::Connect("accept on a client-only endpoint".to_string()))?;
+        InteractiveConnection::establish(connection, ConnectionEnd::Acceptor, my_device_id).await
     }
 
     /// Close the endpoint and drain in-flight connections gracefully (H6): send each
@@ -190,12 +206,20 @@ pub struct InteractiveConnection {
     connection: Connection,
     control: ControlStream,
     motion: MotionSender,
+    /// This end's own `device_id` (§3), captured at establish so [`Self::sas`] can build
+    /// the §5 ascending-id exporter context without re-deriving from the local cert.
+    my_device_id: DeviceId,
 }
 
 impl InteractiveConnection {
     /// Establish the control stream eagerly and symmetrically (A2), then start the
-    /// keep-newest motion pump (A4).
-    async fn establish(connection: Connection, end: ConnectionEnd) -> Result<Self, NetError> {
+    /// keep-newest motion pump (A4). `my_device_id` is this end's own id (§3), retained
+    /// for the §5 SAS derivation.
+    async fn establish(
+        connection: Connection,
+        end: ConnectionEnd,
+        my_device_id: DeviceId,
+    ) -> Result<Self, NetError> {
         // `seed` carries any bytes already read off the recv stream during setup that are
         // NOT the priming frame, so the first real frame isn't lost (consume_prime
         // hardening): they pre-fill the persistent recv buffer.
@@ -234,6 +258,7 @@ impl InteractiveConnection {
             connection,
             control,
             motion,
+            my_device_id,
         })
     }
 
@@ -253,6 +278,18 @@ impl InteractiveConnection {
             .ok()?;
         let leaf = certs.first()?;
         device_id_from_cert(leaf).ok()
+    }
+
+    /// The mandatory 6-digit §5 SAS for this interactive connection, derived from the
+    /// TLS 1.3 exporter and the two `device_id`s ordered ascending. Both ends compute the
+    /// **identical** string; the user compares the two screens to authenticate the channel
+    /// (§5 step 3). Errors if the peer presented no usable cert or the exporter is
+    /// unavailable. See [`crate::sas`] for the full derivation.
+    pub fn sas(&self) -> Result<String, NetError> {
+        let peer_id = self
+            .peer_device_id()
+            .ok_or_else(|| NetError::Connect("no peer device_id for SAS".to_string()))?;
+        crate::sas::compute_sas(&self.connection, self.my_device_id, peer_id)
     }
 
     /// Send a framed control message (§0.2): `encode_frame(msg_type, 0, payload)` on

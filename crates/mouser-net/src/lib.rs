@@ -14,11 +14,14 @@
 //! - [`bulk`] — the second QUIC connection (§6.2): `BulkHello` binding to the
 //!   interactive session (§5 step 5) + one dedicated framed stream per `transfer_id`,
 //!   reusing the interactive plane's cert/pin/TLS builders.
+//! - [`sas`] — the mandatory §5 step-3 Short Authentication String: both ends derive an
+//!   identical 6-digit code from the interactive TLS exporter + ascending-id context for
+//!   the user to compare. Exposed as [`InteractiveConnection::sas`].
 //!
-//! **Stubbed for this skeleton** (see module docs): the §5 `Hello`/`HelloAck`
-//! handshake and the mandatory SAS pairing on the *interactive* plane. The bulk plane's
-//! `channel_sig` binding (§5 step 5) IS implemented in [`bulk`]. Cert pinning (§3) is
-//! enforced on both planes.
+//! **Stubbed for this skeleton** (see module docs): the §5 `Hello`/`HelloAck` handshake
+//! on the *interactive* plane. The bulk plane's `channel_sig` binding (§5 step 5) IS
+//! implemented in [`bulk`], and the mandatory SAS pairing (§5 step 3) in [`sas`]. Cert
+//! pinning (§3) is enforced on both planes.
 
 // §0.3 panic-free decode discipline: the decode/runtime path must never panic.
 // Decoders use checked slicing + `try_into` and return `NetError` instead.
@@ -30,6 +33,7 @@ pub mod discovery;
 pub mod identity;
 pub mod motion;
 pub mod pin;
+pub mod sas;
 pub mod tls;
 pub mod transport;
 
@@ -41,6 +45,7 @@ pub use identity::{
 pub use motion::{MotionPlane, MotionSender};
 pub use mouser_core::{DeviceId, DeviceIdentity};
 pub use pin::{DeviceIdPinVerifier, PinPolicy};
+pub use sas::compute_sas;
 pub use tls::ALPN_MOUSER_1;
 pub use transport::{loopback_addr, InteractiveConnection, InteractiveEndpoint};
 
