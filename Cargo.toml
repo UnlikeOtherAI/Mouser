@@ -7,6 +7,7 @@ members = [
   "crates/mouser-clipboard",
   "crates/mouser-files",
   "crates/mouser-net",
+  "crates/mouser-ipc",
   "crates/mouser-engine",
   "crates/mouser-testkit",
   "crates/mouser-ffi",

@@ -17,10 +17,16 @@
 //! - `mouserd identity` - print this machine's persistent device id.
 //! - `mouserd trust <peer-id>` / `mouserd trusted` - manage trusted peer pins.
 //!
+//! While in a serve role (`auto`/`source`/`target`) the daemon also runs the
+//! [`mouser_ipc`] **Server** on a local Unix-domain socket so the Tauri desktop UI can
+//! reflect the engine's live state (discovered peers + trust + connection) and drive it
+//! (`Connect{peer_id}` / `Disconnect`). The IPC server is gated to serve roles: the
+//! `probe`/`connect`/`identity`/`trust` local commands never start it.
+//!
 //! Discovery itself is platform-agnostic (it lives in the shared `mouser-engine`/
 //! `mouser-net` crates over `mdns-sd`), so the same serve loop runs on every host;
 //! only the concrete capture/injection adapters differ per OS (selected in `main`).
-//! The §5 SAS pairing UI, CRDT layout, and Tauri/IPC sit above.
+//! The §5 SAS pairing UI and CRDT layout sit above.
 
 fn main() {
     #[cfg(target_os = "macos")]
@@ -80,6 +86,8 @@ mod engine {
         PinPolicy,
     };
 
+    use crate::ipc_bridge::IpcBridge;
+
     /// Bridges the platform capture sink to the engine runtime: every local event is
     /// fed to the core, which decides suppress vs pass-through.
     struct EngineSink {
@@ -130,7 +138,7 @@ mod engine {
             }
         };
 
-        // Direct modes take an explicit peer address and bypass mDNS.
+        // Direct modes take an explicit peer address and bypass mDNS (and IPC).
         if arg1 == "probe" || arg1 == "connect" {
             let Some(addr_str) = args.get(2).cloned() else {
                 eprintln!(
@@ -317,6 +325,11 @@ mod engine {
         Ok(())
     }
 
+    /// A serve role (`auto`/`source`/`target`): advertise + discover over mDNS, run the
+    /// [`IpcBridge`] so the desktop UI reflects/drives the engine, then form one peer
+    /// connection (auto-discovered, accepted, or an IPC `Connect`) and run it until
+    /// ctrl-c or an IPC `Disconnect`. Single-session v1, matching the prior behaviour;
+    /// the IPC link is the new control surface on top.
     async fn serve(
         store: &DaemonStore,
         role: &str,
@@ -348,46 +361,39 @@ mod engine {
         );
         windows_firewall_hint(iport);
 
-        // Form exactly one connection per role (whichever side dials/accepts).
-        // Connection direction only avoids duplicate QUIC sessions; control ability
-        // comes from the selected role below.
-        let (conn, direction) = match role {
-            "source" => (
-                dial_discovered(
-                    store,
-                    &endpoint,
-                    &me,
-                    my_id,
-                    &my_b32,
-                    &Browser::browse().map_err(|e| e.to_string())?,
-                    true,
-                )
-                .await?,
-                "dialed",
-            ),
-            "target" => (accept_trusted(&endpoint, store).await?, "accepted"),
-            _ => {
-                let browser = Browser::browse().map_err(|e| e.to_string())?;
-                eprintln!("mouserd: searching for peers on the local network...");
-                tokio::select! {
-                    accepted = accept_trusted(&endpoint, store) => (
-                        accepted?,
-                        "accepted"
-                    ),
-                    dialed = dial_discovered(store, &endpoint, &me, my_id, &my_b32, &browser, false) => (
-                        dialed?,
-                        "dialed"
-                    ),
-                }
+        // Bring up the local IPC link so the desktop UI can see/drive the engine. The
+        // bridge owns its own continuous mDNS browse + IPC server; failure to bind it is
+        // non-fatal (the daemon still runs headless), so we warn and carry on.
+        let bridge = match IpcBridge::start(store.clone(), my_b32.clone(), hostname()).await {
+            Ok(bridge) => Some(bridge),
+            Err(e) => {
+                eprintln!("mouserd: IPC unavailable ({e}); running headless");
+                None
             }
+        };
+
+        let browser = Browser::browse().map_err(|e| e.to_string())?;
+        eprintln!("mouserd: searching for peers on the local network...");
+
+        // Wait for the first connection to form (auto-dial, accept, or IPC Connect).
+        let Some((conn, can_control)) = next_connection(
+            store, &endpoint, &me, my_id, &my_b32, &browser, role, bridge.as_ref(),
+        )
+        .await
+        else {
+            eprintln!("mouserd: shutting down");
+            let _ = capture.stop();
+            return Ok(());
         };
 
         let peer = conn
             .peer_device_id()
             .ok_or("peer did not present a device_id")?;
-        let can_control = role != "target";
+        if let Some(bridge) = bridge.as_ref() {
+            bridge.set_connected(&format_device_id(&peer), &my_b32);
+        }
         eprintln!(
-            "mouserd: connected ({direction}); {}",
+            "mouserd: connected; {}",
             if can_control {
                 "this machine can control the peer"
             } else {
@@ -395,6 +401,129 @@ mod engine {
             }
         );
 
+        run_session(my_id, peer, can_control, conn, injector, capture.as_ref(), bridge.as_ref())
+            .await;
+        if let Some(bridge) = bridge.as_ref() {
+            bridge.set_idle();
+        }
+        eprintln!("mouserd: shutting down");
+        let _ = capture.stop();
+        Ok(())
+    }
+
+    /// Wait for the connection to form: an IPC `Connect{peer_id}` to a trusted,
+    /// discovered peer, an auto-discovered dial (auto/source), or an inbound accept.
+    /// Returns `(connection, can_control)`, or `None` if ctrl-c fired first.
+    #[allow(clippy::too_many_arguments)]
+    async fn next_connection(
+        store: &DaemonStore,
+        endpoint: &InteractiveEndpoint,
+        me: &DeviceIdentity,
+        my_id: DeviceId,
+        my_b32: &str,
+        browser: &Browser,
+        role: &str,
+        bridge: Option<&IpcBridge>,
+    ) -> Option<(InteractiveConnection, bool)> {
+        // `target` only accepts; `source`/`auto` may dial. Either way an IPC Connect can
+        // explicitly drive a dial to a chosen trusted peer.
+        let can_dial = role != "target";
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    return None;
+                }
+                ipc = wait_for_connect(bridge) => {
+                    if let Some(peer_id) = ipc {
+                        match dial_peer_id(store, endpoint, me, browser, peer_id).await {
+                            Ok(conn) => return Some((conn, true)),
+                            Err(e) => {
+                                eprintln!("mouserd: IPC connect failed: {e}");
+                                if let Some(bridge) = bridge { bridge.set_idle(); }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                accepted = accept_trusted(endpoint, store) => {
+                    match accepted {
+                        Ok(conn) => return Some((conn, false)),
+                        Err(e) => { eprintln!("mouserd: accept error: {e}"); continue; }
+                    }
+                }
+                dialed = dial_discovered(store, endpoint, me, my_id, my_b32, browser, role == "source"), if can_dial => {
+                    match dialed {
+                        Ok(conn) => return Some((conn, true)),
+                        Err(e) => { eprintln!("mouserd: dial error: {e}"); continue; }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve an IPC `Connect` command into the next peer id, or never resolve when
+    /// there is no IPC bridge (so the `select!` arm is inert in headless mode).
+    async fn wait_for_connect(bridge: Option<&IpcBridge>) -> Option<DeviceId> {
+        match bridge {
+            Some(bridge) => bridge.next_connect_request().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Dial a specific trusted peer chosen over IPC, resolving its address from the live
+    /// discovery registry. Errors if the peer is unknown, not dialable, or untrusted.
+    async fn dial_peer_id(
+        store: &DaemonStore,
+        endpoint: &InteractiveEndpoint,
+        me: &DeviceIdentity,
+        browser: &Browser,
+        peer_id: DeviceId,
+    ) -> Result<InteractiveConnection, String> {
+        if !store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "peer {} is not trusted on this machine",
+                format_device_id(&peer_id)
+            ));
+        }
+        // The bridge's registry holds resolved addresses; ask it for this peer's addr.
+        let addr = browser_addr_for(browser, &peer_id)
+            .await
+            .ok_or_else(|| format!("peer {} not currently discoverable", format_device_id(&peer_id)))?;
+        eprintln!("mouserd: dialing {addr} (IPC connect)");
+        endpoint
+            .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Browse briefly for `peer_id`'s current socket address (used by an IPC dial).
+    async fn browser_addr_for(browser: &Browser, peer_id: &DeviceId) -> Option<SocketAddr> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+            let event = tokio::time::timeout(remaining, browser.next_event()).await.ok()??;
+            if let PeerEvent::Found(peer) = event {
+                if discovery::peer_device_id(&peer).as_ref() == Some(peer_id) {
+                    if let Some(addr) = discovery::peer_socket_addr(&peer) {
+                        return Some(addr);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run the connected session: start the engine runtime, (for a controller) the
+    /// capture hooks, and wait until ctrl-c or an IPC `Disconnect` ends it. The caller
+    /// then stops capture and the process exits (single-session v1).
+    async fn run_session(
+        my_id: DeviceId,
+        peer: DeviceId,
+        can_control: bool,
+        conn: InteractiveConnection,
+        injector: Arc<dyn InputInjection>,
+        capture: &dyn InputCapture,
+        bridge: Option<&IpcBridge>,
+    ) {
         let core = if can_control {
             EngineCore::new_source(my_id, peer, source_layout())
         } else {
@@ -406,17 +535,34 @@ mod engine {
             let sink: Arc<dyn InputSink> = Arc::new(EngineSink {
                 runtime: Arc::clone(&runtime),
             });
-            capture.start(sink).map_err(|e| e.to_string())?;
-            eprintln!("mouserd: capture ready - local keys/buttons stay local until edge crossing");
+            if let Err(e) = capture.start(sink) {
+                eprintln!("mouserd: capture failed to start: {e}");
+            } else {
+                eprintln!(
+                    "mouserd: capture ready - local keys/buttons stay local until edge crossing"
+                );
+            }
         } else {
             eprintln!("mouserd: target ready - injecting input received from the source");
         }
 
-        tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
-        eprintln!("mouserd: shutting down");
-        // Restore local input (ungrab on Linux / drop the tap on macOS).
-        let _ = capture.stop();
-        Ok(())
+        // End the session on ctrl-c or an IPC Disconnect.
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = wait_for_disconnect(bridge) => {
+                eprintln!("mouserd: disconnect requested over IPC");
+            }
+        }
+        // Keep the runtime alive for the whole session (its tasks own the connection).
+        drop(runtime);
+    }
+
+    /// Resolve when an IPC `Disconnect` command arrives (inert in headless mode).
+    async fn wait_for_disconnect(bridge: Option<&IpcBridge>) {
+        match bridge {
+            Some(bridge) => bridge.next_disconnect_request().await,
+            None => std::future::pending().await,
+        }
     }
 
     fn source_layout() -> EdgeLayout {
@@ -551,4 +697,231 @@ mod engine {
 
     #[cfg(not(target_os = "windows"))]
     fn windows_firewall_hint(_iport: u16) {}
+}
+
+/// The IPC bridge: a continuous mDNS browse → peer registry, a [`mouser_ipc::Server`]
+/// publishing snapshots on change, and the channels the serve loop uses to learn about
+/// UI `Connect`/`Disconnect` commands and to report connection state.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod ipc_bridge {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    use mouser_core::DeviceId;
+    use mouser_engine::daemon_store::DaemonStore;
+    use mouser_engine::discovery;
+    use mouser_ipc::{
+        Command, ConnectionDto, ConnectionStateDto, DeviceDto, PeerDto, Publisher, Server, Snapshot,
+    };
+    use mouser_net::{Browser, PeerAdvert, PeerEvent};
+    use tokio::sync::mpsc;
+
+    /// OS kind advertised for the local device DTO (matches the frontend `OsKind`).
+    const OS_KIND: &str = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+
+    /// Shared, mutable engine state the snapshot is built from.
+    struct Shared {
+        store: DaemonStore,
+        local: DeviceDto,
+        /// Discovered peers keyed by DNS-SD instance fullname.
+        peers: Mutex<HashMap<String, PeerAdvert>>,
+        connection: Mutex<ConnectionDto>,
+    }
+
+    fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The running IPC bridge handle the serve loop drives.
+    pub struct IpcBridge {
+        shared: Arc<Shared>,
+        /// Cheap publish handle (no lock contention with the command-receiving task).
+        publisher: Publisher,
+        // `tokio::sync::Mutex` so the single consumer (the serve loop) can hold the
+        // guard across the `recv().await` without breaking `Send`.
+        connect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<DeviceId>>,
+        disconnect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl IpcBridge {
+        /// Start the bridge: bind the IPC server, spawn the browse + command loops.
+        pub async fn start(
+            store: DaemonStore,
+            local_id: String,
+            local_name: String,
+        ) -> Result<Self, String> {
+            let shared = Arc::new(Shared {
+                store,
+                local: DeviceDto {
+                    id: local_id,
+                    name: local_name,
+                    os: OS_KIND.to_string(),
+                },
+                peers: Mutex::new(HashMap::new()),
+                connection: Mutex::new(ConnectionDto::default()),
+            });
+
+            let server = Server::bind(build_snapshot(&shared))
+                .await
+                .map_err(|e| e.to_string())?;
+            eprintln!("mouserd: IPC listening at {}", server.socket_path().display());
+            let publisher = server.publisher();
+
+            let (connect_tx, connect_rx) = mpsc::unbounded_channel();
+            let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
+
+            // The command loop owns the `Server` (it awaits `recv_command`); the bridge
+            // and browse loop publish through cloned `Publisher`s, so reporting state
+            // never contends with command reception.
+            let tasks = vec![
+                tokio::spawn(browse_loop(Arc::clone(&shared), publisher.clone())),
+                tokio::spawn(command_loop(server, connect_tx, disconnect_tx)),
+            ];
+
+            Ok(Self {
+                shared,
+                publisher,
+                connect_rx: tokio::sync::Mutex::new(connect_rx),
+                disconnect_rx: tokio::sync::Mutex::new(disconnect_rx),
+                tasks,
+            })
+        }
+
+        /// Await the next UI `Connect{peer_id}` request (decoded to a `DeviceId`).
+        pub async fn next_connect_request(&self) -> Option<DeviceId> {
+            // The receiver is single-consumer; the serve loop is the only caller.
+            let mut guard = self.connect_rx.lock().await;
+            guard.recv().await
+        }
+
+        /// Await the next UI `Disconnect` request.
+        pub async fn next_disconnect_request(&self) {
+            let mut guard = self.disconnect_rx.lock().await;
+            let _ = guard.recv().await;
+        }
+
+        /// Report that the engine connected to `peer_id`; republish the snapshot.
+        pub fn set_connected(&self, peer_id: &str, owner_id: &str) {
+            *lock(&self.shared.connection) = ConnectionDto {
+                state: ConnectionStateDto::Connected,
+                peer_id: Some(peer_id.to_string()),
+                owner: Some(owner_id.to_string()),
+                epoch: None,
+            };
+            self.republish();
+        }
+
+        /// Report that the engine has no connection; republish the snapshot.
+        pub fn set_idle(&self) {
+            *lock(&self.shared.connection) = ConnectionDto::default();
+            self.republish();
+        }
+
+        fn republish(&self) {
+            self.publisher.publish(build_snapshot(&self.shared));
+        }
+    }
+
+    impl Drop for IpcBridge {
+        fn drop(&mut self) {
+            for task in self.tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
+
+    /// Build a fresh snapshot from the shared state (local + discovered peers + trust).
+    fn build_snapshot(shared: &Shared) -> Snapshot {
+        let peers_guard = lock(&shared.peers);
+        let mut peers: Vec<PeerDto> = peers_guard
+            .values()
+            .map(|advert| {
+                let trusted = discovery::peer_device_id(advert)
+                    .map(|id| shared.store.is_peer_trusted(&id).unwrap_or(false))
+                    .unwrap_or(false);
+                let host = advert
+                    .addrs
+                    .first()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_default();
+                PeerDto {
+                    id: advert.id.clone(),
+                    name: if advert.name.is_empty() {
+                        host.clone()
+                    } else {
+                        advert.name.clone()
+                    },
+                    os: advert.os.clone(),
+                    host,
+                    port: advert.iport,
+                    trusted,
+                }
+            })
+            .collect();
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
+        Snapshot {
+            local: shared.local.clone(),
+            peers,
+            connection: lock(&shared.connection).clone(),
+        }
+    }
+
+    /// Continuous mDNS browse: fold `Found`/`Removed` into the peer registry and
+    /// republish a snapshot on every change so connected UIs stay live.
+    async fn browse_loop(shared: Arc<Shared>, publisher: Publisher) {
+        let browser = match Browser::browse() {
+            Ok(b) => b,
+            Err(_) => return, // no mDNS daemon: leave peers empty
+        };
+        while let Some(event) = browser.next_event().await {
+            let changed = match event {
+                PeerEvent::Found(advert) => {
+                    if advert.id == shared.local.id {
+                        false // never list ourselves
+                    } else {
+                        let fullname =
+                            format!("{}.{}", advert.instance_name(), mouser_net::SERVICE_TYPE);
+                        lock(&shared.peers).insert(fullname, advert);
+                        true
+                    }
+                }
+                PeerEvent::Removed(fullname) => lock(&shared.peers).remove(&fullname).is_some(),
+            };
+            if changed {
+                publisher.publish(build_snapshot(&shared));
+            }
+        }
+    }
+
+    /// Drain UI commands from the IPC server and forward Connect/Disconnect to the serve
+    /// loop. `GetSnapshot` is handled inside the server itself.
+    async fn command_loop(
+        mut server: Server,
+        connect_tx: mpsc::UnboundedSender<DeviceId>,
+        disconnect_tx: mpsc::UnboundedSender<()>,
+    ) {
+        loop {
+            match server.recv_command().await {
+                Some(Command::Connect { peer_id }) => match discovery::decode_device_id(&peer_id) {
+                    Some(id) => {
+                        let _ = connect_tx.send(id);
+                    }
+                    None => eprintln!("mouserd: IPC Connect with invalid peer id: {peer_id}"),
+                },
+                Some(Command::Disconnect) => {
+                    let _ = disconnect_tx.send(());
+                }
+                // GetSnapshot is answered by the server; nothing reaches here.
+                Some(Command::GetSnapshot) => {}
+                None => return, // server dropped
+            }
+        }
+    }
 }

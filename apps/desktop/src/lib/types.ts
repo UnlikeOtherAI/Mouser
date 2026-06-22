@@ -37,10 +37,10 @@ export interface Device {
 }
 
 /**
- * A peer seen on the LAN over mDNS (`_mouser._udp`), mirroring the backend
- * `PeerInfo` (src-tauri/src/lib.rs). This is a UI-side discovery shortcut: it
- * proves a peer is reachable but carries no trust or display layout — that
- * arrives once the engine owns discovery over `mouser-ipc`.
+ * A peer the **engine** has discovered on the LAN, delivered over `mouser-ipc`
+ * (mirrors the backend `EnginePeer` / `mouser_ipc::PeerDto`). Unlike the old
+ * UI-side mDNS shortcut, this carries the engine's trust decision, so the UI can
+ * offer a real "Connect" action for trusted peers.
  */
 export interface Peer {
   id: string;
@@ -50,6 +50,24 @@ export interface Peer {
   host: string;
   /** Interactive-connection UDP port (`iport`). */
   port: number;
+  /** Whether this peer is user-approved (trusted) on this machine. */
+  trusted: boolean;
+}
+
+/** Lifecycle of the engine's single peer connection (mirrors `ConnectionDto`). */
+export type EngineConnectionState = "idle" | "connecting" | "connected";
+
+/**
+ * The engine's current connection/ownership state, delivered over `mouser-ipc`.
+ */
+export interface EngineConnection {
+  state: EngineConnectionState;
+  /** The peer being connected to (base32 id), when connecting/connected. */
+  peerId: string | null;
+  /** The device that currently owns input (base32 id), when connected. */
+  owner: string | null;
+  /** Current ownership epoch, when connected. */
+  epoch: number | null;
 }
 
 export type SectionId =
