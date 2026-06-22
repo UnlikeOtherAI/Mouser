@@ -6,10 +6,17 @@ import { Toggle } from "../components/toggle";
 
 type Appearance = "system" | "light" | "dark";
 
-/** General application preferences (static — no persistence yet). */
-export function GeneralSection(): React.JSX.Element {
+interface GeneralSectionProps {
+  showTrayIcon: boolean;
+  onShowTrayIconChange: (next: boolean) => void;
+}
+
+/** General application preferences. */
+export function GeneralSection({
+  showTrayIcon,
+  onShowTrayIconChange,
+}: GeneralSectionProps): React.JSX.Element {
   const [launchAtLogin, setLaunchAtLogin] = useState(true);
-  const [showMenuBar, setShowMenuBar] = useState(true);
   const [autoUpdate, setAutoUpdate] = useState(true);
   const [appearance, setAppearance] = useState<Appearance>("system");
 
@@ -29,14 +36,14 @@ export function GeneralSection(): React.JSX.Element {
           }
         />
         <SettingRow
-          title="Show menu bar icon"
-          description="Keep a quick-access icon in the system tray."
+          title="Show tray icon"
+          description="Keep Mouser in the system tray instead of the taskbar."
           control={
             <Toggle
-              label="Show menu bar icon"
+              label="Show tray icon"
               labelHidden
-              checked={showMenuBar}
-              onChange={setShowMenuBar}
+              checked={showTrayIcon}
+              onChange={onShowTrayIconChange}
             />
           }
         />

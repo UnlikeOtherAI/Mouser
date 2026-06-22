@@ -1,7 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ClipboardProgress } from "./components/clipboard-progress";
 import { SideNav } from "./components/side-nav";
 import { NAV_ITEMS } from "./lib/mock-data";
+import {
+  readTrayIconPreference,
+  syncTrayIconPreference,
+  writeTrayIconPreference,
+} from "./lib/tray-preference";
 import type { ClipboardTransfer, SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";
@@ -22,10 +27,23 @@ const SECTION_TITLES: Record<SectionId, string> = {
   security: "Security",
 };
 
-function renderSection(id: SectionId): React.JSX.Element {
+interface GeneralSettingsProps {
+  showTrayIcon: boolean;
+  onShowTrayIconChange: (next: boolean) => void;
+}
+
+function renderSection(
+  id: SectionId,
+  general: GeneralSettingsProps,
+): React.JSX.Element {
   switch (id) {
     case "general":
-      return <GeneralSection />;
+      return (
+        <GeneralSection
+          showTrayIcon={general.showTrayIcon}
+          onShowTrayIconChange={general.onShowTrayIconChange}
+        />
+      );
     case "devices":
       return <DevicesSection />;
     case "layout":
@@ -42,6 +60,16 @@ function renderSection(id: SectionId): React.JSX.Element {
 /** Top-level settings/layout shell: left nav + active section panel. */
 export function App(): React.JSX.Element {
   const [active, setActive] = useState<SectionId>("layout");
+  const [showTrayIcon, setShowTrayIcon] = useState(readTrayIconPreference);
+
+  useEffect(() => {
+    void syncTrayIconPreference(showTrayIcon);
+  }, [showTrayIcon]);
+
+  function handleShowTrayIconChange(next: boolean): void {
+    setShowTrayIcon(next);
+    writeTrayIconPreference(next);
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-ink text-slate-100">
@@ -57,7 +85,10 @@ export function App(): React.JSX.Element {
           <h1 className="mb-5 text-xl font-semibold tracking-tight">
             {SECTION_TITLES[active]}
           </h1>
-          {renderSection(active)}
+          {renderSection(active, {
+            showTrayIcon,
+            onShowTrayIconChange: handleShowTrayIconChange,
+          })}
         </div>
       </main>
       <ClipboardProgress transfers={CLIPBOARD_TRANSFERS} />

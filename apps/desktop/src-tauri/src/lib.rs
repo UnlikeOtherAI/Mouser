@@ -9,6 +9,8 @@
 //! Layout canvas reflect this computer instead of placeholder data. Remote peers
 //! still require the engine; the UI shows an honest "no peers yet" state.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use serde::Serialize;
 use tauri::{
     menu::MenuBuilder,
@@ -49,9 +51,26 @@ struct LocalDevice {
 }
 
 const MAIN_WINDOW_LABEL: &str = "main";
+const TRAY_ID: &str = "mouser";
 const TRAY_SHOW: &str = "show";
 const TRAY_HIDE: &str = "hide";
 const TRAY_QUIT: &str = "quit";
+
+struct DesktopPreferences {
+    tray_icon_visible: Mutex<bool>,
+}
+
+impl Default for DesktopPreferences {
+    fn default() -> Self {
+        Self {
+            tray_icon_visible: Mutex::new(true),
+        }
+    }
+}
+
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Returns the real local device: friendly name, OS, and the physical monitor
 /// layout reported by the windowing system (positions and sizes converted from
@@ -111,6 +130,39 @@ fn hide_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn apply_tray_icon_visibility(app: &tauri::AppHandle, visible: bool) -> Result<(), String> {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        tray.set_visible(visible).map_err(|e| e.to_string())?;
+    }
+
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        window
+            .set_skip_taskbar(visible)
+            .map_err(|e| e.to_string())?;
+        if !visible {
+            let _ = window.show();
+            let _ = window.unminimize();
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn set_tray_icon_visible(
+    app: tauri::AppHandle,
+    prefs: tauri::State<'_, DesktopPreferences>,
+    visible: bool,
+) -> Result<bool, String> {
+    apply_tray_icon_visibility(&app, visible)?;
+    *lock_recover(&prefs.tray_icon_visible) = visible;
+    Ok(visible)
+}
+
+fn is_tray_icon_visible(prefs: &DesktopPreferences) -> bool {
+    *lock_recover(&prefs.tray_icon_visible)
+}
+
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
         .text(TRAY_SHOW, "Show Mouser")
@@ -120,7 +172,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         .build()?;
     let icon = app.default_window_icon().cloned();
 
-    let mut tray = TrayIconBuilder::with_id("mouser")
+    let mut tray = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip("Mouser")
         .show_menu_on_left_click(false)
@@ -160,19 +212,29 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(DesktopPreferences::default())
         .setup(|app| {
             install_tray(app)?;
+            let _ = apply_tray_icon_visibility(app.handle(), true);
             Ok(())
         })
         .on_window_event(|window, event| {
             if window.label() == MAIN_WINDOW_LABEL {
                 if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
+                    let prefs = window.state::<DesktopPreferences>();
+                    if is_tray_icon_visible(&prefs) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    } else {
+                        window.app_handle().exit(0);
+                    }
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![local_device])
+        .invoke_handler(tauri::generate_handler![
+            local_device,
+            set_tray_icon_visible
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Mouser desktop shell");
 }
