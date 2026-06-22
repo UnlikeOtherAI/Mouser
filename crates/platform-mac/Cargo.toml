@@ -29,6 +29,8 @@ objc2-app-kit = { version = "0.3", features = [
   "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem",
   "NSDraggingSession", "NSWindow", "NSView", "NSResponder", "NSApplication",
   "NSEvent", "NSImage", "NSGraphics", "NSGraphicsContext", "NSColor",
+  # Menu-bar tray (MacTray): the system status bar item + its button.
+  "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl",
 ] }
 
 [dev-dependencies]

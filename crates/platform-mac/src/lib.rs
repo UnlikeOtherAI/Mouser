@@ -5,7 +5,9 @@
 //! the free functions in [`inject`] / the tap helpers in [`capture`] are the
 //! low-level bodies. [`keymap`] is the HID↔CGKeyCode table plus the `mods`
 //! translation (audit H11); [`display_info`] enumerates all displays so motion
-//! routes to the right monitor (audit M1).
+//! routes to the right monitor (audit M1). [`tray::MacTray`] implements the
+//! `mouser_core::Tray` contract over an `NSStatusItem` (main-thread / AppKit-host
+//! only — see its module docs).
 //!
 //! It deliberately does **not** set `[lints] workspace = true`: the workspace
 //! forbids `unsafe_code`, but the macOS path is C/Objective-C-API-driven.
@@ -44,6 +46,7 @@ pub mod dragdrop;
 pub mod inject;
 pub mod keymap;
 pub mod keymap_capture;
+pub mod tray;
 
 pub use adapter::{MacCapture, MacInjector};
 pub use capture::{install_listen_only_tap, CaptureError};
@@ -67,3 +70,4 @@ pub use keymap_capture::{
     cgkeycode_to_hid_usage, cursor_moved_for_global, flags_changed_event, to_local_event,
     ModifierState,
 };
+pub use tray::{state_label, state_tooltip, MacTray, TrayError};
