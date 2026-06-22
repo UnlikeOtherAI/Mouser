@@ -76,7 +76,9 @@ pub fn run(injector: Arc<dyn InputInjection>, capture: Box<dyn InputCapture>) {
     // Direct modes take an explicit peer address and bypass mDNS (and IPC).
     if arg1 == "probe" || arg1 == "connect" {
         let Some(addr_str) = args.get(2).cloned() else {
-            eprintln!("mouserd: `{arg1}` needs <host:port>, e.g. mouserd {arg1} 192.168.1.230:49970");
+            eprintln!(
+                "mouserd: `{arg1}` needs <host:port>, e.g. mouserd {arg1} 192.168.1.230:49970"
+            );
             std::process::exit(1);
         };
         let addr: SocketAddr = match addr_str.parse() {
@@ -91,7 +93,9 @@ pub fn run(injector: Arc<dyn InputInjection>, capture: Box<dyn InputCapture>) {
                 direct::probe(&store, addr).await
             } else if let Some(peer_id_arg) = args.get(3).cloned() {
                 match parse_peer_id_arg(&peer_id_arg) {
-                    Ok(peer_id) => direct::serve_direct(&store, addr, peer_id, injector, capture).await,
+                    Ok(peer_id) => {
+                        direct::serve_direct(&store, addr, peer_id, injector, capture).await
+                    }
                     Err(e) => Err(e.to_string()),
                 }
             } else {
@@ -154,6 +158,15 @@ fn handle_local_command(
 }
 
 fn role_from_arg(arg: &str) -> String {
+    #[cfg(target_os = "windows")]
+    if arg == "auto" {
+        eprintln!(
+            "mouserd: Windows auto mode is disabled because low-level capture hooks can \
+             interfere with Bluetooth keyboard/touchpad input; using target mode"
+        );
+        return "target".to_string();
+    }
+
     match arg {
         role @ ("auto" | "source" | "target") => role.to_string(),
         other => {

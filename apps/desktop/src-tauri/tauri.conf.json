@@ -37,7 +37,7 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "binaries/mouserd"
+      "binaries"
     ],
     "windows": {
       "webviewInstallMode": {

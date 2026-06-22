@@ -107,7 +107,11 @@ impl EngineSnapshot {
             .map(|a| {
                 let host = a.addrs.first().map(|ip| ip.to_string()).unwrap_or_default();
                 EnginePeer {
-                    name: if a.name.is_empty() { host.clone() } else { a.name },
+                    name: if a.name.is_empty() {
+                        host.clone()
+                    } else {
+                        a.name
+                    },
                     id: a.id,
                     os: a.os,
                     host,
@@ -185,21 +189,35 @@ struct EngineProcess {
     child: Mutex<Option<Child>>,
 }
 
-/// Resolve the bundled `mouserd` engine: `Resources/binaries/mouserd` in the installed
-/// app, else fall back to a `mouserd` on `PATH` (dev runs).
+/// Resolve the bundled `mouserd` engine from the installed app resources, else fall
+/// back to a `mouserd` on `PATH` (dev runs).
 fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(dir) = app.path().resource_dir() {
-        let bundled = dir.join("binaries").join("mouserd");
-        if bundled.exists() {
-            return bundled;
+        let binaries = dir.join("binaries");
+        let platform = binaries.join(mouserd_exe_name());
+        if platform.exists() {
+            return platform;
+        }
+        let extensionless = binaries.join("mouserd");
+        if extensionless.exists() {
+            return extensionless;
         }
     }
-    PathBuf::from("mouserd")
+    PathBuf::from(mouserd_exe_name())
+}
+
+fn mouserd_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "mouserd.exe"
+    } else {
+        "mouserd"
+    }
 }
 
 /// Ensure the engine is running: if the IPC socket doesn't already answer, launch the
-/// bundled `mouserd auto` and keep its handle so [`run`] can stop it on exit. The app
-/// owns the daemon lifecycle (the user just opens the app).
+/// bundled `mouserd` and keep its handle so [`run`] can stop it on exit. Windows starts
+/// in explicit receive-only target mode, avoiding global capture hooks until the user
+/// explicitly connects.
 fn ensure_engine_running(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -208,14 +226,29 @@ fn ensure_engine_running(app: &tauri::AppHandle) {
             return;
         }
         let path = resolve_mouserd(&app);
-        match std::process::Command::new(&path).arg("auto").spawn() {
+        let mut command = std::process::Command::new(&path);
+        for arg in mouserd_launch_args() {
+            command.arg(arg);
+        }
+        match command.spawn() {
             Ok(child) => {
                 *lock_recover(&app.state::<EngineProcess>().child) = Some(child);
                 eprintln!("mouser-desktop: launched engine {}", path.display());
             }
-            Err(e) => eprintln!("mouser-desktop: failed to launch engine {}: {e}", path.display()),
+            Err(e) => eprintln!(
+                "mouser-desktop: failed to launch engine {}: {e}",
+                path.display()
+            ),
         }
     });
+}
+
+fn mouserd_launch_args() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["target"]
+    } else {
+        &[]
+    }
 }
 
 /// Peers this app discovered directly over mDNS, keyed by DNS-SD instance fullname.
@@ -299,7 +332,9 @@ fn local_device(window: tauri::Window) -> Result<LocalDevice, String> {
 /// snapshot (`engine_running: false`) rather than failing, so the UI can show the
 /// local device with an "engine not running" hint.
 #[tauri::command]
-async fn engine_snapshot(peers: tauri::State<'_, DiscoveredPeers>) -> Result<EngineSnapshot, String> {
+async fn engine_snapshot(
+    peers: tauri::State<'_, DiscoveredPeers>,
+) -> Result<EngineSnapshot, String> {
     Ok(match fetch_engine_snapshot().await {
         // Engine is up: it owns discovery + trust + the live connection.
         Ok(snapshot) => EngineSnapshot::from_snapshot(snapshot),
@@ -478,7 +513,8 @@ pub fn run() {
     // Stop the engine we launched when the app exits, so we don't orphan the daemon.
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            if let Some(mut child) = lock_recover(&app_handle.state::<EngineProcess>().child).take() {
+            if let Some(mut child) = lock_recover(&app_handle.state::<EngineProcess>().child).take()
+            {
                 let _ = child.kill();
             }
         }
