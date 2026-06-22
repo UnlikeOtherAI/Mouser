@@ -59,11 +59,12 @@ fn mouserd_exe_name() -> &'static str {
 }
 
 fn mouserd_launch_args() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["target"]
-    } else {
-        &[]
-    }
+    // No explicit role on any platform: the daemon defaults to `auto` (advertise +
+    // browse, either side can control). Windows used to be pinned to `target` because
+    // becoming a source installed always-on low-level hooks that degraded local input;
+    // capture is now ownership-driven (passive edge-sensing while idle, suppressing
+    // hooks only while actively controlling), so Windows is a first-class controller.
+    &[]
 }
 
 /// Supervise the engine: keep a `mouserd` reachable over IPC, relaunching the bundled

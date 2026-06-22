@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use input_linux::{EvdevHandle, Key};
 use mouser_core::platform::{
-    CaptureDecision, InputCapture, InputSink, PlatformError, PlatformResult,
+    CaptureDecision, CaptureMode, InputCapture, InputSink, PlatformError, PlatformResult,
 };
 
 use crate::capture_translate::{to_local_event, VirtualCursor};
@@ -82,8 +82,12 @@ struct CaptureRun {
     running: Arc<AtomicBool>,
     /// Join handle for the reader thread, so `stop` can wait for it to drain.
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Whether suppression is possible (at least one device opened/grabbable).
+    /// Whether suppression is possible right now (devices open AND actively
+    /// forwarding). Reading evdev without `EVIOCGRAB` is non-intrusive, so the
+    /// passive-edge mode keeps the reader running but never grabs.
     can_suppress: bool,
+    /// The capture mode the adapter is currently in.
+    mode: CaptureMode,
 }
 
 /// Linux input capture over the raw evdev devices (audit H3).
@@ -115,6 +119,7 @@ impl LinuxCapture {
                 running: Arc::new(AtomicBool::new(false)),
                 thread: None,
                 can_suppress: false,
+                mode: CaptureMode::Off,
             })),
             desktop_w: desktop_w.max(1),
             desktop_h: desktop_h.max(1),
@@ -251,8 +256,13 @@ fn drain_device(
     (decision, read_any)
 }
 
-impl InputCapture for LinuxCapture {
-    fn start(&self, sink: Arc<dyn InputSink>) -> PlatformResult<()> {
+impl LinuxCapture {
+    /// Ensure the evdev reader thread is running, opening the keyboard/pointer
+    /// devices if needed. Idempotent: a no-op when already running. The reader only
+    /// `EVIOCGRAB`s (suppresses) when the sink returns [`CaptureDecision::Suppress`],
+    /// which the engine does only while actively forwarding — so this same reader
+    /// serves both passive edge sensing and active forwarding.
+    fn ensure_running(&self, sink: Arc<dyn InputSink>) -> PlatformResult<()> {
         let mut guard = lock_recover(&self.inner);
         // Idempotent: already capturing.
         if guard.thread.is_some() {
@@ -266,7 +276,6 @@ impl InputCapture for LinuxCapture {
 
         let running = Arc::new(AtomicBool::new(true));
         guard.running = Arc::clone(&running);
-        guard.can_suppress = true; // grabbing is available once a device is open
 
         let cursor = VirtualCursor::new(self.desktop_w, self.desktop_h);
 
@@ -299,12 +308,32 @@ impl InputCapture for LinuxCapture {
         guard.thread = Some(handle);
         Ok(())
     }
+}
+
+impl InputCapture for LinuxCapture {
+    fn set_mode(&self, mode: CaptureMode, sink: &Arc<dyn InputSink>) -> PlatformResult<()> {
+        match mode {
+            CaptureMode::Off => self.stop(),
+            CaptureMode::PassiveEdge | CaptureMode::ActiveForward => {
+                // The evdev reader serves both modes (it only grabs when the sink
+                // says Suppress, which the engine does only while forwarding). Ensure
+                // it is running, then record the mode and whether we can suppress.
+                self.ensure_running(Arc::clone(sink))?;
+                let mut guard = lock_recover(&self.inner);
+                guard.mode = mode;
+                guard.can_suppress =
+                    matches!(mode, CaptureMode::ActiveForward) && guard.thread.is_some();
+                Ok(())
+            }
+        }
+    }
 
     fn stop(&self) -> PlatformResult<()> {
         let thread = {
             let mut guard = lock_recover(&self.inner);
             guard.running.store(false, Ordering::Relaxed);
             guard.can_suppress = false;
+            guard.mode = CaptureMode::Off;
             guard.thread.take()
         };
         if let Some(handle) = thread {
@@ -316,6 +345,10 @@ impl InputCapture for LinuxCapture {
 
     fn can_suppress(&self) -> bool {
         lock_recover(&self.inner).can_suppress
+    }
+
+    fn current_mode(&self) -> CaptureMode {
+        lock_recover(&self.inner).mode
     }
 }
 

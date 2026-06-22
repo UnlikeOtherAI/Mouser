@@ -20,8 +20,8 @@ use core_graphics::event::{
     CallbackResult, EventField,
 };
 use mouser_core::platform::{
-    CaptureDecision, InputCapture, InputInjection, InputSink, LocalInputEvent, PlatformError,
-    PlatformResult, ScrollUnit,
+    CaptureDecision, CaptureMode, InputCapture, InputInjection, InputSink, LocalInputEvent,
+    PlatformError, PlatformResult, ScrollUnit,
 };
 
 use crate::display_info::display_bounds;
@@ -123,6 +123,14 @@ struct CaptureRun {
     run_loop: Option<CFRunLoop>,
     /// Whether the installed tap can actually suppress (default tap created).
     can_suppress: bool,
+    /// The capture mode the adapter is currently in.
+    mode: CaptureMode,
+    /// Bumped each time a new tap thread is started. A run-loop thread only
+    /// claims/clears the shared state if its captured generation is still current,
+    /// so a superseded thread's teardown epilogue can never clobber the run loop a
+    /// newer transition just installed (mac does not join the old thread, unlike
+    /// the Windows adapter which tears down synchronously).
+    generation: u64,
 }
 
 /// macOS input capture via a background `CGEventTap` (audit H3).
@@ -137,14 +145,121 @@ impl Default for MacCapture {
 }
 
 impl MacCapture {
-    /// A not-yet-started capture handle.
+    /// A not-yet-started capture handle (mode [`CaptureMode::Off`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(CaptureRun {
                 run_loop: None,
                 can_suppress: false,
+                mode: CaptureMode::Off,
+                generation: 0,
             })),
+        }
+    }
+
+    /// Bring a `CGEventTap` up on a background run loop. `listen_only` forces a
+    /// non-suppressing tap (the passive edge-sensing mode); otherwise a
+    /// suppress-capable default tap is tried first, falling back to listen-only when
+    /// Accessibility is missing (so we never pretend to suppress what we cannot).
+    fn start_tap(
+        &self,
+        sink: Arc<dyn InputSink>,
+        listen_only: bool,
+        mode: CaptureMode,
+    ) -> PlatformResult<()> {
+        let inner = Arc::clone(&self.inner);
+        // Claim a fresh generation. Any earlier run-loop thread now holds a stale
+        // generation and will neither claim nor clear the shared state.
+        let my_gen = {
+            let mut g = lock_recover(&inner);
+            g.generation = g.generation.wrapping_add(1);
+            g.generation
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Result<bool, ()>>();
+
+        std::thread::Builder::new()
+            .name("mouser-mac-capture".into())
+            .spawn(move || {
+                let (tap, can_suppress) = if listen_only {
+                    // PassiveEdge: observe only, never suppress.
+                    match CGEventTap::new(
+                        CGEventTapLocation::Session,
+                        CGEventTapPlacement::HeadInsertEventTap,
+                        CGEventTapOptions::ListenOnly,
+                        events_of_interest(),
+                        make_callback(Arc::clone(&sink)),
+                    ) {
+                        Ok(t) => (Some(t), false),
+                        Err(()) => (None, false),
+                    }
+                } else {
+                    // ActiveForward: prefer a suppress-capable default tap; fall back
+                    // to listen-only if Accessibility can't be created.
+                    match CGEventTap::new(
+                        CGEventTapLocation::Session,
+                        CGEventTapPlacement::HeadInsertEventTap,
+                        CGEventTapOptions::Default,
+                        events_of_interest(),
+                        make_callback(Arc::clone(&sink)),
+                    ) {
+                        Ok(t) => (Some(t), true),
+                        Err(()) => match CGEventTap::new(
+                            CGEventTapLocation::Session,
+                            CGEventTapPlacement::HeadInsertEventTap,
+                            CGEventTapOptions::ListenOnly,
+                            events_of_interest(),
+                            make_callback(Arc::clone(&sink)),
+                        ) {
+                            Ok(t) => (Some(t), false),
+                            Err(()) => (None, false),
+                        },
+                    }
+                };
+
+                let Some(tap) = tap else {
+                    let _ = tx.send(Err(()));
+                    return;
+                };
+
+                let Ok(source) = tap.mach_port().create_runloop_source(0) else {
+                    let _ = tx.send(Err(()));
+                    return;
+                };
+                let run_loop = CFRunLoop::get_current();
+                // SAFETY: `kCFRunLoopCommonModes` is a CoreFoundation extern
+                // constant string; reading it is the documented usage.
+                run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
+                tap.enable();
+
+                {
+                    let mut g = lock_recover(&inner);
+                    // Only claim the shared state if a newer tap hasn't superseded us.
+                    if g.generation == my_gen {
+                        g.run_loop = Some(run_loop.clone());
+                        g.can_suppress = can_suppress;
+                        g.mode = mode;
+                    }
+                }
+                let _ = tx.send(Ok(can_suppress));
+
+                // Blocks until `stop()` calls `CFRunLoop::stop`.
+                CFRunLoop::run_current();
+
+                // Run loop ended: clear only the state we still own, so a teardown
+                // epilogue can't wipe a run loop a newer transition just installed.
+                let mut g = lock_recover(&inner);
+                if g.generation == my_gen {
+                    g.run_loop = None;
+                    g.can_suppress = false;
+                }
+                drop(tap);
+            })
+            .map_err(|e| -> PlatformError { Box::new(e) })?;
+
+        match rx.recv() {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Box::new(CaptureStartFailed)),
         }
     }
 }
@@ -234,79 +349,39 @@ fn make_callback(
 }
 
 impl InputCapture for MacCapture {
-    fn start(&self, sink: Arc<dyn InputSink>) -> PlatformResult<()> {
-        // Idempotent: already running.
-        if lock_recover(&self.inner).run_loop.is_some() {
-            return Ok(());
+    fn set_mode(&self, mode: CaptureMode, sink: &Arc<dyn InputSink>) -> PlatformResult<()> {
+        // Check idempotency and detach the current run loop atomically under one lock
+        // (so a same-mode no-op and the stop bookkeeping can't interleave), then stop
+        // the old run loop and start the new tap outside the lock. A mode change swaps
+        // ListenOnly↔Default; on a start failure we are left stopped (mode Off).
+        let old_run_loop = {
+            let mut g = lock_recover(&self.inner);
+            if g.mode == mode {
+                return Ok(()); // already in the requested mode
+            }
+            g.mode = CaptureMode::Off;
+            g.can_suppress = false;
+            g.run_loop.take()
+        };
+        if let Some(rl) = old_run_loop {
+            rl.stop();
         }
-
-        let inner = Arc::clone(&self.inner);
-        let (tx, rx) = std::sync::mpsc::channel::<Result<bool, ()>>();
-
-        std::thread::Builder::new()
-            .name("mouser-mac-capture".into())
-            .spawn(move || {
-                // Prefer a default (suppress-capable) tap; fall back to
-                // listen-only if it can't be created (missing Accessibility).
-                let (tap, can_suppress) = match CGEventTap::new(
-                    CGEventTapLocation::Session,
-                    CGEventTapPlacement::HeadInsertEventTap,
-                    CGEventTapOptions::Default,
-                    events_of_interest(),
-                    make_callback(Arc::clone(&sink)),
-                ) {
-                    Ok(t) => (Some(t), true),
-                    Err(()) => match CGEventTap::new(
-                        CGEventTapLocation::Session,
-                        CGEventTapPlacement::HeadInsertEventTap,
-                        CGEventTapOptions::ListenOnly,
-                        events_of_interest(),
-                        make_callback(sink),
-                    ) {
-                        Ok(t) => (Some(t), false),
-                        Err(()) => (None, false),
-                    },
-                };
-
-                let Some(tap) = tap else {
-                    let _ = tx.send(Err(()));
-                    return;
-                };
-
-                let Ok(source) = tap.mach_port().create_runloop_source(0) else {
-                    let _ = tx.send(Err(()));
-                    return;
-                };
-                let run_loop = CFRunLoop::get_current();
-                // SAFETY: `kCFRunLoopCommonModes` is a CoreFoundation extern
-                // constant string; reading it is the documented usage.
-                run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
-                tap.enable();
-
-                {
-                    let mut g = lock_recover(&inner);
-                    g.run_loop = Some(run_loop.clone());
-                    g.can_suppress = can_suppress;
-                }
-                let _ = tx.send(Ok(can_suppress));
-
-                // Blocks until `stop()` calls `CFRunLoop::stop`.
-                CFRunLoop::run_current();
-
-                // Run loop ended: clear shared state and drop the tap.
-                lock_recover(&inner).run_loop = None;
-                drop(tap);
-            })
-            .map_err(|e| -> PlatformError { Box::new(e) })?;
-
-        match rx.recv() {
-            Ok(Ok(_)) => Ok(()),
-            _ => Err(Box::new(CaptureStartFailed)),
+        match mode {
+            CaptureMode::Off => Ok(()),
+            // PassiveEdge: a listen-only tap senses the edge without ever suppressing.
+            CaptureMode::PassiveEdge => self.start_tap(Arc::clone(sink), true, mode),
+            // ActiveForward: a default (suppress-capable) tap while driving the peer.
+            CaptureMode::ActiveForward => self.start_tap(Arc::clone(sink), false, mode),
         }
     }
 
     fn stop(&self) -> PlatformResult<()> {
-        let run_loop = lock_recover(&self.inner).run_loop.take();
+        let run_loop = {
+            let mut g = lock_recover(&self.inner);
+            g.mode = CaptureMode::Off;
+            g.can_suppress = false;
+            g.run_loop.take()
+        };
         if let Some(rl) = run_loop {
             rl.stop();
         }
@@ -315,6 +390,10 @@ impl InputCapture for MacCapture {
 
     fn can_suppress(&self) -> bool {
         lock_recover(&self.inner).can_suppress
+    }
+
+    fn current_mode(&self) -> CaptureMode {
+        lock_recover(&self.inner).mode
     }
 }
 

@@ -5,19 +5,36 @@
 //! button ids, modifier bitmasks, and core scroll units) to the Win32 `SendInput`
 //! backend.
 //!
-//! [`WinCapture`] installs low-level keyboard and mouse hooks on a background
-//! thread and forwards modeled local input to `mouser_core::InputSink`. The hook
-//! callbacks honor `CaptureDecision::Suppress`, which is the Windows equivalent
-//! of the macOS default event tap behavior.
+//! [`WinCapture`] is a **mode state machine** (`mouser_core::CaptureMode`) — the
+//! Windows embodiment of "edge sensing is not input forwarding":
+//!
+//! - [`CaptureMode::Off`](mouser_core::platform::CaptureMode::Off) installs nothing.
+//! - [`CaptureMode::PassiveEdge`](mouser_core::platform::CaptureMode::PassiveEdge)
+//!   runs a lightweight background thread that polls `GetCursorPos` (via
+//!   [`crate::inject::cursor_position`]) and reports cursor position to the sink. It
+//!   installs **no** `WH_*_LL` hooks, never suppresses, and never observes the
+//!   keyboard — so a connected-but-idle controller leaves local keyboard/touchpad
+//!   completely native (this is what fixes the Bluetooth-input degradation).
+//! - [`CaptureMode::ActiveForward`](mouser_core::platform::CaptureMode::ActiveForward)
+//!   installs the low-level `WH_KEYBOARD_LL` + `WH_MOUSE_LL` hooks on a background
+//!   thread **only while this machine is actively driving a remote peer**. In this
+//!   mode the hooks synchronously swallow local input (the machine is forwarding to
+//!   the peer) and enqueue each event for a worker thread to hand to the sink for
+//!   forwarding. The decision is statically "suppress while forwarding", so there is
+//!   no lagging-atomic race between the hook callback and the worker.
+//!
+//! The engine runtime drives the mode from ownership state and only ever escalates
+//! to `ActiveForward` for the window during which a peer owns this machine's input.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use mouser_core::platform::{
-    CaptureDecision, InputCapture, InputInjection, InputSink, LocalInputEvent, PlatformError,
+    CaptureMode, InputCapture, InputInjection, InputSink, LocalInputEvent, PlatformError,
     PlatformResult, ScrollUnit as CoreScrollUnit,
 };
 use windows::Win32::Foundation::{LPARAM, LRESULT, RECT, WPARAM};
@@ -251,7 +268,13 @@ impl InputInjection for WinInjector {
     }
 }
 
-/// Shared mutable state used by the static Win32 hook callbacks.
+/// How often [`CaptureMode::PassiveEdge`] samples the cursor. `GetCursorPos` is a
+/// cheap kernel read (no hook, no per-input-event cost), so ~125 Hz gives prompt
+/// edge detection without touching the local input pipeline at all.
+const PASSIVE_POLL_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Shared mutable state used by the static Win32 hook callbacks (the
+/// [`CaptureMode::ActiveForward`] path only).
 #[derive(Default)]
 struct CaptureState {
     sink: Option<Arc<dyn InputSink>>,
@@ -273,7 +296,6 @@ const MAX_CAPTURE_QUEUE: usize = 256;
 
 static CAPTURE_STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
 static CAPTURE_QUEUE: OnceLock<CaptureQueue> = OnceLock::new();
-static CAPTURE_SUPPRESSING: AtomicBool = AtomicBool::new(false);
 static CAPTURE_MODS: AtomicU16 = AtomicU16::new(0);
 
 fn capture_state() -> &'static Mutex<CaptureState> {
@@ -296,7 +318,6 @@ fn wait_recover<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuar
 }
 
 fn clear_capture_state() {
-    CAPTURE_SUPPRESSING.store(false, Ordering::Release);
     CAPTURE_MODS.store(0, Ordering::Release);
     clear_capture_queue();
     let mut state = lock_recover(capture_state());
@@ -309,23 +330,36 @@ fn prepare_capture_state(sink: Arc<dyn InputSink>) -> PlatformResult<()> {
     if state.sink.is_some() {
         return Err(boxed(CaptureAlreadyRunning));
     }
-    CAPTURE_SUPPRESSING.store(false, Ordering::Release);
     CAPTURE_MODS.store(0, Ordering::Release);
     clear_capture_queue();
-    state.displays = active_display_bounds().unwrap_or_else(|_| Vec::new());
+    state.displays = active_display_bounds().unwrap_or_default();
     state.sink = Some(sink);
     Ok(())
 }
 
-/// Windows input capture via `WH_KEYBOARD_LL` and `WH_MOUSE_LL`.
+/// Windows input capture: a [`CaptureMode`] state machine over a passive cursor
+/// poll (PassiveEdge) and the low-level `WH_*_LL` hooks (ActiveForward).
 pub struct WinCapture {
     inner: Arc<Mutex<CaptureRun>>,
 }
 
+/// The adapter's run state. All transitions go through the `inner` mutex, and the
+/// background threads it owns (the passive poll thread, the hook thread, and the
+/// hook thread's worker) **never** acquire this mutex — so a transition can join
+/// them while holding the lock without risking a deadlock.
 struct CaptureRun {
-    thread_id: Option<u32>,
+    /// The mode the adapter is actually in.
+    mode: CaptureMode,
+    /// Active-forward hook thread id (for `PostThreadMessageW(WM_QUIT)`).
+    hook_thread_id: Option<u32>,
+    /// Active-forward hook thread handle.
+    hook_handle: Option<JoinHandle<()>>,
+    /// True only while the `WH_*_LL` hooks are installed.
     can_suppress: bool,
-    handle: Option<JoinHandle<()>>,
+    /// Passive poll thread stop flag.
+    passive_stop: Option<Arc<AtomicBool>>,
+    /// Passive poll thread handle.
+    passive_handle: Option<JoinHandle<()>>,
 }
 
 impl Default for WinCapture {
@@ -335,106 +369,162 @@ impl Default for WinCapture {
 }
 
 impl WinCapture {
-    /// A not-yet-started Windows capture handle.
+    /// A not-yet-started Windows capture handle (mode [`CaptureMode::Off`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(CaptureRun {
-                thread_id: None,
+                mode: CaptureMode::Off,
+                hook_thread_id: None,
+                hook_handle: None,
                 can_suppress: false,
-                handle: None,
+                passive_stop: None,
+                passive_handle: None,
             })),
         }
     }
+}
 
-    fn join_stale_thread(&self) {
-        let handle = {
-            let mut run = lock_recover(&self.inner);
-            if run.thread_id.is_some() {
-                return;
-            }
-            run.handle.take()
-        };
-        if let Some(handle) = handle {
+/// Tear down whatever the run is currently doing and leave it in
+/// [`CaptureMode::Off`]. Joins the background threads; they never touch `run`'s
+/// mutex, so it is safe to hold the guard across the joins.
+fn teardown(run: &mut CaptureRun) {
+    // Stop the passive poll thread.
+    if let Some(stop) = run.passive_stop.take() {
+        stop.store(true, Ordering::Release);
+    }
+    if let Some(handle) = run.passive_handle.take() {
+        let _ = handle.join();
+    }
+
+    // Stop the active-forward hook thread: ask its message loop to unwind + unhook.
+    let hook_tid = run.hook_thread_id.take();
+    if let Some(tid) = hook_tid {
+        // SAFETY: `tid` was reported by the hook thread after it created its User32
+        // message queue; WM_QUIT asks its GetMessageW loop to return and unhook.
+        let _ = unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    }
+    if let Some(handle) = run.hook_handle.take() {
+        // Never self-join. Teardown runs on the runtime's capture-mode task, not the
+        // hook thread, but guard defensively anyway.
+        // SAFETY: thread-id query has no preconditions.
+        let safe = hook_tid.is_none_or(|tid| unsafe { GetCurrentThreadId() } != tid);
+        if safe {
             let _ = handle.join();
+        }
+    }
+
+    run.can_suppress = false;
+    run.mode = CaptureMode::Off;
+}
+
+/// Spawn the passive cursor-poll thread. Returns its stop flag and join handle.
+fn start_passive_poll(sink: Arc<dyn InputSink>) -> PlatformResult<(Arc<AtomicBool>, JoinHandle<()>)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
+        .name("mouser-win-edge".into())
+        .spawn(move || passive_poll_thread(sink, stop_for_thread))
+        .map_err(boxed)?;
+    Ok((stop, handle))
+}
+
+/// Bring up the active-forward hooks. Returns the hook thread id (for WM_QUIT) and
+/// its join handle once both hooks are installed, or an error if either failed.
+fn start_active_hooks(sink: Arc<dyn InputSink>) -> PlatformResult<(u32, JoinHandle<()>)> {
+    prepare_capture_state(sink)?;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    let handle = std::thread::Builder::new()
+        .name("mouser-win-capture".into())
+        .spawn(move || run_capture_thread(tx))
+        .map_err(boxed)?;
+
+    match rx.recv() {
+        Ok(Ok(thread_id)) => Ok((thread_id, handle)),
+        Ok(Err(reason)) => {
+            clear_capture_state();
+            let _ = handle.join();
+            Err(boxed(CaptureStartFailed(reason)))
+        }
+        Err(_) => {
+            clear_capture_state();
+            let _ = handle.join();
+            Err(boxed(CaptureStartFailed(
+                "capture thread exited before installing hooks".to_owned(),
+            )))
         }
     }
 }
 
 impl InputCapture for WinCapture {
-    fn start(&self, sink: Arc<dyn InputSink>) -> PlatformResult<()> {
-        self.join_stale_thread();
-        if lock_recover(&self.inner).thread_id.is_some() {
-            return Ok(());
+    fn set_mode(&self, mode: CaptureMode, sink: &Arc<dyn InputSink>) -> PlatformResult<()> {
+        let mut run = lock_recover(&self.inner);
+        if run.mode == mode {
+            return Ok(()); // idempotent: already in the requested mode
         }
-
-        prepare_capture_state(sink)?;
-
-        let inner = Arc::clone(&self.inner);
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let handle = std::thread::Builder::new()
-            .name("mouser-win-capture".into())
-            .spawn(move || run_capture_thread(inner, tx))
-            .map_err(boxed)?;
-
-        match rx.recv() {
-            Ok(Ok(())) => {
-                lock_recover(&self.inner).handle = Some(handle);
-                Ok(())
+        // Tear the previous mode down first (leaves us in Off), then bring up the new
+        // one. On failure we stay in Off rather than a half-installed state.
+        teardown(&mut run);
+        match mode {
+            CaptureMode::Off => {}
+            CaptureMode::PassiveEdge => {
+                let (stop, handle) = start_passive_poll(Arc::clone(sink))?;
+                run.passive_stop = Some(stop);
+                run.passive_handle = Some(handle);
+                run.mode = CaptureMode::PassiveEdge;
             }
-            Ok(Err(reason)) => {
-                clear_capture_state();
-                let _ = handle.join();
-                Err(boxed(CaptureStartFailed(reason)))
-            }
-            Err(_) => {
-                clear_capture_state();
-                let _ = handle.join();
-                Err(boxed(CaptureStartFailed(
-                    "capture thread exited before installing hooks".to_owned(),
-                )))
+            CaptureMode::ActiveForward => {
+                let (thread_id, handle) = start_active_hooks(Arc::clone(sink))?;
+                run.hook_thread_id = Some(thread_id);
+                run.hook_handle = Some(handle);
+                run.can_suppress = true;
+                run.mode = CaptureMode::ActiveForward;
             }
         }
+        Ok(())
     }
 
     fn stop(&self) -> PlatformResult<()> {
-        let thread_id = lock_recover(&self.inner).thread_id;
-        let Some(thread_id) = thread_id else {
-            self.join_stale_thread();
-            clear_capture_state();
-            return Ok(());
-        };
-
-        // SAFETY: `thread_id` was reported by the capture thread after creating
-        // its User32 message queue. Posting WM_QUIT asks its GetMessageW loop to
-        // unwind and unhook.
-        unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }.map_err(boxed)?;
-
-        let handle = {
-            let mut run = lock_recover(&self.inner);
-            run.can_suppress = false;
-            run.thread_id = None;
-            run.handle.take()
-        };
-
-        // Avoid self-joining if stop is ever called from inside the hook sink.
-        if unsafe { GetCurrentThreadId() } != thread_id {
-            if let Some(handle) = handle {
-                let _ = handle.join();
-            }
-        }
+        let mut run = lock_recover(&self.inner);
+        teardown(&mut run);
         Ok(())
     }
 
     fn can_suppress(&self) -> bool {
         lock_recover(&self.inner).can_suppress
     }
+
+    fn current_mode(&self) -> CaptureMode {
+        lock_recover(&self.inner).mode
+    }
 }
 
-fn run_capture_thread(
-    inner: Arc<Mutex<CaptureRun>>,
-    tx: std::sync::mpsc::Sender<Result<(), String>>,
-) {
+/// The passive edge sensor: poll `GetCursorPos`, map to a display-local position,
+/// and report it to the sink. Installs no hooks, never suppresses, never reads the
+/// keyboard — so local input is wholly untouched while a controller is connected
+/// but not actively driving the peer.
+fn passive_poll_thread(sink: Arc<dyn InputSink>, stop: Arc<AtomicBool>) {
+    let displays = active_display_bounds().unwrap_or_default();
+    let mut last: Option<(i32, i32)> = None;
+    while !stop.load(Ordering::Acquire) {
+        if let Ok(point) = inject::cursor_position() {
+            let pos = (point.x, point.y);
+            if last != Some(pos) {
+                last = Some(pos);
+                let event = virtual_point_to_event(&displays, point.x, point.y);
+                // Passive sensing never suppresses; the returned decision is ignored.
+                let _ = catch_unwind(AssertUnwindSafe(|| sink.on_event(event)));
+            }
+        }
+        std::thread::sleep(PASSIVE_POLL_INTERVAL);
+    }
+}
+
+/// The active-forward hook thread: install `WH_KEYBOARD_LL` + `WH_MOUSE_LL`, run the
+/// message loop, and unhook on WM_QUIT. Reports its thread id back over `tx` once the
+/// hooks are installed (so a transition can post WM_QUIT to it), or an error string
+/// if installation failed. Never touches the [`CaptureRun`] mutex.
+fn run_capture_thread(tx: std::sync::mpsc::Sender<Result<u32, String>>) {
     // SAFETY: thread id is a pure OS query.
     let thread_id = unsafe { GetCurrentThreadId() };
     create_message_queue();
@@ -453,9 +543,9 @@ fn run_capture_thread(
         }
     };
 
-    // SAFETY: low-level hook procedures are static `extern "system"` functions
-    // with the exact signature Windows requires. For WH_*_LL hooks the callback
-    // runs in this installing thread's context while its message loop is alive.
+    // SAFETY: low-level hook procedures are static `extern "system"` functions with
+    // the exact signature Windows requires. For WH_*_LL hooks the callback runs in
+    // this installing thread's context while its message loop is alive.
     let keyboard_hook =
         match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) } {
             Ok(hook) => hook,
@@ -471,8 +561,8 @@ fn run_capture_thread(
     let mouse_hook = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) } {
         Ok(hook) => hook,
         Err(e) => {
-            // SAFETY: `keyboard_hook` was returned by SetWindowsHookExW above
-            // and is still owned by this thread.
+            // SAFETY: `keyboard_hook` was returned by SetWindowsHookExW above and is
+            // still owned by this thread.
             let _ = unsafe { UnhookWindowsHookEx(keyboard_hook) };
             stop_capture_worker(worker_stop, worker);
             clear_capture_state();
@@ -481,25 +571,16 @@ fn run_capture_thread(
         }
     };
 
-    {
-        let mut run = lock_recover(&inner);
-        run.thread_id = Some(thread_id);
-        run.can_suppress = true;
-    }
-    let _ = tx.send(Ok(()));
+    let _ = tx.send(Ok(thread_id));
 
     message_loop();
 
-    // SAFETY: these handles were installed on this thread and have not been
-    // unhooked yet. Ignore shutdown failures; capture is already stopping.
+    // SAFETY: these handles were installed on this thread and have not been unhooked
+    // yet. Ignore shutdown failures; capture is already stopping.
     let _ = unsafe { UnhookWindowsHookEx(mouse_hook) };
     let _ = unsafe { UnhookWindowsHookEx(keyboard_hook) };
     stop_capture_worker(worker_stop, worker);
     clear_capture_state();
-
-    let mut run = lock_recover(&inner);
-    run.thread_id = None;
-    run.can_suppress = false;
 }
 
 fn stop_capture_worker(stop: Arc<AtomicBool>, worker: JoinHandle<()>) {
@@ -519,7 +600,7 @@ fn capture_worker(stop: Arc<AtomicBool>) {
         }
 
         for event in events {
-            let _ = process_queued_capture_event(event);
+            process_queued_capture_event(event);
         }
     }
 }
@@ -538,9 +619,9 @@ fn wait_for_capture_events(stop: &AtomicBool) -> VecDeque<QueuedCaptureEvent> {
 
 fn create_message_queue() {
     let mut msg = MSG::default();
-    // SAFETY: a zero-filter PeekMessageW creates this thread's User32 message
-    // queue if it does not already exist. PM_NOREMOVE leaves queued messages
-    // untouched, which matters because stop() later uses PostThreadMessageW.
+    // SAFETY: a zero-filter PeekMessageW creates this thread's User32 message queue
+    // if it does not already exist. PM_NOREMOVE leaves queued messages untouched,
+    // which matters because a transition later uses PostThreadMessageW.
     let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
 }
 
@@ -569,10 +650,31 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     // SAFETY: Windows calls this hook with `lparam` pointing at a live
     // KBDLLHOOKSTRUCT for the duration of the callback.
     let hook = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    let decision = keyboard_event_from_parts(message, hook.scanCode, hook.flags.0)
-        .map(dispatch_non_cursor_capture_event)
-        .unwrap_or(CaptureDecision::PassThrough);
-    hook_result(decision, code, wparam, lparam)
+    // Never capture our own injected input.
+    if hook.flags.0 & LLKHF_INJECTED.0 != 0 {
+        return call_next(code, wparam, lparam);
+    }
+    // Only real key transitions are forwarded/suppressed; anything else passes.
+    if !is_key_message(message) {
+        return call_next(code, wparam, lparam);
+    }
+
+    // Hooks only exist in ActiveForward (we are driving the peer), so the answer is
+    // statically "swallow locally and forward": enqueue the modeled event for the
+    // worker and return Suppress synchronously. Unmapped keys are still swallowed so
+    // they cannot leak to the local desktop while controlling.
+    //
+    // Known minor edge case: a key physically held *across* the PassiveEdge→
+    // ActiveForward transition had its key-down delivered locally (passive mode does
+    // not capture the keyboard); its key-up then arrives here and is suppressed,
+    // which can leave that one key logically held on the local desktop until pressed
+    // again. This requires holding a key while crossing the screen edge and is far
+    // rarer than the always-on-hook degradation this design removes; synthesizing
+    // held-key releases at the transition is future work.
+    if let Some(event) = keyboard_event_from_parts(message, hook.scanCode, hook.flags.0) {
+        enqueue_capture_event(event);
+    }
+    LRESULT(1)
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -589,31 +691,39 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     // SAFETY: Windows calls this hook with `lparam` pointing at a live
     // MSLLHOOKSTRUCT for the duration of the callback.
     let hook = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
-    let decision = mouse_capture_decision_from_parts(
-        message,
-        hook.pt.x,
-        hook.pt.y,
-        hook.mouseData,
-        hook.flags,
-    );
-    hook_result(decision, code, wparam, lparam)
+    if hook.flags & LLMHF_INJECTED != 0 {
+        return call_next(code, wparam, lparam);
+    }
+
+    // ActiveForward: swallow local pointer input and forward it to the peer.
+    if message == WM_MOUSEMOVE {
+        enqueue_cursor_capture_point(hook.pt.x, hook.pt.y);
+        return LRESULT(1);
+    }
+    if let Some(event) =
+        mouse_event_from_parts(message, hook.pt.x, hook.pt.y, hook.mouseData, hook.flags)
+    {
+        enqueue_capture_event(event);
+        return LRESULT(1);
+    }
+    call_next(code, wparam, lparam)
 }
 
 fn call_next(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // SAFETY: forwarding with a null hook handle is the documented low-level
-    // hook pattern; `code/wparam/lparam` are the values Windows supplied.
+    // SAFETY: forwarding with a null hook handle is the documented low-level hook
+    // pattern; `code/wparam/lparam` are the values Windows supplied.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
-}
-
-fn hook_result(decision: CaptureDecision, code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match decision {
-        CaptureDecision::PassThrough => call_next(code, wparam, lparam),
-        CaptureDecision::Suppress => LRESULT(1),
-    }
 }
 
 fn hook_message(wparam: WPARAM) -> Option<u32> {
     u32::try_from(wparam.0).ok()
+}
+
+fn is_key_message(message: u32) -> bool {
+    matches!(
+        message,
+        WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+    )
 }
 
 fn keyboard_event_from_parts(message: u32, scan_code: u32, flags: u32) -> Option<LocalInputEvent> {
@@ -707,31 +817,13 @@ fn mouse_event_from_parts(
     }
 }
 
-fn mouse_capture_decision_from_parts(
-    message: u32,
-    x: i32,
-    y: i32,
-    mouse_data: u32,
-    flags: u32,
-) -> CaptureDecision {
-    if flags & LLMHF_INJECTED != 0 {
-        return CaptureDecision::PassThrough;
-    }
-    if message == WM_MOUSEMOVE {
-        return dispatch_cursor_capture_point(x, y);
-    }
-    mouse_event_from_parts(message, x, y, mouse_data, flags)
-        .map(dispatch_non_cursor_capture_event)
-        .unwrap_or(CaptureDecision::PassThrough)
-}
-
-fn cursor_event_for_virtual_point(x: i32, y: i32) -> LocalInputEvent {
-    let displays = lock_recover(capture_state()).displays.clone();
+/// Map a virtual-desktop point to a display-local [`LocalInputEvent::CursorMoved`].
+fn virtual_point_to_event(displays: &[DisplayBounds], x: i32, y: i32) -> LocalInputEvent {
     let bounds = displays
         .iter()
         .copied()
         .find(|b| b.contains_virtual(x, y))
-        .or_else(|| displays.iter().copied().next());
+        .or_else(|| displays.first().copied());
 
     match bounds {
         Some(bounds) => {
@@ -750,59 +842,30 @@ fn cursor_event_for_virtual_point(x: i32, y: i32) -> LocalInputEvent {
     }
 }
 
-fn dispatch_cursor_capture_point(x: i32, y: i32) -> CaptureDecision {
-    let decision = cached_capture_decision();
-    enqueue_cursor_capture_point(x, y);
-    decision
+/// Resolve a virtual-desktop point using the active-forward display snapshot.
+fn cursor_event_for_virtual_point(x: i32, y: i32) -> LocalInputEvent {
+    let displays = lock_recover(capture_state()).displays.clone();
+    virtual_point_to_event(&displays, x, y)
 }
 
-fn dispatch_non_cursor_capture_event(event: LocalInputEvent) -> CaptureDecision {
-    let decision = cached_capture_decision();
-    if decision == CaptureDecision::PassThrough {
-        return CaptureDecision::PassThrough;
-    }
-    enqueue_capture_event(event);
-    decision
-}
-
-fn dispatch_capture_event(event: LocalInputEvent) -> CaptureDecision {
+/// Hand one queued event to the sink. The returned decision is unused: in
+/// ActiveForward the hook already returned Suppress synchronously, so this call
+/// exists only to drive forwarding (and a reclaim arrives as a `SetCaptureMode`
+/// action that tears the hooks back down).
+fn dispatch_capture_event(event: LocalInputEvent) {
     let sink = lock_recover(capture_state()).sink.clone();
-    let decision = if let Some(sink) = sink {
-        catch_unwind(AssertUnwindSafe(|| sink.on_event(event)))
-            .unwrap_or(CaptureDecision::PassThrough)
-    } else {
-        CaptureDecision::PassThrough
-    };
-    set_capture_suppressing(decision)
+    if let Some(sink) = sink {
+        let _ = catch_unwind(AssertUnwindSafe(|| sink.on_event(event)));
+    }
 }
 
-fn process_queued_capture_event(event: QueuedCaptureEvent) -> CaptureDecision {
+fn process_queued_capture_event(event: QueuedCaptureEvent) {
     match event {
         QueuedCaptureEvent::Event(event) => dispatch_capture_event(event),
         QueuedCaptureEvent::CursorPoint { x, y } => {
             dispatch_capture_event(cursor_event_for_virtual_point(x, y))
         }
     }
-}
-
-fn cached_capture_decision() -> CaptureDecision {
-    if capture_is_suppressing() {
-        CaptureDecision::Suppress
-    } else {
-        CaptureDecision::PassThrough
-    }
-}
-
-fn capture_is_suppressing() -> bool {
-    CAPTURE_SUPPRESSING.load(Ordering::Acquire)
-}
-
-fn set_capture_suppressing(decision: CaptureDecision) -> CaptureDecision {
-    CAPTURE_SUPPRESSING.store(
-        matches!(decision, CaptureDecision::Suppress),
-        Ordering::Release,
-    );
-    decision
 }
 
 fn enqueue_capture_event(event: LocalInputEvent) {
@@ -815,10 +878,16 @@ fn enqueue_cursor_capture_point(x: i32, y: i32) {
 
 fn enqueue_queued_capture_event(event: QueuedCaptureEvent) {
     let queue = capture_queue();
-    let Ok(mut pending) = queue.pending.try_lock() else {
-        return;
-    };
+    // Block rather than `try_lock`: the worker only ever holds this lock for the
+    // microsecond-scale `swap` in `wait_for_capture_events` (it releases it across
+    // the condvar wait and while running the sink), so this never stalls the hook
+    // long enough to trip Windows' LowLevelHooksTimeout — and it guarantees a
+    // key/button transition is never dropped just because the worker was mid-swap.
+    let mut pending = lock_recover(&queue.pending);
 
+    // Coalesce consecutive cursor moves: only the latest position matters. A cursor
+    // event is only ever merged into another cursor event, so this can never drop a
+    // key/button transition (a transition between two cursors blocks the merge).
     if queued_capture_event_is_cursor(&event) {
         if let Some(last) = pending.back_mut() {
             if queued_capture_event_is_cursor(last) {
@@ -830,10 +899,23 @@ fn enqueue_queued_capture_event(event: QueuedCaptureEvent) {
     }
 
     if pending.len() >= MAX_CAPTURE_QUEUE {
-        let _ = pending.pop_front();
+        // Overflow under a slow sink: evict the oldest *cursor* (positional, lossy)
+        // event so key/button transitions survive. Only if the backlog is entirely
+        // transitions do we fall back to dropping the oldest entry.
+        drop_one_for_overflow(&mut pending);
     }
     pending.push_back(event);
     queue.ready.notify_one();
+}
+
+/// Evict one event to make room: prefer the oldest cursor move (lossy), and only
+/// drop the front (oldest transition) if there is no cursor to sacrifice.
+fn drop_one_for_overflow(pending: &mut VecDeque<QueuedCaptureEvent>) {
+    if let Some(idx) = pending.iter().position(queued_capture_event_is_cursor) {
+        let _ = pending.remove(idx);
+    } else {
+        let _ = pending.pop_front();
+    }
 }
 
 fn queued_capture_event_is_cursor(event: &QueuedCaptureEvent) -> bool {
@@ -897,6 +979,7 @@ impl std::error::Error for CaptureStartFailed {}
 mod tests {
     use super::*;
 
+    use mouser_core::platform::CaptureDecision;
     use std::collections::VecDeque;
 
     static CAPTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -905,20 +988,14 @@ mod tests {
         lock_recover(CAPTURE_TEST_LOCK.get_or_init(|| Mutex::new(())))
     }
 
+    /// Records every event handed to it; the decision is unused under the new model
+    /// (the active hook suppresses synchronously), so it always passes through.
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<LocalInputEvent>>,
-        decisions: Mutex<VecDeque<CaptureDecision>>,
     }
 
     impl RecordingSink {
-        fn with_decisions(decisions: impl IntoIterator<Item = CaptureDecision>) -> Self {
-            Self {
-                events: Mutex::new(Vec::new()),
-                decisions: Mutex::new(decisions.into_iter().collect()),
-            }
-        }
-
         fn events(&self) -> Vec<LocalInputEvent> {
             lock_recover(&self.events).clone()
         }
@@ -927,9 +1004,7 @@ mod tests {
     impl InputSink for RecordingSink {
         fn on_event(&self, event: LocalInputEvent) -> CaptureDecision {
             lock_recover(&self.events).push(event);
-            lock_recover(&self.decisions)
-                .pop_front()
-                .unwrap_or(CaptureDecision::PassThrough)
+            CaptureDecision::PassThrough
         }
     }
 
@@ -944,7 +1019,23 @@ mod tests {
             std::mem::take(&mut *pending)
         };
         for event in events {
-            let _ = process_queued_capture_event(event);
+            process_queued_capture_event(event);
+        }
+    }
+
+    fn key(usage: u16, down: bool) -> LocalInputEvent {
+        LocalInputEvent::Key {
+            usage,
+            down,
+            mods: 0,
+        }
+    }
+
+    fn cursor(x: i32, y: i32) -> LocalInputEvent {
+        LocalInputEvent::CursorMoved {
+            display_id: 0,
+            x,
+            y,
         }
     }
 
@@ -1088,93 +1179,194 @@ mod tests {
     }
 
     #[test]
-    fn idle_non_cursor_events_bypass_the_sink() {
+    fn new_capture_is_off_and_cannot_suppress() {
+        let cap = WinCapture::new();
+        assert_eq!(cap.current_mode(), CaptureMode::Off);
+        assert!(!cap.can_suppress());
+    }
+
+    #[test]
+    fn passive_mode_installs_no_hooks() {
+        let _guard = capture_test_lock();
+        let cap = WinCapture::new();
+        let sink: Arc<dyn InputSink> = Arc::new(RecordingSink::default());
+
+        cap.set_mode(CaptureMode::PassiveEdge, &sink)
+            .expect("enter passive edge");
+        assert_eq!(cap.current_mode(), CaptureMode::PassiveEdge);
+        assert!(
+            !cap.can_suppress(),
+            "passive edge sensing never suppresses local input"
+        );
+        {
+            let run = lock_recover(&cap.inner);
+            assert!(
+                run.hook_thread_id.is_none(),
+                "no WH_*_LL hooks are installed in passive mode"
+            );
+            assert!(run.passive_handle.is_some(), "the poll thread is running");
+        }
+
+        // Re-entering the same mode is a no-op.
+        cap.set_mode(CaptureMode::PassiveEdge, &sink)
+            .expect("idempotent");
+        assert_eq!(cap.current_mode(), CaptureMode::PassiveEdge);
+
+        cap.stop().expect("stop");
+        assert_eq!(cap.current_mode(), CaptureMode::Off);
+        {
+            let run = lock_recover(&cap.inner);
+            assert!(run.passive_handle.is_none(), "poll thread joined on stop");
+        }
+    }
+
+    #[test]
+    fn coalescing_preserves_interleaved_key_transitions() {
         let _guard = capture_test_lock();
         clear_capture_state();
-        let sink = Arc::new(RecordingSink::with_decisions([CaptureDecision::Suppress]));
+        let sink = Arc::new(RecordingSink::default());
         install_test_sink(&sink);
 
+        // A key down/up straddling a run of cursor moves. The middle cursor (2,2)
+        // coalesces into (3,3); both key transitions must survive in order.
+        enqueue_cursor_capture_point(1, 1);
+        enqueue_capture_event(key(0x04, true));
+        enqueue_cursor_capture_point(2, 2);
+        enqueue_cursor_capture_point(3, 3); // coalesces with (2,2)
+        enqueue_capture_event(key(0x04, false));
+        enqueue_cursor_capture_point(4, 4);
+        drain_capture_queue_for_test();
+
+        let events = sink.events();
+        let keys: Vec<LocalInputEvent> = events
+            .iter()
+            .copied()
+            .filter(|e| matches!(e, LocalInputEvent::Key { .. }))
+            .collect();
         assert_eq!(
-            dispatch_non_cursor_capture_event(LocalInputEvent::Key {
-                usage: 0x04,
-                down: true,
-                mods: 0,
-            }),
-            CaptureDecision::PassThrough
+            keys,
+            vec![key(0x04, true), key(0x04, false)],
+            "both key transitions preserved, in order"
         );
-        assert!(sink.events().is_empty());
-        assert!(!capture_is_suppressing());
+        assert!(
+            !events.contains(&cursor(2, 2)),
+            "the intermediate cursor (2,2) coalesced away"
+        );
+        assert!(
+            events.contains(&cursor(3, 3)) && events.contains(&cursor(4, 4)),
+            "the latest cursor positions survive"
+        );
         clear_capture_state();
     }
 
     #[test]
-    fn cursor_suppression_enables_non_cursor_forwarding() {
+    fn high_rate_cursor_flood_never_overflows_or_evicts_transitions() {
         let _guard = capture_test_lock();
         clear_capture_state();
-        let sink = Arc::new(RecordingSink::with_decisions([
-            CaptureDecision::Suppress,
-            CaptureDecision::PassThrough,
-        ]));
+        let sink = Arc::new(RecordingSink::default());
         install_test_sink(&sink);
 
-        let cursor = LocalInputEvent::CursorMoved {
-            display_id: 0,
-            x: 100,
-            y: 20,
-        };
-        let key = LocalInputEvent::Key {
-            usage: 0x04,
+        // A held key, then a long flood of cursor moves (as a fast touchpad would
+        // produce), then the release. Consecutive cursors coalesce into the tail, so
+        // the queue never grows past a few entries and never overflows — the down/up
+        // transitions are never at risk.
+        enqueue_capture_event(key(0x04, true));
+        for i in 0..(MAX_CAPTURE_QUEUE as i32 * 8) {
+            enqueue_cursor_capture_point(i, i);
+        }
+        enqueue_capture_event(key(0x04, false));
+
+        {
+            let pending = lock_recover(&capture_queue().pending);
+            assert!(
+                pending.len() <= 3,
+                "cursor flood coalesced; queue stayed tiny (len {})",
+                pending.len()
+            );
+        }
+
+        drain_capture_queue_for_test();
+        let events = sink.events();
+        assert!(events.contains(&key(0x04, true)), "key down preserved");
+        assert!(events.contains(&key(0x04, false)), "key up preserved");
+        clear_capture_state();
+    }
+
+    #[test]
+    fn slow_sink_overflow_is_bounded_and_evicts_cursors_before_transitions() {
+        let _guard = capture_test_lock();
+        clear_capture_state();
+
+        // Simulate a stalled worker with a realistic backlog where cursor moves
+        // dominate: a leading key transition, then `pairs` of (cursor, button) so the
+        // cursors don't coalesce. `pairs` is chosen so the queue overflows yet there
+        // are always more cursors than overflow drops — the property that holds in
+        // practice (positional events vastly outnumber transitions). The queue must
+        // stay bounded and every key/button transition must survive (only cursors are
+        // sacrificed).
+        let pairs = MAX_CAPTURE_QUEUE * 3 / 4; // overflow, but drops < cursor count
+        enqueue_capture_event(key(0x04, true));
+        for i in 0..pairs as i32 {
+            enqueue_cursor_capture_point(i, i);
+            enqueue_capture_event(LocalInputEvent::Button {
+                button: 2,
+                down: i % 2 == 0,
+            });
+        }
+
+        {
+            let pending = lock_recover(&capture_queue().pending);
+            assert!(
+                pending.len() <= MAX_CAPTURE_QUEUE,
+                "queue is bounded under a slow sink (len {})",
+                pending.len()
+            );
+            assert!(
+                pending
+                    .iter()
+                    .any(|e| matches!(e, QueuedCaptureEvent::Event(LocalInputEvent::Key { .. }))),
+                "the leading key transition survived overflow (cursors evicted first)"
+            );
+            let transitions = pending
+                .iter()
+                .filter(|e| matches!(e, QueuedCaptureEvent::Event(LocalInputEvent::Button { .. })))
+                .count();
+            assert_eq!(
+                transitions, pairs,
+                "every button transition survived; only cursors were evicted"
+            );
+        }
+        clear_capture_state();
+    }
+
+    #[test]
+    fn overflow_eviction_prefers_cursors_then_falls_back_to_front() {
+        // With a cursor present, the oldest cursor is evicted and transitions stay.
+        let mut q: VecDeque<QueuedCaptureEvent> = VecDeque::new();
+        q.push_back(QueuedCaptureEvent::Event(key(0x04, true)));
+        q.push_back(QueuedCaptureEvent::CursorPoint { x: 1, y: 1 });
+        q.push_back(QueuedCaptureEvent::Event(LocalInputEvent::Button {
+            button: 0,
             down: true,
-            mods: 0,
-        };
-
-        assert_eq!(
-            mouse_capture_decision_from_parts(WM_MOUSEMOVE, 100, 20, 0, 0),
-            CaptureDecision::PassThrough
-        );
-        assert!(sink.events().is_empty());
-        drain_capture_queue_for_test();
-        assert!(capture_is_suppressing());
-        assert_eq!(
-            dispatch_non_cursor_capture_event(key),
-            CaptureDecision::Suppress
-        );
-        assert!(capture_is_suppressing());
-        drain_capture_queue_for_test();
-        assert!(!capture_is_suppressing());
-        assert_eq!(sink.events(), vec![cursor, key]);
-        clear_capture_state();
-    }
-
-    #[test]
-    fn queued_cursor_moves_coalesce_when_worker_lags() {
-        let _guard = capture_test_lock();
-        clear_capture_state();
-        let sink = Arc::new(RecordingSink::with_decisions([
-            CaptureDecision::PassThrough,
-            CaptureDecision::PassThrough,
-        ]));
-        install_test_sink(&sink);
-
-        let latest = LocalInputEvent::CursorMoved {
-            display_id: 0,
-            x: 30,
-            y: 40,
-        };
-
-        assert_eq!(
-            mouse_capture_decision_from_parts(WM_MOUSEMOVE, 10, 20, 0, 0),
-            CaptureDecision::PassThrough
+        }));
+        q.push_back(QueuedCaptureEvent::CursorPoint { x: 2, y: 2 });
+        drop_one_for_overflow(&mut q);
+        assert!(
+            matches!(q.front(), Some(QueuedCaptureEvent::Event(LocalInputEvent::Key { .. }))),
+            "front transition kept"
         );
         assert_eq!(
-            mouse_capture_decision_from_parts(WM_MOUSEMOVE, 30, 40, 0, 0),
-            CaptureDecision::PassThrough
+            q.iter().filter(|e| queued_capture_event_is_cursor(e)).count(),
+            1,
+            "exactly one cursor evicted"
         );
-        drain_capture_queue_for_test();
 
-        assert_eq!(sink.events(), vec![latest]);
-        assert!(!capture_is_suppressing());
-        clear_capture_state();
+        // With no cursor to sacrifice, fall back to dropping the oldest entry.
+        let mut all_transitions: VecDeque<QueuedCaptureEvent> = VecDeque::new();
+        all_transitions.push_back(QueuedCaptureEvent::Event(key(0x04, true)));
+        all_transitions.push_back(QueuedCaptureEvent::Event(key(0x05, true)));
+        drop_one_for_overflow(&mut all_transitions);
+        assert_eq!(all_transitions.len(), 1);
     }
 
     #[test]
@@ -1188,15 +1380,10 @@ mod tests {
             width: 500,
             height: 400,
         }];
-        let sink = Arc::new(RecordingSink::with_decisions([
-            CaptureDecision::PassThrough,
-        ]));
+        let sink = Arc::new(RecordingSink::default());
         install_test_sink(&sink);
 
-        assert_eq!(
-            mouse_capture_decision_from_parts(WM_MOUSEMOVE, 125, 250, 0, 0),
-            CaptureDecision::PassThrough
-        );
+        enqueue_cursor_capture_point(125, 250);
         drain_capture_queue_for_test();
 
         assert_eq!(
@@ -1207,7 +1394,6 @@ mod tests {
                 y: 50,
             }]
         );
-        assert!(!capture_is_suppressing());
         clear_capture_state();
     }
 }

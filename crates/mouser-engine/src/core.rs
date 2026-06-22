@@ -21,7 +21,7 @@ use mouser_core::{
     ownership::{Ownership, OwnershipUpdate},
     DeviceId,
 };
-use mouser_core::platform::{LocalInputEvent, ScrollUnit as CoreScrollUnit};
+use mouser_core::platform::{CaptureMode, LocalInputEvent, ScrollUnit as CoreScrollUnit};
 use mouser_protocol::{
     from_cbor, to_cbor, Datagram, FocusKind, Goodbye, GoodbyeReason, Heartbeat, KeyEvent,
     OwnershipAck, OwnershipTransfer, Ping, PointerButton, PointerMotion, Pong, Scroll, ScrollUnit,
@@ -96,6 +96,11 @@ pub enum Action {
     Inject(Inject),
     /// Tell the capture adapter to pass through or swallow the local event.
     Capture(CaptureDecision),
+    /// Transition the capture adapter's mode (the "edge sensing is not input
+    /// forwarding" lever). Emitted whenever ownership changes so the runtime
+    /// installs heavyweight forwarding hooks **only** while actively controlling a
+    /// remote peer and otherwise sits in passive, non-suppressing edge sensing.
+    SetCaptureMode(CaptureMode),
     /// Ownership/owner changed — for the tray/UI and logging.
     OwnerChanged { owner: DeviceId, epoch: u64 },
 }
@@ -207,6 +212,34 @@ impl EngineCore {
     /// Whether this node currently owns input.
     pub fn is_owner(&self) -> bool {
         self.ownership.is_owner()
+    }
+
+    /// The capture mode this node should be in **right now**, derived purely from
+    /// role + ownership (a total function of state — never a stored flag, so it can
+    /// never drift out of sync with ownership):
+    ///
+    /// - [`Role::Target`] → always [`CaptureMode::Off`] (it injects, never captures).
+    /// - [`Role::Source`] while it owns input (cursor on its own screen) →
+    ///   [`CaptureMode::PassiveEdge`]: sense the edge with no hooks, no suppression,
+    ///   so local keyboard/touchpad are untouched.
+    /// - [`Role::Source`] while a peer owns input (we are forwarding) →
+    ///   [`CaptureMode::ActiveForward`]: full suppressing capture.
+    #[must_use]
+    pub fn capture_mode(&self) -> CaptureMode {
+        match self.role {
+            Role::Target => CaptureMode::Off,
+            Role::Source if self.is_owner() => CaptureMode::PassiveEdge,
+            Role::Source => CaptureMode::ActiveForward,
+        }
+    }
+
+    /// The actions the runtime must apply once when the session starts, to bring
+    /// capture up in the correct initial mode (a source begins in
+    /// [`CaptureMode::PassiveEdge`]; a target in [`CaptureMode::Off`]). Keeping this
+    /// in the core means the "what mode now?" decision lives in exactly one place.
+    #[must_use]
+    pub fn initial_actions(&self) -> Vec<Action> {
+        vec![Action::SetCaptureMode(self.capture_mode())]
     }
 
     fn me(&self) -> DeviceId {
@@ -346,7 +379,10 @@ impl EngineCore {
         });
         let seq = self.next_seq();
         let motion = PointerMotion { owner_epoch: epoch, seq, display_id: 0, x: self.peer_x, y: self.peer_y };
+        // SetCaptureMode goes first: the runtime escalates to ActiveForward (installs
+        // suppressing hooks) before we start suppressing/forwarding this crossing.
         vec![
+            Action::SetCaptureMode(CaptureMode::ActiveForward),
             Action::SendControl(TYPE_OWNERSHIP_TRANSFER, transfer),
             Action::SendMotion(motion),
             Action::OwnerChanged { owner: self.peer, epoch },
@@ -365,7 +401,10 @@ impl EngineCore {
             layout_rev: 0,
             reason: TransferReason::LocalReclaim,
         });
+        // SetCaptureMode goes first: drop suppressing hooks back to passive edge
+        // sensing the moment we reclaim, so local input is immediately untouched.
         vec![
+            Action::SetCaptureMode(CaptureMode::PassiveEdge),
             Action::SendControl(TYPE_OWNERSHIP_TRANSFER, transfer),
             Action::OwnerChanged { owner: me, epoch },
             Action::Capture(CaptureDecision::PassThrough),
@@ -401,10 +440,21 @@ impl EngineCore {
                 self.reset_out();
                 self.misses = 0;
                 let ack = encode(&OwnershipAck { owner_epoch: epoch, accepted: true, reason: None });
-                vec![
+                let mut actions = vec![
                     Action::SendControl(TYPE_OWNERSHIP_ACK, ack),
                     Action::OwnerChanged { owner, epoch },
-                ]
+                ];
+                // An inbound transfer can flip a Source between owning (passive edge
+                // sensing) and forwarding (active capture) — e.g. a peer reclaiming
+                // on its side. Re-sync the capture mode to the new ownership so a
+                // Source that just lost the input stops its suppressing hooks (and
+                // one that regained it drops back to passive). Idempotent in the
+                // adapter, so a no-op when the mode is unchanged. A Target never
+                // captures, so it emits nothing here.
+                if self.role == Role::Source {
+                    actions.push(Action::SetCaptureMode(self.capture_mode()));
+                }
+                actions
             }
             OwnershipUpdate::Rejected(_) => {
                 let ack = encode(&OwnershipAck {

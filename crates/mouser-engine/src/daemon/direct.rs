@@ -4,14 +4,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mouser_core::platform::{InputCapture, InputInjection, InputSink};
+use mouser_core::platform::{InputCapture, InputInjection};
 use mouser_core::DeviceId;
 use mouser_net::{InteractiveEndpoint, PinPolicy};
 
 use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::{EngineCore, RuntimeHandle};
 
-use super::{source_layout, EngineSink};
+use super::source_layout;
 
 /// Connect to an explicit peer (TrustOnFirstUse) and report the handshake, then
 /// exit - a safe transport check that never captures or injects input.
@@ -56,7 +56,7 @@ pub(super) async fn serve_direct(
     addr: SocketAddr,
     expected_peer: DeviceId,
     injector: Arc<dyn InputInjection>,
-    capture: Box<dyn InputCapture>,
+    capture: Arc<dyn InputCapture>,
 ) -> Result<(), String> {
     if !store
         .is_peer_trusted(&expected_peer)
@@ -85,14 +85,13 @@ pub(super) async fn serve_direct(
     eprintln!("mouserd: connected directly; this machine can control the peer");
 
     let core = EngineCore::new_source(my_id, peer, source_layout());
-    let runtime = Arc::new(RuntimeHandle::start(core, Arc::new(conn), injector));
-    let sink: Arc<dyn InputSink> = Arc::new(EngineSink {
-        runtime: Arc::clone(&runtime),
-    });
-    capture.start(sink).map_err(|e| e.to_string())?;
-    eprintln!("mouserd: capture ready - local keys/buttons stay local until edge crossing");
+    let runtime = RuntimeHandle::start(core, Arc::new(conn), injector, capture);
+    eprintln!(
+        "mouserd: passive edge sensing active - local keyboard/mouse stay native; \
+         suppressing capture installs only while controlling the peer"
+    );
 
     tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
-    let _ = capture.stop();
+    runtime.shutdown();
     Ok(())
 }

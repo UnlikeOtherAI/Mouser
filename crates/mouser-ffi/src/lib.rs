@@ -33,7 +33,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use mouser_core::platform::{InputInjection, LocalInputEvent, PlatformResult, ScrollUnit};
+use mouser_core::platform::{
+    CaptureMode, InputCapture, InputInjection, InputSink, LocalInputEvent, PlatformResult,
+    ScrollUnit,
+};
 use mouser_engine::discovery::decode_device_id;
 use mouser_engine::{EdgeLayout, EngineCore, RuntimeHandle};
 use mouser_net::{DeviceIdentity, InteractiveConnection, InteractiveEndpoint, PinPolicy};
@@ -97,6 +100,27 @@ impl InputInjection for NoopInjector {
     }
     fn scroll(&self, _dx: i32, _dy: i32, _unit: ScrollUnit) -> PlatformResult<()> {
         Ok(())
+    }
+}
+
+/// A no-op [`InputCapture`] for the mobile bridge: the phone is a pure controller whose
+/// input comes from its own touchpad/keyboard UI, not from the engine's local-capture
+/// path. It never edge-senses or suppresses, so every mode transition is inert. Exists
+/// only to satisfy [`RuntimeHandle::start`]'s [`InputCapture`] requirement.
+struct NoopCapture;
+
+impl InputCapture for NoopCapture {
+    fn set_mode(&self, _mode: CaptureMode, _sink: &Arc<dyn InputSink>) -> PlatformResult<()> {
+        Ok(())
+    }
+    fn stop(&self) -> PlatformResult<()> {
+        Ok(())
+    }
+    fn can_suppress(&self) -> bool {
+        false
+    }
+    fn current_mode(&self) -> CaptureMode {
+        CaptureMode::Off
     }
 }
 
@@ -215,7 +239,12 @@ impl MobileClient {
         // context; enter it for the duration of the start.
         let runtime = {
             let _guard = self.rt.enter();
-            RuntimeHandle::start(core, Arc::clone(&connection), Arc::new(NoopInjector))
+            RuntimeHandle::start(
+                core,
+                Arc::clone(&connection),
+                Arc::new(NoopInjector),
+                Arc::new(NoopCapture),
+            )
         };
 
         // Hand ownership to the peer: x >= width-1 (==0) crosses immediately. Then nudge
@@ -405,6 +434,7 @@ mod tests {
                 EngineCore::new_target(target_device, phone_id),
                 conn,
                 Arc::new(RecordingInjector { tx: rec_tx }),
+                Arc::new(NoopCapture),
             );
             // Keep the target engine alive until the test drops the runtime.
             std::future::pending::<()>().await;
