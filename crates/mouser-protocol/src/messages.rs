@@ -4,14 +4,47 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::enums::{AckStatus, ClipFormat};
+use crate::enums::{
+    AckStatus, BlockedReason, CapState, CapabilitySet, ClipFormat, FocusKind, GoodbyeReason, Os,
+    PointerMode, Role, ScrollUnit, TransferReason,
+};
 
+/// `[01] Hello` envelope type (§7.1).
+pub const TYPE_HELLO: u16 = 0x01;
 /// `[02] HelloAck` envelope type.
 pub const TYPE_HELLO_ACK: u16 = 0x02;
+/// `[03] PairingResult` envelope type (§7.1, §5).
+pub const TYPE_PAIRING_RESULT: u16 = 0x03;
 /// `[04] BulkHello` envelope type (§7.1, §5 step 5).
 pub const TYPE_BULK_HELLO: u16 = 0x04;
 /// `[05] Ping` envelope type.
 pub const TYPE_PING: u16 = 0x05;
+/// `[06] Pong` envelope type (§7.1).
+pub const TYPE_PONG: u16 = 0x06;
+/// `[07] Heartbeat` envelope type (§7.1).
+pub const TYPE_HEARTBEAT: u16 = 0x07;
+/// `[08] Goodbye` envelope type (§7.1).
+pub const TYPE_GOODBYE: u16 = 0x08;
+
+/// `[30] OwnershipTransfer` envelope type (§7.4).
+pub const TYPE_OWNERSHIP_TRANSFER: u16 = 0x30;
+/// `[31] OwnershipAck` envelope type (§7.4).
+pub const TYPE_OWNERSHIP_ACK: u16 = 0x31;
+/// `[32] FocusState` envelope type (§7.4).
+pub const TYPE_FOCUS_STATE: u16 = 0x32;
+/// `[33] CapabilityState` envelope type (§7.4).
+pub const TYPE_CAPABILITY_STATE: u16 = 0x33;
+/// `[34] OwnershipRequest` envelope type (§7.4).
+pub const TYPE_OWNERSHIP_REQUEST: u16 = 0x34;
+/// `[35] PointerModeReq` envelope type (§7.4/§7.6).
+pub const TYPE_POINTER_MODE_REQ: u16 = 0x35;
+
+/// `[40] KeyEvent` envelope type (§7.5).
+pub const TYPE_KEY_EVENT: u16 = 0x40;
+/// `[41] PointerButton` envelope type (§7.5).
+pub const TYPE_POINTER_BUTTON: u16 = 0x41;
+/// `[42] Scroll` envelope type (§7.5).
+pub const TYPE_SCROLL: u16 = 0x42;
 
 /// `[50] ClipboardOffer` envelope type (§7.7).
 pub const TYPE_CLIPBOARD_OFFER: u16 = 0x50;
@@ -61,6 +94,166 @@ pub struct HelloAck {
     pub status: AckStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// §7.1 Session & liveness
+// ---------------------------------------------------------------------------
+
+/// `[01] Hello { device_id, name, os, engine_version, capabilities, role, session_id,
+/// channel_sig }` (§7.1) — the first control-stream message: announces identity and
+/// capabilities and proves the session binding with `channel_sig` over the interactive
+/// TLS exporter (§5 step 4). `device_id`/`channel_sig` encode as CBOR byte strings (§0.1).
+/// Fields are declared in spec order so the CBOR map keys are byte-canonical.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    #[serde(with = "serde_bytes")]
+    pub device_id: Vec<u8>,
+    pub name: String,
+    pub os: Os,
+    pub engine_version: String,
+    pub capabilities: CapabilitySet,
+    pub role: Role,
+    pub session_id: u64,
+    #[serde(with = "serde_bytes")]
+    pub channel_sig: Vec<u8>,
+}
+
+/// `[03] PairingResult { accepted: bool, reason?: str }` (§7.1, §5) — sent after the SAS
+/// comparison: `accepted` reflects the user's approval. `reason` is omitted when `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingResult {
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `[06] Pong { id: u64 }` (§7.1) — echoes [`Ping::id`] for a same-clock RTT sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pong {
+    pub id: u64,
+}
+
+/// `[07] Heartbeat { seq: u64 }` (§7.1) — sent every ~1s; a peer is `Disconnected`
+/// after 3 consecutive misses (the §7.4 reclaim trigger).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Heartbeat {
+    pub seq: u64,
+}
+
+/// `[08] Goodbye { reason: GoodbyeReason }` (§7.1) — a graceful leave; an owner's
+/// Goodbye triggers a handoff before the connection drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Goodbye {
+    pub reason: GoodbyeReason,
+}
+
+// ---------------------------------------------------------------------------
+// §7.4 Ownership, focus & capability
+// ---------------------------------------------------------------------------
+
+/// `[30] OwnershipTransfer { to, owner_epoch, layout_rev, reason }` (§7.4) — an
+/// owner-minted grant of input ownership to `to` at `owner_epoch`. Accepted iff
+/// `owner_epoch` is strictly greater than the locally-known epoch (§7.4). `to` encodes
+/// as a CBOR byte string (§0.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipTransfer {
+    #[serde(with = "serde_bytes")]
+    pub to: Vec<u8>,
+    pub owner_epoch: u64,
+    pub layout_rev: u64,
+    pub reason: TransferReason,
+}
+
+/// `[31] OwnershipAck { owner_epoch, accepted, reason? }` (§7.4) — the target's
+/// acknowledgement of an [`OwnershipTransfer`]: `accepted` reports willingness to
+/// inject. `reason` is omitted when `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipAck {
+    pub owner_epoch: u64,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `[32] FocusState { owner, owner_epoch, state }` (§7.4) — broadcast when the owner or
+/// focus changes; subject to the same strictly-greater-epoch acceptance rule as
+/// [`OwnershipTransfer`]. `owner` encodes as a CBOR byte string (§0.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusState {
+    #[serde(with = "serde_bytes")]
+    pub owner: Vec<u8>,
+    pub owner_epoch: u64,
+    pub state: FocusKind,
+}
+
+/// `[33] CapabilityState { device_id, capture, inject, reason }` (§7.4) — broadcast when
+/// input capture/injection becomes (un)available (secure desktop, lock screen, missing
+/// permission, unsupported compositor). `device_id` is a CBOR byte string (§0.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityState {
+    #[serde(with = "serde_bytes")]
+    pub device_id: Vec<u8>,
+    pub capture: CapState,
+    pub inject: CapState,
+    pub reason: BlockedReason,
+}
+
+/// `[34] OwnershipRequest { from, reason }` (§7.4) — a non-owner asks the current owner
+/// to hand off (e.g. mobile `UiSelect`). `from` encodes as a CBOR byte string (§0.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipRequest {
+    #[serde(with = "serde_bytes")]
+    pub from: Vec<u8>,
+    pub reason: TransferReason,
+}
+
+/// `[35] PointerModeReq { owner_epoch, mode }` (§7.4/§7.6) — the target asks the owner
+/// to switch absolute/relative motion (relative on a foreground pointer-lock grab).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerModeReq {
+    pub owner_epoch: u64,
+    pub mode: PointerMode,
+}
+
+// ---------------------------------------------------------------------------
+// §7.5 Input — reliable (control stream)
+// ---------------------------------------------------------------------------
+
+/// `[40] KeyEvent { usage, down, mods, owner_epoch, ctr }` (§7.5) — a physical key
+/// transition. `usage` = USB HID Usage Page 0x07 (Appendix B); `mods` is the modifier
+/// bitmask. Anti-replay: a receiver rejects an event whose `owner_epoch` is not current
+/// or whose `(owner_epoch, ctr)` is not strictly increasing (§7.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEvent {
+    pub usage: u16,
+    pub down: bool,
+    pub mods: u16,
+    pub owner_epoch: u64,
+    pub ctr: u64,
+}
+
+/// `[41] PointerButton { button, down, owner_epoch, ctr }` (§7.5) — a mouse-button
+/// transition (`button`: 0=left, 1=right, 2=middle, 3=back, 4=forward). Same anti-replay
+/// rule as [`KeyEvent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerButton {
+    pub button: u8,
+    pub down: bool,
+    pub owner_epoch: u64,
+    pub ctr: u64,
+}
+
+/// `[42] Scroll { dx, dy, unit, owner_epoch, ctr }` (§7.5) — a scroll delta in `unit`
+/// (`Detent120` or `LogicalPixel`); the receiver converts to its native unit. Same
+/// anti-replay rule as [`KeyEvent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scroll {
+    pub dx: i32,
+    pub dy: i32,
+    pub unit: ScrollUnit,
+    pub owner_epoch: u64,
+    pub ctr: u64,
 }
 
 /// One advertised file inside a [`FileOffer`] (§7.8): a sanitized-on-receipt `name`
