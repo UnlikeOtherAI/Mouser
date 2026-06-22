@@ -180,6 +180,20 @@ pub struct SettingsDto {
     /// Return input ownership to the local device on sleep/lock.
     #[serde(default = "yes")]
     pub release_on_lock: bool,
+
+    // --- General (application preferences) ---
+    /// Keep the menu-bar/system-tray icon visible.
+    #[serde(default = "yes")]
+    pub show_tray_icon: bool,
+    /// Start Mouser automatically when the user signs in (OS autostart).
+    #[serde(default)]
+    pub launch_at_login: bool,
+    /// UI theme choice: `"system" | "light" | "dark"`.
+    #[serde(default = "theme_default")]
+    pub theme: String,
+    /// Download and install new versions automatically.
+    #[serde(default = "yes")]
+    pub auto_update: bool,
 }
 
 fn yes() -> bool {
@@ -190,6 +204,9 @@ fn edge_default() -> String {
 }
 fn direction_default() -> String {
     "bidirectional".to_string()
+}
+fn theme_default() -> String {
+    "system".to_string()
 }
 
 impl Default for SettingsDto {
@@ -209,6 +226,10 @@ impl Default for SettingsDto {
             require_approval: true,
             encrypted_only: true,
             release_on_lock: true,
+            show_tray_icon: true,
+            launch_at_login: false,
+            theme: theme_default(),
+            auto_update: true,
         }
     }
 }

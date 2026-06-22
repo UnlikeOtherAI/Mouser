@@ -99,6 +99,11 @@ export interface EngineSettings {
   require_approval: boolean;
   encrypted_only: boolean;
   release_on_lock: boolean;
+  // General (application preferences)
+  show_tray_icon: boolean;
+  launch_at_login: boolean;
+  theme: "system" | "light" | "dark";
+  auto_update: boolean;
 }
 
 /** Defaults matching `SettingsDto::default()` (used as the browser-dev fallback). */
@@ -117,6 +122,10 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   require_approval: true,
   encrypted_only: true,
   release_on_lock: true,
+  show_tray_icon: true,
+  launch_at_login: false,
+  theme: "system",
+  auto_update: true,
 };
 
 export type SectionId =

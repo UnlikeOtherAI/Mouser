@@ -1,18 +1,13 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { ClipboardProgress } from "./components/clipboard-progress";
 import { SideNav } from "./components/side-nav";
 import { DIAGNOSTICS_NAV_ITEM, NAV_ITEMS } from "./lib/mock-data";
 import {
-  readTrayIconPreference,
-  syncTrayIconPreference,
-  writeTrayIconPreference,
-} from "./lib/tray-preference";
-import {
   readDiagnosticsPreference,
   writeDiagnosticsPreference,
 } from "./lib/diagnostics-preference";
-import type { ThemeChoice } from "./lib/theme-preference";
-import { useTheme } from "./lib/use-theme";
+import { useApplySettings } from "./lib/use-apply-settings";
+import { useWorkspace } from "./lib/use-workspace";
 import type { ClipboardTransfer, SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";
@@ -36,10 +31,6 @@ const SECTION_TITLES: Record<SectionId, string> = {
 };
 
 interface GeneralSettingsProps {
-  showTrayIcon: boolean;
-  onShowTrayIconChange: (next: boolean) => void;
-  theme: ThemeChoice;
-  onThemeChange: (next: ThemeChoice) => void;
   showDiagnostics: boolean;
   onShowDiagnosticsChange: (next: boolean) => void;
 }
@@ -52,10 +43,6 @@ function renderSection(
     case "general":
       return (
         <GeneralSection
-          showTrayIcon={general.showTrayIcon}
-          onShowTrayIconChange={general.onShowTrayIconChange}
-          theme={general.theme}
-          onThemeChange={general.onThemeChange}
           showDiagnostics={general.showDiagnostics}
           onShowDiagnosticsChange={general.onShowDiagnosticsChange}
         />
@@ -78,24 +65,20 @@ function renderSection(
 /** Top-level settings/layout shell: left nav + active section panel. */
 export function App(): React.JSX.Element {
   const [active, setActive] = useState<SectionId>("layout");
-  const [showTrayIcon, setShowTrayIcon] = useState(readTrayIconPreference);
   const [showDiagnostics, setShowDiagnostics] = useState(
     readDiagnosticsPreference,
   );
-  const { theme, setTheme } = useTheme();
 
-  useEffect(() => {
-    void syncTrayIconPreference(showTrayIcon);
-  }, [showTrayIcon]);
+  // General prefs (tray icon, launch-at-login, theme, auto-update) are
+  // daemon-owned. Apply the daemon's persisted values to this machine whenever
+  // they change; the apply side never writes settings back, so there is no loop.
+  const { settings } = useWorkspace();
+  useApplySettings(settings);
 
   // Launch-at-login is strictly opt-in: Mouser never enables it automatically. The
   // user turns it on from the "Launch at login" toggle in General settings, which
-  // reflects and drives the real OS autostart state via tauri-plugin-autostart.
-
-  function handleShowTrayIconChange(next: boolean): void {
-    setShowTrayIcon(next);
-    writeTrayIconPreference(next);
-  }
+  // now writes the daemon-owned `launch_at_login` setting; `useApplySettings`
+  // reflects that into the real OS autostart state.
 
   function handleShowDiagnosticsChange(next: boolean): void {
     setShowDiagnostics(next);
@@ -123,10 +106,6 @@ export function App(): React.JSX.Element {
             {SECTION_TITLES[active]}
           </h1>
           {renderSection(active, {
-            showTrayIcon,
-            onShowTrayIconChange: handleShowTrayIconChange,
-            theme,
-            onThemeChange: setTheme,
             showDiagnostics,
             onShowDiagnosticsChange: handleShowDiagnosticsChange,
           })}

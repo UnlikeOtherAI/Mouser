@@ -1,67 +1,23 @@
-import { useEffect, useState } from "react";
 import { SectionCard } from "../components/section-card";
 import { Segmented } from "../components/segmented";
 import { SettingRow } from "../components/setting-row";
 import { Toggle } from "../components/toggle";
+import { useWorkspace } from "../lib/use-workspace";
 import type { ThemeChoice } from "../lib/theme-preference";
 
 interface GeneralSectionProps {
-  showTrayIcon: boolean;
-  onShowTrayIconChange: (next: boolean) => void;
-  theme: ThemeChoice;
-  onThemeChange: (next: ThemeChoice) => void;
   showDiagnostics: boolean;
   onShowDiagnosticsChange: (next: boolean) => void;
 }
 
-/** General application preferences. */
+/** General application preferences — daemon-owned, edited over IPC (the same
+ * state the MCP server reads/writes). "Show diagnostics" stays UI-local: it only
+ * toggles whether this shell renders the Diagnostics tab. */
 export function GeneralSection({
-  showTrayIcon,
-  onShowTrayIconChange,
-  theme,
-  onThemeChange,
   showDiagnostics,
   onShowDiagnosticsChange,
 }: GeneralSectionProps): React.JSX.Element {
-  // "Launch at login" reflects the real OS autostart state (macOS LaunchAgent,
-  // Windows Run key, Linux .desktop) via tauri-plugin-autostart — not local
-  // state. `null` until the initial `isEnabled()` query resolves, which also
-  // disables the toggle so we never flash a wrong value or fire before we know.
-  const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
-  const [autoUpdate, setAutoUpdate] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const { isEnabled } = await import("@tauri-apps/plugin-autostart");
-        const enabled = await isEnabled();
-        if (!cancelled) setLaunchAtLogin(enabled);
-      } catch {
-        // Browser/dev fallback (no Tauri): treat autostart as off.
-        if (!cancelled) setLaunchAtLogin(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  async function handleLaunchAtLoginChange(next: boolean): Promise<void> {
-    // Optimistically reflect the request, then reconcile with the real state
-    // the plugin reports (so a failed enable/disable doesn't lie to the user).
-    setLaunchAtLogin(next);
-    try {
-      const { enable, disable, isEnabled } = await import(
-        "@tauri-apps/plugin-autostart"
-      );
-      if (next) await enable();
-      else await disable();
-      setLaunchAtLogin(await isEnabled());
-    } catch {
-      setLaunchAtLogin(!next);
-    }
-  }
+  const { settings, updateSettings } = useWorkspace();
 
   return (
     <div className="space-y-6">
@@ -73,9 +29,10 @@ export function GeneralSection({
             <Toggle
               label="Launch at login"
               labelHidden
-              checked={launchAtLogin ?? false}
-              disabled={launchAtLogin === null}
-              onChange={(next) => void handleLaunchAtLoginChange(next)}
+              checked={settings.launch_at_login}
+              onChange={(next) =>
+                void updateSettings({ launch_at_login: next })
+              }
             />
           }
         />
@@ -86,8 +43,8 @@ export function GeneralSection({
             <Toggle
               label="Show tray icon"
               labelHidden
-              checked={showTrayIcon}
-              onChange={onShowTrayIconChange}
+              checked={settings.show_tray_icon}
+              onChange={(next) => void updateSettings({ show_tray_icon: next })}
             />
           }
         />
@@ -100,8 +57,8 @@ export function GeneralSection({
           control={
             <Segmented<ThemeChoice>
               label="Theme"
-              value={theme}
-              onChange={onThemeChange}
+              value={settings.theme}
+              onChange={(next) => void updateSettings({ theme: next })}
               options={[
                 { value: "system", label: "System" },
                 { value: "light", label: "Light" },
@@ -120,8 +77,8 @@ export function GeneralSection({
             <Toggle
               label="Automatic updates"
               labelHidden
-              checked={autoUpdate}
-              onChange={setAutoUpdate}
+              checked={settings.auto_update}
+              onChange={(next) => void updateSettings({ auto_update: next })}
             />
           }
         />
