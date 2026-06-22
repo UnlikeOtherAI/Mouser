@@ -11,9 +11,18 @@
 //! Transport: newline-delimited JSON-RPC 2.0 over stdin/stdout (the MCP stdio
 //! transport). No external MCP SDK — the surface is small and tools-only.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use mouser_ipc::{Client, Command, SettingsDto, Snapshot};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -27,13 +36,39 @@ const SETTLE: Duration = Duration::from_millis(1200);
 /// Tail size for the engine log.
 const LOG_TAIL_BYTES: usize = 128 * 1024;
 
-#[tokio::main(flavor = "current_thread")]
+/// Default listen address for the HTTP transport: all interfaces so the same tools
+/// are reachable by LAN IP (and discoverable via mDNS), not just loopback.
+const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8765";
+/// mDNS service type the HTTP transport advertises so other machines can find it
+/// the same way they find the engine itself (`_mouser._udp`).
+const MCP_SERVICE_TYPE: &str = "_mouser-mcp._tcp.local.";
+
+#[tokio::main]
 async fn main() {
+    // Two transports, one tool surface:
+    //   * no args            → stdio MCP (local Claude Code / `.mcp.json`)
+    //   * `--http [ADDR]`    → Streamable-HTTP MCP on ADDR + mDNS advertisement,
+    //                          so the tools are reachable by IP on every platform.
+    let args: Vec<String> = std::env::args().collect();
+    match args.iter().position(|a| a == "--http") {
+        Some(pos) => {
+            let addr = args
+                .get(pos + 1)
+                .filter(|a| !a.starts_with("--"))
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string());
+            run_http(&addr).await;
+        }
+        None => run_stdio().await,
+    }
+}
+
+/// stdio transport: one JSON-RPC message per line (MCP stdio framing).
+async fn run_stdio() {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = tokio::io::stdout();
 
-    // One JSON-RPC message per line (MCP stdio transport).
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -53,6 +88,148 @@ async fn main() {
             }
         }
     }
+}
+
+/// Streamable-HTTP transport: serve the same JSON-RPC tools over HTTP and advertise
+/// the endpoint over mDNS so any machine on the LAN can discover and reach it.
+///
+/// Security: a bearer token guards requests. It comes from `MOUSER_MCP_TOKEN` when
+/// set; otherwise loopback binds run open (local only) and non-loopback binds get a
+/// freshly generated token, printed to stderr for the operator to hand to clients.
+/// The token is deliberately NOT placed in the mDNS advertisement.
+async fn run_http(addr: &str) {
+    let Ok(socket): Result<SocketAddr, _> = addr.parse() else {
+        eprintln!("mouser-mcp: invalid --http address {addr:?} (expected HOST:PORT)");
+        return;
+    };
+
+    let token = resolve_token(&socket);
+    let listener = match tokio::net::TcpListener::bind(socket).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("mouser-mcp: could not bind {socket}: {e}");
+            return;
+        }
+    };
+    let bound = listener.local_addr().unwrap_or(socket);
+
+    // Advertise over mDNS. Keep the daemon + registration alive for the whole
+    // process by holding them until the server returns. `enable_addr_auto` fills the
+    // A records from the host's live interfaces (same approach the engine uses).
+    let _mdns = advertise(bound.port());
+
+    match &token {
+        Some(t) => eprintln!(
+            "mouser-mcp: HTTP transport on http://{bound}/mcp (bearer token: {t}); \
+             advertising {MCP_SERVICE_TYPE}"
+        ),
+        None => eprintln!(
+            "mouser-mcp: HTTP transport on http://{bound}/mcp (loopback, no token); \
+             advertising {MCP_SERVICE_TYPE}"
+        ),
+    }
+
+    let app = Router::new()
+        .route("/", get(health).post(mcp_post))
+        .route("/mcp", get(health).post(mcp_post))
+        .with_state(Arc::new(token));
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("mouser-mcp: HTTP server stopped: {e}");
+    }
+}
+
+/// Register the mDNS advertisement for the HTTP transport, returning the live
+/// `ServiceDaemon` (dropping it sends the goodbye and stops advertising).
+fn advertise(port: u16) -> Option<ServiceDaemon> {
+    let daemon = ServiceDaemon::new().ok()?;
+    let host = host_name();
+    let info = ServiceInfo::new(
+        MCP_SERVICE_TYPE,
+        &format!("mouser-mcp {host}"),
+        &format!("{host}.local."),
+        "", // address: filled automatically by enable_addr_auto
+        port,
+        &[("path", "/mcp"), ("transport", "streamable-http")][..],
+    )
+    .ok()?
+    .enable_addr_auto();
+    daemon.register(info).ok()?;
+    Some(daemon)
+}
+
+/// Health/identity probe for `GET` (clients POST JSON-RPC; a bare GET just confirms
+/// the endpoint is a mouser-mcp server).
+async fn health() -> &'static str {
+    "mouser-mcp"
+}
+
+/// Handle one POSTed JSON-RPC message over HTTP, mirroring the stdio dispatch.
+async fn mcp_post(State(token): State<Arc<Option<String>>>, headers: HeaderMap, body: Bytes) -> Response {
+    if !authorized(&token, &headers) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response();
+    };
+    match handle_message(&request).await {
+        // Streamable-HTTP allows a plain JSON response when there is no stream.
+        Some(response) => Json(response).into_response(),
+        // Notifications take no reply.
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// Whether a request carries the required `Authorization: Bearer <token>`. When no
+/// token is configured (loopback bind, no env override) every request is allowed.
+fn authorized(token: &Option<String>, headers: &HeaderMap) -> bool {
+    let Some(expected) = token else {
+        return true;
+    };
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|got| got == expected)
+}
+
+/// Resolve the bearer token for an HTTP bind: explicit `MOUSER_MCP_TOKEN` wins;
+/// loopback binds stay open; any other interface gets a generated token.
+fn resolve_token(socket: &SocketAddr) -> Option<String> {
+    if let Ok(env) = std::env::var("MOUSER_MCP_TOKEN") {
+        if !env.is_empty() {
+            return Some(env);
+        }
+    }
+    if socket.ip().is_loopback() {
+        return None;
+    }
+    Some(random_token())
+}
+
+/// A 128-bit random token rendered as lowercase hex. Falls back to a fixed marker
+/// only if the OS RNG is unavailable (effectively never), which still requires the
+/// operator to set the header explicitly.
+fn random_token() -> String {
+    let mut buf = [0u8; 16];
+    if getrandom::getrandom(&mut buf).is_err() {
+        return "set-MOUSER_MCP_TOKEN".to_string();
+    }
+    let mut out = String::with_capacity(buf.len() * 2);
+    for byte in buf {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Best-effort host label for the mDNS instance name.
+fn host_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("HOST"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "mouser".to_string())
 }
 
 /// Dispatch one JSON-RPC message, returning the response to write (or `None` for
