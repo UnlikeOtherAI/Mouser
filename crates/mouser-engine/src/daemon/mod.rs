@@ -168,7 +168,14 @@ fn role_from_arg(arg: &str) -> String {
 }
 
 fn default_role() -> &'static str {
-    "auto"
+    #[cfg(target_os = "windows")]
+    {
+        "target"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "auto"
+    }
 }
 
 /// The source-side edge layout, seeded from the local display size when available.

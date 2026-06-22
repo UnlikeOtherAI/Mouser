@@ -47,8 +47,8 @@ But major product features are still not end-to-end:
 At the time this audit was written, this machine was temporarily running
 `mouserd.exe` in explicit `target` mode while the Windows keyboard/touchpad
 sluggishness path was isolated. The Windows capture hot path has since been
-moved off the low-level hook callback, so the intended desktop-launched mode is
-again normal `auto`.
+moved off the low-level hook callback, but the desktop-launched Windows mode is
+still receive-first `target` so capture only starts after an explicit connect.
 
 ## Functionality Matrix
 
@@ -92,7 +92,7 @@ Implemented:
 
 - `mouserd` supports `auto`, `source`, `target`, `connect <host:port>`, and
   `probe <host:port>`.
-- Windows, macOS, and Linux default to `auto`.
+- Windows defaults to receive-first `target`; macOS/Linux default to `auto`.
 - mDNS advertise/browse is wired for non-direct modes.
 - Auto mode uses lower `device_id` to avoid double dialing.
 
@@ -171,8 +171,8 @@ Partial or missing:
 
 - "Any-to-any" is source-capable single-peer, not arbitrary multi-machine
   control.
-- Windows auto/source control has been re-enabled after moving low-level hook
-  work off the callback thread.
+- Windows explicit connect can still dial/control, but automatic startup remains
+  receive-first to avoid surprise capture on Bluetooth keyboard/touchpad setups.
 - Local hardware reclaim is incomplete.
 - Panic hotkey is not implemented.
 - Runtime does not query `can_suppress()` or downgrade if suppression is missing.

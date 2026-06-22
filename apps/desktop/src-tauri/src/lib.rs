@@ -12,9 +12,11 @@
 //! snapshot command reports `engine_running: false` so the UI can degrade gracefully
 //! (show the local device + an "engine not running" hint).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -133,22 +135,51 @@ impl EngineSnapshot {
         }
     }
 
-    /// Convert a live engine [`Snapshot`] into the UI shape.
-    fn from_snapshot(snapshot: Snapshot) -> Self {
+    /// Convert a live engine [`Snapshot`] into the UI shape, merging direct mDNS
+    /// discoveries as a display fallback if the daemon bridge has not surfaced them yet.
+    fn from_snapshot(snapshot: Snapshot, mdns_adverts: Vec<PeerAdvert>) -> Self {
+        let mut seen = HashSet::new();
+        let mut peers: Vec<EnginePeer> = Vec::new();
+
+        for p in snapshot.peers {
+            seen.insert(p.id.clone());
+            peers.push(EnginePeer {
+                id: p.id,
+                name: p.name,
+                os: p.os,
+                host: p.host,
+                port: p.port,
+                trusted: p.trusted,
+            });
+        }
+
+        for advert in mdns_adverts {
+            if !seen.insert(advert.id.clone()) {
+                continue;
+            }
+            let host = advert
+                .addrs
+                .first()
+                .map(|ip| ip.to_string())
+                .unwrap_or_default();
+            peers.push(EnginePeer {
+                name: if advert.name.is_empty() {
+                    host.clone()
+                } else {
+                    advert.name
+                },
+                id: advert.id,
+                os: advert.os,
+                host,
+                port: advert.iport,
+                trusted: false,
+            });
+        }
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
+
         Self {
             engine_running: true,
-            peers: snapshot
-                .peers
-                .into_iter()
-                .map(|p| EnginePeer {
-                    id: p.id,
-                    name: p.name,
-                    os: p.os,
-                    host: p.host,
-                    port: p.port,
-                    trusted: p.trusted,
-                })
-                .collect(),
+            peers,
             connection: EngineConnection {
                 state: snapshot.connection.state.as_str().to_string(),
                 peer_id: snapshot.connection.peer_id,
@@ -164,6 +195,10 @@ const TRAY_ID: &str = "mouser";
 const TRAY_SHOW: &str = "show";
 const TRAY_HIDE: &str = "hide";
 const TRAY_QUIT: &str = "quit";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 struct DesktopPreferences {
     tray_icon_visible: Mutex<bool>,
@@ -225,6 +260,10 @@ fn ensure_engine_running(app: &tauri::AppHandle) {
         }
         let path = resolve_mouserd(&app);
         let mut command = std::process::Command::new(&path);
+        configure_engine_command(&mut command);
+        for arg in mouserd_launch_args() {
+            command.arg(arg);
+        }
         match command.spawn() {
             Ok(child) => {
                 *lock_recover(&app.state::<EngineProcess>().child) = Some(child);
@@ -236,6 +275,25 @@ fn ensure_engine_running(app: &tauri::AppHandle) {
             ),
         }
     });
+}
+
+fn configure_engine_command(command: &mut std::process::Command) {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+}
+
+fn mouserd_launch_args() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["target"]
+    } else {
+        &[]
+    }
 }
 
 /// Peers this app discovered directly over mDNS, keyed by DNS-SD instance fullname.
@@ -324,7 +382,7 @@ async fn engine_snapshot(
 ) -> Result<EngineSnapshot, String> {
     Ok(match fetch_engine_snapshot().await {
         // Engine is up: it owns discovery + trust + the live connection.
-        Ok(snapshot) => EngineSnapshot::from_snapshot(snapshot),
+        Ok(snapshot) => EngineSnapshot::from_snapshot(snapshot, mdns_peers(&peers)),
         // Engine is down: fall back to the peers we discovered over mDNS ourselves, so
         // the Devices list is still populated (read-only until the engine is started).
         Err(_) => EngineSnapshot::from_mdns(mdns_peers(&peers)),
