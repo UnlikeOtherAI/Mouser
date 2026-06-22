@@ -11,22 +11,33 @@ export default {
       },
       colors: {
         // Custom control palette (WCAG 2.2 AA contrast checked for text/bg).
+        // Backed by CSS variables (src/styles/global.css) so the app can switch
+        // between the dark (:root) and light (:root.theme-light) palettes by
+        // toggling a class on <html>; see src/lib/theme-preference.ts.
         ink: {
-          DEFAULT: "#0f121c",
-          soft: "#161a26",
-          card: "#1c2130",
-          line: "#2a3142",
+          DEFAULT: "var(--ink)",
+          soft: "var(--ink-soft)",
+          card: "var(--ink-card)",
+          line: "var(--ink-line)",
         },
         accent: {
-          DEFAULT: "#4f8cff",
-          hover: "#6aa0ff",
-          soft: "#23314f",
+          DEFAULT: "var(--accent)",
+          hover: "var(--accent-hover)",
+          soft: "var(--accent-soft)",
         },
-        muted: "#8a93a6",
-        canvas: "#3a3f4b",
+        muted: "var(--muted)",
+        canvas: "var(--canvas)",
+        // Semantic foreground tokens — theme-aware text colors that replace the
+        // hardcoded near-white classes (text-slate-100/200, text-white).
+        fg: {
+          DEFAULT: "var(--fg)",
+          strong: "var(--fg-strong)",
+        },
+        // Text on an accent fill; constant white across themes.
+        "on-accent": "var(--on-accent)",
       },
       boxShadow: {
-        glow: "0 0 0 2px #4f8cff, 0 0 18px 2px rgba(79,140,255,0.45)",
+        glow: "0 0 0 2px var(--accent), 0 0 18px 2px rgba(79,140,255,0.45)",
       },
     },
   },

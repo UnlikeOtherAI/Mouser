@@ -7,6 +7,8 @@ import {
   syncTrayIconPreference,
   writeTrayIconPreference,
 } from "./lib/tray-preference";
+import type { ThemeChoice } from "./lib/theme-preference";
+import { useTheme } from "./lib/use-theme";
 import type { ClipboardTransfer, SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";
@@ -30,6 +32,8 @@ const SECTION_TITLES: Record<SectionId, string> = {
 interface GeneralSettingsProps {
   showTrayIcon: boolean;
   onShowTrayIconChange: (next: boolean) => void;
+  theme: ThemeChoice;
+  onThemeChange: (next: ThemeChoice) => void;
 }
 
 function renderSection(
@@ -42,6 +46,8 @@ function renderSection(
         <GeneralSection
           showTrayIcon={general.showTrayIcon}
           onShowTrayIconChange={general.onShowTrayIconChange}
+          theme={general.theme}
+          onThemeChange={general.onThemeChange}
         />
       );
     case "devices":
@@ -61,6 +67,7 @@ function renderSection(
 export function App(): React.JSX.Element {
   const [active, setActive] = useState<SectionId>("layout");
   const [showTrayIcon, setShowTrayIcon] = useState(readTrayIconPreference);
+  const { theme, setTheme } = useTheme();
 
   useEffect(() => {
     void syncTrayIconPreference(showTrayIcon);
@@ -72,7 +79,7 @@ export function App(): React.JSX.Element {
   }
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-ink text-slate-100">
+    <div className="flex h-screen w-screen overflow-hidden bg-ink text-fg">
       <SideNav items={NAV_ITEMS} active={active} onSelect={setActive} />
       <main
         id={`panel-${active}`}
@@ -88,6 +95,8 @@ export function App(): React.JSX.Element {
           {renderSection(active, {
             showTrayIcon,
             onShowTrayIconChange: handleShowTrayIconChange,
+            theme,
+            onThemeChange: setTheme,
           })}
         </div>
       </main>

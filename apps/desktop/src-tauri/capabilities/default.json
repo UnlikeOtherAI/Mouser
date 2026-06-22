@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capabilities for the main Mouser window. UI-only shell; no engine access yet.",
   "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": ["core:default", "opener:default", "autostart:default"]
 }

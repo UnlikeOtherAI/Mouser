@@ -1,24 +1,63 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { SectionCard } from "../components/section-card";
 import { Segmented } from "../components/segmented";
 import { SettingRow } from "../components/setting-row";
 import { Toggle } from "../components/toggle";
-
-type Appearance = "system" | "light" | "dark";
+import type { ThemeChoice } from "../lib/theme-preference";
 
 interface GeneralSectionProps {
   showTrayIcon: boolean;
   onShowTrayIconChange: (next: boolean) => void;
+  theme: ThemeChoice;
+  onThemeChange: (next: ThemeChoice) => void;
 }
 
 /** General application preferences. */
 export function GeneralSection({
   showTrayIcon,
   onShowTrayIconChange,
+  theme,
+  onThemeChange,
 }: GeneralSectionProps): React.JSX.Element {
-  const [launchAtLogin, setLaunchAtLogin] = useState(true);
+  // "Launch at login" reflects the real OS autostart state (macOS LaunchAgent,
+  // Windows Run key, Linux .desktop) via tauri-plugin-autostart — not local
+  // state. `null` until the initial `isEnabled()` query resolves, which also
+  // disables the toggle so we never flash a wrong value or fire before we know.
+  const [launchAtLogin, setLaunchAtLogin] = useState<boolean | null>(null);
   const [autoUpdate, setAutoUpdate] = useState(true);
-  const [appearance, setAppearance] = useState<Appearance>("system");
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+        const enabled = await isEnabled();
+        if (!cancelled) setLaunchAtLogin(enabled);
+      } catch {
+        // Browser/dev fallback (no Tauri): treat autostart as off.
+        if (!cancelled) setLaunchAtLogin(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleLaunchAtLoginChange(next: boolean): Promise<void> {
+    // Optimistically reflect the request, then reconcile with the real state
+    // the plugin reports (so a failed enable/disable doesn't lie to the user).
+    setLaunchAtLogin(next);
+    try {
+      const { enable, disable, isEnabled } = await import(
+        "@tauri-apps/plugin-autostart"
+      );
+      if (next) await enable();
+      else await disable();
+      setLaunchAtLogin(await isEnabled());
+    } catch {
+      setLaunchAtLogin(!next);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -30,8 +69,9 @@ export function GeneralSection({
             <Toggle
               label="Launch at login"
               labelHidden
-              checked={launchAtLogin}
-              onChange={setLaunchAtLogin}
+              checked={launchAtLogin ?? false}
+              disabled={launchAtLogin === null}
+              onChange={(next) => void handleLaunchAtLoginChange(next)}
             />
           }
         />
@@ -54,10 +94,10 @@ export function GeneralSection({
           title="Theme"
           description="Match the system theme or pick one."
           control={
-            <Segmented<Appearance>
+            <Segmented<ThemeChoice>
               label="Theme"
-              value={appearance}
-              onChange={setAppearance}
+              value={theme}
+              onChange={onThemeChange}
               options={[
                 { value: "system", label: "System" },
                 { value: "light", label: "Light" },

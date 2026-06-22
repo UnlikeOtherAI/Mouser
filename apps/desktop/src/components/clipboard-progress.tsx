@@ -52,7 +52,7 @@ function TransferToast({
         <span aria-hidden="true" className="text-base">
           {FORMAT_GLYPH[transfer.format]}
         </span>
-        <p className="min-w-0 flex-1 truncate text-sm font-medium text-slate-100">
+        <p className="min-w-0 flex-1 truncate text-sm font-medium text-fg">
           {transferLabel(transfer)}
         </p>
         {!done && !failed ? (

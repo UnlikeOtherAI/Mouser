@@ -44,7 +44,7 @@ export function LayoutCanvas({
         <button
           type="button"
           onClick={reset}
-          className="rounded-lg border border-ink-line px-3 py-1.5 text-sm font-medium text-muted transition-colors hover:text-slate-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+          className="rounded-lg border border-ink-line px-3 py-1.5 text-sm font-medium text-muted transition-colors hover:text-fg-strong focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
         >
           Reset layout
         </button>
