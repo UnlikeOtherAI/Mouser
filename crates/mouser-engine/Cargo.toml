@@ -20,6 +20,7 @@ mouser-files = { path = "../mouser-files" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 data-encoding = "2"
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tokio-util = "0.7"
 thiserror = "2"

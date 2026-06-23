@@ -9,6 +9,7 @@
 
 mod clipboard;
 mod direct;
+mod file_transfer;
 mod ipc_bridge;
 mod pairing;
 mod reconnect;
@@ -21,6 +22,8 @@ use mouser_core::platform::{Clipboard, InputCapture, InputInjection};
 
 use crate::daemon_store::{format_device_id, parse_peer_id_arg, DaemonStore};
 use crate::EdgeLayout;
+
+pub use file_transfer::send_paths_to_peer;
 
 /// Run the daemon with the host's `injector` and `capture` adapters.
 ///

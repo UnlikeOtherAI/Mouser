@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use mouser_core::platform::{Clipboard, InputCapture, InputInjection};
 use mouser_core::DeviceId;
@@ -18,6 +17,7 @@ use crate::discovery::PeerRegistry;
 use crate::{discovery, EngineCore, RuntimeHandle};
 
 use super::clipboard::{self as clipboard_driver, SettingsProvider};
+use super::file_transfer;
 use super::ipc_bridge::{ConnectRequest, IpcBridge};
 use super::pairing;
 use super::reconnect::{redial_until_reconnected, ReconnectEnd};
@@ -69,7 +69,12 @@ pub(super) async fn serve(
         .local_addr()
         .map_err(|e| e.to_string())?
         .port();
-    let bulk_task = tokio::spawn(run_bulk_accept_skeleton(Arc::clone(&bulk_endpoint)));
+    let (bulk_peer_tx, bulk_peer_rx) = tokio::sync::watch::channel(None);
+    let bulk_task = tokio::spawn(file_transfer::run_bulk_acceptor(
+        Arc::clone(&bulk_endpoint),
+        bulk_peer_rx,
+        file_transfer::quarantine_dir(store),
+    ));
 
     // One shared mDNS endpoint advertises this host (§4) and feeds a single browse into
     // one peer registry that both the dialer and the IPC snapshot read. A host must use
@@ -145,6 +150,7 @@ pub(super) async fn serve(
                 "receive-only target mode"
             }
         );
+        bulk_peer_tx.send_replace(Some(peer));
 
         let end = run_session(
             my_id,
@@ -163,6 +169,7 @@ pub(super) async fn serve(
             },
         )
         .await;
+        bulk_peer_tx.send_replace(None);
         if let Some(bridge) = bridge.as_ref() {
             bridge.set_idle();
         }
@@ -203,21 +210,6 @@ pub(super) async fn serve(
     bulk_task.abort();
     let _ = capture.stop();
     Ok(())
-}
-
-async fn run_bulk_accept_skeleton(endpoint: Arc<mouser_net::BulkEndpoint>) {
-    loop {
-        match endpoint.accept_bulk(0).await {
-            Ok(conn) => {
-                eprintln!("mouserd: bulk connection accepted; file receiver is not wired yet");
-                conn.close();
-            }
-            Err(e) => {
-                eprintln!("mouserd: bulk accept skipped: {e}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
 }
 
 /// Wait for the connection to form: an IPC `Connect{peer_id}` to a trusted,
