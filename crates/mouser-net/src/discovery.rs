@@ -3,9 +3,10 @@
 //! never from TXT. The typed TXT keys (§4) are: `txtvers`, `id`, `name`, `os`, `ver`,
 //! `iport`, `bport`, `caps`, `role`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
@@ -295,6 +296,8 @@ impl Discovery {
             .map_err(|e| NetError::Discovery(e.to_string()))?;
         Ok(Browser {
             daemon: None,
+            resolver: self.daemon.clone(),
+            nudged: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -317,11 +320,24 @@ impl Drop for Discovery {
     }
 }
 
+/// How long the daemon keeps re-querying a hostname after a [`Browser`] nudge (§4). One
+/// `resolve_hostname` window long enough to catch the missing-family A/AAAA reply, then
+/// the daemon drops the resolver.
+const RERESOLVE_WINDOW: Duration = Duration::from_secs(3);
+
 /// A browse session yielding resolved peers as they appear on the network (§4).
 pub struct Browser {
     /// `Some` when this browser owns its daemon (standalone) and shuts it down on drop;
     /// `None` when the daemon is owned by a shared [`Discovery`].
     daemon: Option<ServiceDaemon>,
+    /// A handle to the same daemon (cheap clone) used to force-resolve a peer's *other*
+    /// address family — mdns-sd stops querying A once AAAA is cached (and vice-versa), so a
+    /// peer can resolve IPv6-only on macOS even though it has a routable IPv4. See
+    /// [`Browser::nudge_other_family`].
+    resolver: ServiceDaemon,
+    /// Hostnames already nudged this session, so a flapping single-family peer doesn't
+    /// trigger a `resolve_hostname` storm. One nudge is enough to pull in the other family.
+    nudged: Mutex<HashSet<String>>,
     events: Receiver<ServiceEvent>,
 }
 
@@ -342,8 +358,11 @@ impl Browser {
         let events = daemon
             .browse(SERVICE_TYPE)
             .map_err(|e| NetError::Discovery(e.to_string()))?;
+        let resolver = daemon.clone();
         Ok(Self {
             daemon: Some(daemon),
+            resolver,
+            nudged: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -358,6 +377,14 @@ impl Browser {
             match self.events.recv_async().await.ok()? {
                 ServiceEvent::ServiceResolved(info) => {
                     if let Some(peer) = PeerAdvert::from_service_info(&info) {
+                        // If the peer resolved on only one address family, ask the daemon to
+                        // re-query the other one. mdns-sd stops sending A queries once it has
+                        // an AAAA (and vice-versa), so a dual-stack peer can surface as
+                        // IPv6-only on macOS; the follow-up resolution arrives as another
+                        // `ServiceResolved` and the registry unions it in.
+                        if is_single_family(&peer.addrs) {
+                            self.nudge_other_family(info.get_hostname());
+                        }
                         return Some(PeerEvent::Found(peer));
                     }
                 }
@@ -368,6 +395,44 @@ impl Browser {
             }
         }
     }
+
+    /// Force the daemon to re-query `hostname` for both A and AAAA, once per host per
+    /// session. mdns-sd's `resolve_hostname` keeps both queries going for the timeout
+    /// window (unlike the browse, which stops at the first family it caches), so the
+    /// missing record arrives and re-fires `ServiceResolved`. Best-effort and detached:
+    /// we don't consume the result channel (the cache update is what matters), we just keep
+    /// it alive for the window so the daemon doesn't tear the resolver down early.
+    fn nudge_other_family(&self, hostname: &str) {
+        if hostname.is_empty() {
+            return;
+        }
+        {
+            let mut nudged = self.nudged.lock().unwrap_or_else(PoisonError::into_inner);
+            if !nudged.insert(hostname.to_string()) {
+                return;
+            }
+        }
+        let resolver = self.resolver.clone();
+        let host = hostname.to_string();
+        tokio::spawn(async move {
+            let Ok(rx) = resolver.resolve_hostname(&host, Some(RERESOLVE_WINDOW.as_millis() as u64))
+            else {
+                return;
+            };
+            // Drain until the daemon closes the channel at the end of the window, keeping the
+            // resolver registered so the A/AAAA queries actually go out.
+            while rx.recv_async().await.is_ok() {}
+        });
+    }
+}
+
+/// A peer whose resolved addresses are all the same IP family — its other family (if any)
+/// was never queried by the browse and may still be reachable. See
+/// [`Browser::nudge_other_family`].
+fn is_single_family(addrs: &[IpAddr]) -> bool {
+    let has_v4 = addrs.iter().any(IpAddr::is_ipv4);
+    let has_v6 = addrs.iter().any(IpAddr::is_ipv6);
+    has_v4 != has_v6
 }
 
 impl Drop for Browser {

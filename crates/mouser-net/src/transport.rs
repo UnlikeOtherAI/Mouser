@@ -92,6 +92,39 @@ pub fn dual_stack_addr() -> SocketAddr {
     SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0))
 }
 
+/// Bind a **server** [`Endpoint`] that genuinely accepts both IPv4 and IPv6 dialers when
+/// given a wildcard IPv6 address. `quinn::Endpoint::server` binds a plain `UdpSocket` and
+/// never clears `IPV6_V6ONLY`, so on Windows (which defaults `V6ONLY=on`) a `[::]` server
+/// is IPv6-only and silently drops IPv4 peers. We mirror `quinn::Endpoint::client`'s own
+/// socket setup — socket2 + `set_only_v6(false)` — but with our server config, so the
+/// listener is dual-stack on every platform. (The earlier breakage that the old comment
+/// warned about came from a botched manual socket; this matches quinn's known-good path.)
+pub(crate) fn bind_dual_stack_server(
+    server_config: ServerConfig,
+    addr: SocketAddr,
+) -> Result<Endpoint, NetError> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| NetError::Io(e.to_string()))?;
+    if addr.is_ipv6() {
+        // Best-effort: accept v4-mapped peers on the wildcard v6 socket. Failure is fine —
+        // the platform is already dual-stack (macOS/Linux default off) or refuses to change.
+        let _ = socket.set_only_v6(false);
+    }
+    socket
+        .bind(&addr.into())
+        .map_err(|e| NetError::Io(e.to_string()))?;
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| NetError::Io("no async runtime found".into()))?;
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket.into(),
+        runtime,
+    )
+    .map_err(|e| NetError::Io(e.to_string()))
+}
+
 /// Build the shared [`TransportConfig`] applied to both endpoints (H1, A4).
 fn transport_config() -> Result<Arc<TransportConfig>, NetError> {
     let mut cfg = TransportConfig::default();
@@ -122,14 +155,10 @@ impl InteractiveEndpoint {
     ) -> Result<Self, NetError> {
         let cert = build_tls_certificate(identity)?;
         let server_config = build_server_config(&cert, peer_policy)?;
-        // Bind via quinn so a `[::]` address listens **dual-stack** (one socket serving
-        // both IPv4 v4-mapped and IPv6 dialers) — a LAN peer may resolve us to either
-        // family, and an iPhone in particular dials us over IPv6. macOS/Linux default
-        // IPV6_V6ONLY to off, so this is genuinely dual-stack there. (NB: hand-rolling
-        // the socket with socket2 + `Endpoint::new` was tried and broke the QUIC
-        // handshake, so we use quinn's own socket setup.)
-        let endpoint =
-            Endpoint::server(server_config, addr).map_err(|e| NetError::Io(e.to_string()))?;
+        // A `[::]` address must listen **dual-stack** (one socket serving both IPv4
+        // v4-mapped and IPv6 dialers) — a LAN peer may resolve us to either family, and an
+        // iPhone in particular dials us over IPv6. See [`bind_dual_stack_server`].
+        let endpoint = bind_dual_stack_server(server_config, addr)?;
         Ok(Self {
             endpoint,
             my_identity: Some(Arc::new(DeviceIdentity::from_seed(&identity.secret_seed()))),

@@ -26,7 +26,7 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
 use crate::identity::{build_tls_certificate, device_id_from_cert, verifying_key_from_cert};
 use crate::pin::PinPolicy;
-use crate::transport::{build_client_config, build_server_config};
+use crate::transport::{bind_dual_stack_server, build_client_config, build_server_config};
 use crate::NetError;
 use mouser_core::DeviceIdentity;
 
@@ -51,8 +51,8 @@ impl BulkEndpoint {
     ) -> Result<Self, NetError> {
         let cert = build_tls_certificate(identity)?;
         let server_config = build_server_config(&cert, peer_policy)?;
-        let endpoint =
-            Endpoint::server(server_config, addr).map_err(|e| NetError::Io(e.to_string()))?;
+        // Dual-stack like the interactive plane (Windows `[::]` is v6-only otherwise).
+        let endpoint = bind_dual_stack_server(server_config, addr)?;
         Ok(Self { endpoint })
     }
 
