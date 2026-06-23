@@ -42,6 +42,11 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// engine's heartbeat window, so a transient stall doesn't tear down the connection.
 const MAX_IDLE: Duration = Duration::from_secs(20);
 
+/// Per-address dial timeout for [`InteractiveEndpoint::connect_interactive_any`]. A
+/// wrong-family or dead candidate is abandoned this fast and the next address tried,
+/// instead of a single bad address hanging the whole dial on [`MAX_IDLE`] (20s).
+const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// Bound the quinn datagram send buffer (A4): the app-level keep-newest sender
 /// ([`crate::motion`]) already coalesces, so only a couple of frames need to queue.
 /// 4 KiB is a handful of motion datagrams.
@@ -166,6 +171,34 @@ impl InteractiveEndpoint {
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
         InteractiveConnection::establish(connection, ConnectionEnd::Initiator, identity).await
+    }
+
+    /// Dial a peer across several candidate addresses, returning the first connection to
+    /// complete the §6.1 handshake. Callers pass addresses most-reachable-first (routable
+    /// IPv4 before IPv6); each is tried under [`DIAL_ATTEMPT_TIMEOUT`], so a peer that
+    /// resolved to a family it isn't actually listening on no longer hangs the dial on the
+    /// 20s idle timeout — it's abandoned in seconds and the next address is tried. Returns
+    /// the last attempt's error if every candidate fails.
+    pub async fn connect_interactive_any(
+        &self,
+        identity: &DeviceIdentity,
+        addrs: &[SocketAddr],
+        peer_policy: PinPolicy,
+    ) -> Result<InteractiveConnection, NetError> {
+        let mut last_err = NetError::Connect("no dialable address for peer".to_string());
+        for &addr in addrs {
+            match tokio::time::timeout(
+                DIAL_ATTEMPT_TIMEOUT,
+                self.connect_interactive(identity, addr, peer_policy.clone()),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last_err = e,
+                Err(_) => last_err = NetError::Connect(format!("timed out dialing {addr}")),
+            }
+        }
+        Err(last_err)
     }
 
     /// Accept the next inbound interactive connection (§6.1). The control stream is

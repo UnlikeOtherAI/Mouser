@@ -303,12 +303,10 @@ pub enum ServerMessage {
 pub enum Command {
     /// Request the engine connect to a discovered, trusted peer by base32 id.
     Connect {
-        /// Base32 device id of the peer to connect to.
+        /// Base32 device id of the peer to connect to. The engine resolves the address(es)
+        /// itself from its discovery registry (the §3 cert pin is the only trust anchor),
+        /// so no caller-supplied host/port is needed.
         peer_id: String,
-        /// Optional resolved host/IP supplied by a desktop-side mDNS browser.
-        host: Option<String>,
-        /// Optional interactive UDP port paired with `host`.
-        port: Option<u16>,
     },
     /// Request the engine tear down the current connection.
     Disconnect,
