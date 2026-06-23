@@ -20,13 +20,18 @@
 //! Runtime paths are panic-free: the workspace clippy lints deny
 //! `unwrap_used`/`panic`/`indexing_slicing`, and `unsafe` is forbidden.
 
+mod codec;
 mod error;
 mod model;
 mod state;
+mod sync;
+mod wire;
 
+pub use codec::device_id_hex;
 pub use error::{StateError, StateResult};
 pub use model::{DeviceInfo, InputPrefs, Monitor};
-pub use state::{device_id_hex, SharedState, STATE_FMT};
+pub use state::{SharedState, STATE_FMT};
+pub use wire::{CONTROL_WIRE_CAP, SNAPSHOT_WIRE_CAP};
 
 /// A device's permanent identifier: `SHA-256(SubjectPublicKeyInfo)` of its
 /// Ed25519 identity key (spec §3). 32 bytes; in the CRDT it is keyed as

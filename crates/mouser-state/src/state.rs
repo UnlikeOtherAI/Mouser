@@ -6,10 +6,9 @@
 //! and the trusted list are deliberately **not** here (spec §7.2/§9).
 
 use automerge::transaction::Transactable;
-use automerge::{
-    ActorId, AutoCommit, Change, ChangeHash, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT,
-};
+use automerge::{ActorId, AutoCommit, ObjId, ObjType, ReadDoc, Value, ROOT};
 
+use crate::codec::{decode_lww, device_id_hex, encode_lww, lww_key};
 use crate::error::{StateError, StateResult};
 use crate::model::{DeviceInfo, InputPrefs, Monitor};
 
@@ -25,6 +24,7 @@ const K_INPUT_PREFS: &str = "input_prefs";
 /// concurrent edits resolve deterministically by automerge conflict ordering
 /// plus our own `(rev, editor)` tiebreak (see [`SharedState::layout_rev`]).
 const K_LAYOUT_LWW: &str = "layout_lww";
+const K_LAYOUT_EDITS: &str = "edits";
 
 // Sub-keys.
 const K_NAME: &str = "name";
@@ -50,19 +50,6 @@ const K_HOTKEYS: &str = "hotkeys";
 /// root maps and a merge would discard one side's entries (LWW on the ROOT key).
 const GENESIS_ACTOR: [u8; 16] = *b"mouser-state-fmt";
 
-/// Render a 32-byte `device_id` as lowercase hex — the map-key form used by the
-/// CRDT schema (spec Appendix A: `Map<device_id_hex, …>`).
-#[must_use]
-pub fn device_id_hex(id: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in id {
-        // Two lowercase hex nibbles; `write!` into a String cannot fail.
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
-    }
-    s
-}
-
 /// The replicated shared-cluster-state document.
 ///
 /// Cloning is cheap-ish (it forks the automerge document). All mutators
@@ -70,13 +57,24 @@ pub fn device_id_hex(id: &[u8; 32]) -> String {
 /// merge/apply path resolves the layout LWW register internally.
 #[derive(Debug, Clone)]
 pub struct SharedState {
-    doc: AutoCommit,
+    pub(crate) doc: AutoCommit,
 }
 
 impl Default for SharedState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub(crate) fn genesis_doc() -> AutoCommit {
+    let mut genesis = AutoCommit::new().with_actor(ActorId::from(GENESIS_ACTOR));
+    let _ = genesis.put_object(ROOT, K_DEVICES, ObjType::Map);
+    let _ = genesis.put_object(ROOT, K_LAYOUT, ObjType::Map);
+    let _ = genesis.put_object(ROOT, K_ALIASES, ObjType::Map);
+    let _ = genesis.put_object(ROOT, K_INPUT_PREFS, ObjType::Map);
+    let _ = genesis.put(ROOT, K_LAYOUT_LWW, encode_lww(0, &[0u8; 32]));
+    genesis.commit();
+    genesis
 }
 
 impl SharedState {
@@ -89,15 +87,7 @@ impl SharedState {
     /// merge cleanly with peers built the same way.
     #[must_use]
     pub fn new() -> Self {
-        let mut genesis = AutoCommit::new().with_actor(ActorId::from(GENESIS_ACTOR));
-        // ROOT child objects; failures here are impossible on a fresh doc but we
-        // stay panic-free and silently no-op on the (unreachable) error.
-        let _ = genesis.put_object(ROOT, K_DEVICES, ObjType::Map);
-        let _ = genesis.put_object(ROOT, K_LAYOUT, ObjType::Map);
-        let _ = genesis.put_object(ROOT, K_ALIASES, ObjType::Map);
-        let _ = genesis.put_object(ROOT, K_INPUT_PREFS, ObjType::Map);
-        let _ = genesis.put(ROOT, K_LAYOUT_LWW, encode_lww(0, &[0u8; 32]));
-        genesis.commit();
+        let mut genesis = genesis_doc();
         // Fork → fresh random actor for this replica's subsequent local writes,
         // while keeping the shared genesis change as the common ancestor.
         let doc = genesis.fork();
@@ -164,8 +154,23 @@ impl SharedState {
         let layout = self.map_child(ROOT, K_LAYOUT)?;
         let key = device_id_hex(device);
         let entry = self.ensure_map(&layout, &key)?;
-        // Fresh monitors list (replace wholesale so a layout edit is atomic).
-        let list = self.doc.put_object(&entry, K_MONITORS, ObjType::List)?;
+        let next = self.layout_rev().saturating_add(1);
+        let stamp = lww_key(next, editor);
+        let edits = self.ensure_map(&entry, K_LAYOUT_EDITS)?;
+        let edit = self.ensure_map(&edits, &stamp)?;
+        self.write_monitors(&edit, monitors)?;
+        self.doc.put(&entry, K_LAYOUT_LWW, stamp.as_str())?;
+        self.doc.put(ROOT, K_LAYOUT_LWW, stamp.as_str())?;
+        // Legacy readers still expect `layout[device].monitors`; resolved reads
+        // below use the stamped edit so automerge's prop winner cannot disagree
+        // with our LWW winner.
+        self.write_monitors(&entry, monitors)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    fn write_monitors(&mut self, entry: &ObjId, monitors: &[Monitor]) -> StateResult<()> {
+        let list = self.doc.put_object(entry, K_MONITORS, ObjType::List)?;
         for (i, m) in monitors.iter().enumerate() {
             let item = self.doc.insert_object(&list, i, ObjType::Map)?;
             self.doc.put(&item, K_DISPLAY_ID, m.display_id as u64)?;
@@ -176,9 +181,6 @@ impl SharedState {
             self.doc.put(&item, K_SCALE_MILLI, m.scale_milli as u64)?;
             self.doc.put(&item, K_ROTATION, m.rotation as u64)?;
         }
-        let next = self.layout_rev().saturating_add(1);
-        self.doc.put(ROOT, K_LAYOUT_LWW, encode_lww(next, editor))?;
-        self.doc.commit();
         Ok(())
     }
 
@@ -188,10 +190,50 @@ impl SharedState {
             return Ok(Vec::new());
         };
         let key = device_id_hex(device);
+        let mut best_entry = None;
+        for entry in self.map_child_conflicts(&layout, &key)? {
+            let candidate = self.resolved_lww_at(&entry);
+            if candidate.0 == 0 {
+                continue;
+            }
+            let replace = match &best_entry {
+                Some((best, _)) => candidate > *best,
+                None => true,
+            };
+            if replace {
+                best_entry = Some((candidate, entry));
+            }
+        }
+        if let Some((winner, entry)) = best_entry {
+            let stamp = lww_key(winner.0, &winner.1);
+            if let Some(monitors) = self.layout_for_stamp(&entry, &stamp)? {
+                return Ok(monitors);
+            }
+            return self.monitors_at(&entry);
+        }
         let Some(entry) = self.opt_map_child(&layout, &key)? else {
             return Ok(Vec::new());
         };
-        let Some(list) = self.opt_list_child(&entry, K_MONITORS)? else {
+        if let Some(stamp) = self.resolved_lww_key_at(&entry) {
+            if let Some(monitors) = self.layout_for_stamp(&entry, &stamp)? {
+                return Ok(monitors);
+            }
+        }
+        self.monitors_at(&entry)
+    }
+
+    fn layout_for_stamp(&self, entry: &ObjId, stamp: &str) -> StateResult<Option<Vec<Monitor>>> {
+        let Some(edits) = self.opt_map_child(entry, K_LAYOUT_EDITS)? else {
+            return Ok(None);
+        };
+        let Some(edit) = self.opt_map_child(&edits, stamp)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.monitors_at(&edit)?))
+    }
+
+    fn monitors_at(&self, entry: &ObjId) -> StateResult<Vec<Monitor>> {
+        let Some(list) = self.opt_list_child(entry, K_MONITORS)? else {
             return Ok(Vec::new());
         };
         let len = self.doc.length(&list);
@@ -217,24 +259,26 @@ impl SharedState {
     /// across any concurrent writers (spec §7.4). Deterministic on all replicas.
     #[must_use]
     pub fn layout_rev(&self) -> u64 {
-        self.resolved_lww().0
+        self.resolved_lww_at(ROOT).0
     }
 
     /// The editor `device_id` (hex) that authored the winning `layout_rev`.
     #[must_use]
     pub fn layout_editor_hex(&self) -> String {
-        device_id_hex(&self.resolved_lww().1)
+        device_id_hex(&self.resolved_lww_at(ROOT).1)
     }
 
     /// Resolve the LWW register: gather all concurrent `layout_lww` values and
     /// pick the maximum by `(rev, editor_device_id)`. Because every replica runs
     /// this over the same merged op-set, the result is identical everywhere.
-    fn resolved_lww(&self) -> (u64, [u8; 32]) {
+    fn resolved_lww_at<O: AsRef<ObjId>>(&self, parent: O) -> (u64, [u8; 32]) {
         let mut best = (0u64, [0u8; 32]);
-        if let Ok(values) = self.doc.get_all(ROOT, K_LAYOUT_LWW) {
+        let cap = self.causal_layout_rev_cap();
+        if let Ok(values) = self.doc.get_all(parent, K_LAYOUT_LWW) {
             for (value, _) in values {
                 if let Some(s) = value.to_str() {
                     if let Some(cand) = decode_lww(s) {
+                        let cand = (cand.0.min(cap), cand.1);
                         if cand > best {
                             best = cand;
                         }
@@ -243,6 +287,19 @@ impl SharedState {
             }
         }
         best
+    }
+
+    fn resolved_lww_key_at<O: AsRef<ObjId>>(&self, parent: O) -> Option<String> {
+        let resolved = self.resolved_lww_at(parent);
+        if resolved.0 == 0 {
+            None
+        } else {
+            Some(lww_key(resolved.0, &resolved.1))
+        }
+    }
+
+    fn causal_layout_rev_cap(&self) -> u64 {
+        u64::try_from(self.history_change_count()).unwrap_or(u64::MAX)
     }
 
     // ----- aliases --------------------------------------------------------
@@ -303,70 +360,6 @@ impl SharedState {
         Ok(prefs)
     }
 
-    // ----- sync / persistence (spec §7.2 wire ops) ------------------------
-
-    /// Full save for `StateSnapshot.full_state` (spec §7.2 `[13]`).
-    pub fn snapshot(&self) -> Vec<u8> {
-        // `save` needs `&mut`; clone first to keep `snapshot` ergonomically `&self`.
-        let mut doc = self.doc.clone();
-        doc.save()
-    }
-
-    /// Load a full document from a `StateSnapshot.full_state` payload.
-    pub fn load(bytes: &[u8]) -> StateResult<Self> {
-        let doc = AutoCommit::load(bytes).map_err(StateError::Automerge)?;
-        Ok(SharedState { doc })
-    }
-
-    /// Current document heads (spec `StateRequest.have_heads` / `StateDelta.dep_heads`).
-    #[must_use]
-    pub fn heads(&self) -> Vec<ChangeHash> {
-        let mut doc = self.doc.clone();
-        doc.get_heads()
-    }
-
-    /// All changes this document holds that are **not** transitive dependencies
-    /// of `have_heads` — the reply payload for a `StateRequest` (`StateChanges.changes`).
-    /// Each entry is one encoded automerge change (`StateDelta.change` bytes).
-    #[must_use]
-    pub fn changes_since(&self, have_heads: &[ChangeHash]) -> Vec<Vec<u8>> {
-        let mut doc = self.doc.clone();
-        doc.get_changes(have_heads)
-            .into_iter()
-            .map(|c| c.raw_bytes().to_vec())
-            .collect()
-    }
-
-    /// Apply encoded changes received via `StateDelta`/`StateChanges`.
-    ///
-    /// Automerge buffers any change whose dependencies are not yet present and
-    /// applies it automatically once they arrive (it is dependency-order
-    /// tolerant), so callers may feed deltas in any order. Decode errors on a
-    /// single change abort the batch without mutating the document.
-    pub fn apply_changes(&mut self, changes: &[Vec<u8>]) -> StateResult<()> {
-        let mut decoded = Vec::with_capacity(changes.len());
-        for bytes in changes {
-            let change =
-                Change::from_bytes(bytes.clone()).map_err(|e| StateError::Decode(e.to_string()))?;
-            decoded.push(change);
-        }
-        self.doc.apply_changes(decoded)?;
-        Ok(())
-    }
-
-    /// Merge another document into this one (used for snapshot reconciliation).
-    pub fn merge(&mut self, other: &SharedState) -> StateResult<()> {
-        let mut other = other.doc.clone();
-        self.doc.merge(&mut other)?;
-        Ok(())
-    }
-
-    /// Change hashes still missing for the given heads (callers may request them).
-    #[must_use]
-    pub fn missing_deps(&self, heads: &[ChangeHash]) -> Vec<ChangeHash> {
-        self.doc.get_missing_deps(heads)
-    }
-
     // ----- internal helpers ----------------------------------------------
 
     fn map_child(&mut self, parent: ObjId, key: &str) -> StateResult<ObjId> {
@@ -391,6 +384,18 @@ impl SharedState {
             Some((Value::Object(_), _)) => Err(StateError::Schema(format!("{key} is not a map"))),
             _ => Ok(None),
         }
+    }
+
+    fn map_child_conflicts(&self, parent: &ObjId, key: &str) -> StateResult<Vec<ObjId>> {
+        let mut out = Vec::new();
+        for (value, id) in self.doc.get_all(parent, key)? {
+            match value {
+                Value::Object(ObjType::Map) => out.push(id),
+                Value::Object(_) => return Err(StateError::Schema(format!("{key} is not a map"))),
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     fn opt_list_child(&self, parent: &ObjId, key: &str) -> StateResult<Option<ObjId>> {
@@ -445,45 +450,6 @@ fn scalar_u64(value: &Value<'_>) -> Option<u64> {
     }
     match value.to_i64() {
         Some(i) if i >= 0 => Some(i as u64),
-        _ => None,
-    }
-}
-
-/// Encode the LWW key `(rev, editor)` as a sortable string: a zero-padded
-/// 20-digit decimal revision, a separator, then the 64-char editor hex. Plain
-/// lexicographic comparison then matches the `(rev, editor)` ordering exactly.
-fn encode_lww(rev: u64, editor: &[u8; 32]) -> ScalarValue {
-    ScalarValue::Str(format!("{rev:020}|{}", device_id_hex(editor)).into())
-}
-
-/// Inverse of [`encode_lww`]; returns `None` on a malformed register value.
-fn decode_lww(s: &str) -> Option<(u64, [u8; 32])> {
-    let (rev_str, editor_hex) = s.split_once('|')?;
-    let rev: u64 = rev_str.parse().ok()?;
-    let editor = hex32(editor_hex)?;
-    Some((rev, editor))
-}
-
-/// Parse exactly 64 lowercase/uppercase hex chars into a 32-byte array.
-fn hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    let bytes = s.as_bytes();
-    for (i, slot) in out.iter_mut().enumerate() {
-        let hi = hex_nibble(*bytes.get(i * 2)?)?;
-        let lo = hex_nibble(*bytes.get(i * 2 + 1)?)?;
-        *slot = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
 }
