@@ -7,14 +7,17 @@
 //! `target`, see [`serve`]). While serving it also runs the [`ipc_bridge`] so the
 //! Tauri desktop UI can reflect and drive the engine.
 
+mod clipboard;
 mod direct;
 mod ipc_bridge;
+mod pairing;
+mod reconnect;
 mod serve;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mouser_core::platform::{InputCapture, InputInjection};
+use mouser_core::platform::{Clipboard, InputCapture, InputInjection};
 
 use crate::daemon_store::{format_device_id, parse_peer_id_arg, DaemonStore};
 use crate::EdgeLayout;
@@ -25,7 +28,11 @@ use crate::EdgeLayout;
 /// lifetime to drive [`mouser_core::platform::CaptureMode`] transitions (the
 /// runtime, not the daemon, decides when forwarding hooks install) while the serve
 /// loop keeps its own handle to stop it on shutdown.
-pub fn run(injector: Arc<dyn InputInjection>, capture: Arc<dyn InputCapture>) {
+pub fn run(
+    injector: Arc<dyn InputInjection>,
+    capture: Arc<dyn InputCapture>,
+    clipboard: Arc<dyn Clipboard>,
+) {
     let args: Vec<String> = std::env::args().collect();
     let arg1 = args
         .get(1)
@@ -80,7 +87,8 @@ pub fn run(injector: Arc<dyn InputInjection>, capture: Arc<dyn InputCapture>) {
             } else if let Some(peer_id_arg) = args.get(3).cloned() {
                 match parse_peer_id_arg(&peer_id_arg) {
                     Ok(peer_id) => {
-                        direct::serve_direct(&store, addr, peer_id, injector, capture).await
+                        direct::serve_direct(&store, addr, peer_id, injector, capture, clipboard)
+                            .await
                     }
                     Err(e) => Err(e.to_string()),
                 }
@@ -101,7 +109,7 @@ pub fn run(injector: Arc<dyn InputInjection>, capture: Arc<dyn InputCapture>) {
 
     let role = role_from_arg(&arg1);
     rt.block_on(async move {
-        if let Err(e) = serve::serve(&store, &role, injector, capture).await {
+        if let Err(e) = serve::serve(&store, &role, injector, capture, clipboard).await {
             eprintln!("mouserd: {e}");
             std::process::exit(1);
         }

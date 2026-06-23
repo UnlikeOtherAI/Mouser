@@ -5,20 +5,35 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use mouser_core::platform::{InputCapture, InputInjection};
+use mouser_core::platform::{Clipboard, InputCapture, InputInjection};
 use mouser_core::DeviceId;
 use mouser_net::{
     DeviceIdentity, Discovery, InteractiveConnection, InteractiveEndpoint, PinPolicy,
 };
-use mouser_protocol::TYPE_DEVICE_NAME;
 
 use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::discovery::PeerRegistry;
 use crate::{discovery, EngineCore, RuntimeHandle};
 
+use super::clipboard::{self as clipboard_driver, SettingsProvider};
 use super::ipc_bridge::{ConnectRequest, IpcBridge};
+use super::pairing;
+use super::reconnect::{redial_until_reconnected, ReconnectEnd};
 use super::{hostname, source_layout, windows_firewall_hint};
+
+struct SessionContext<'a> {
+    store: &'a DaemonStore,
+    registry: &'a PeerRegistry,
+    bridge: Option<&'a IpcBridge>,
+}
+
+struct SessionAdapters {
+    injector: Arc<dyn InputInjection>,
+    capture: Arc<dyn InputCapture>,
+    clipboard: Arc<dyn Clipboard>,
+}
 
 /// A serve role (`auto`/`source`/`target`): advertise + discover over mDNS, run the
 /// [`IpcBridge`] so the desktop UI reflects/drives the engine, then form one peer
@@ -30,6 +45,7 @@ pub(super) async fn serve(
     role: &str,
     injector: Arc<dyn InputInjection>,
     capture: Arc<dyn InputCapture>,
+    clipboard: Arc<dyn Clipboard>,
 ) -> Result<(), String> {
     let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
     let my_id = me.device_id();
@@ -45,6 +61,15 @@ pub(super) async fn serve(
     let endpoint = InteractiveEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
         .map_err(|e| e.to_string())?;
     let iport = endpoint.local_addr().map_err(|e| e.to_string())?.port();
+    let bulk_endpoint = Arc::new(
+        mouser_net::BulkEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
+            .map_err(|e| e.to_string())?,
+    );
+    let bport = bulk_endpoint
+        .local_addr()
+        .map_err(|e| e.to_string())?
+        .port();
+    let bulk_task = tokio::spawn(run_bulk_accept_skeleton(Arc::clone(&bulk_endpoint)));
 
     // One shared mDNS endpoint advertises this host (§4) and feeds a single browse into
     // one peer registry that both the dialer and the IPC snapshot read. A host must use
@@ -56,12 +81,12 @@ pub(super) async fn serve(
     let host_ip = discovery::local_ipv4()
         .map(|ip| ip.to_string())
         .unwrap_or_default();
-    let advert = discovery::local_advert(&me, &hostname(), iport);
+    let advert = discovery::local_advert(&me, &hostname(), iport, bport);
     let mdns = Discovery::new().map_err(|e| e.to_string())?;
     mdns.advertise(&advert, &host_ip)
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "mouserd: advertising {}:{iport} as {}",
+        "mouserd: advertising {}:{iport} bulk:{bport} as {}",
         if host_ip.is_empty() { "auto" } else { &host_ip },
         advert.instance_name()
     );
@@ -84,20 +109,26 @@ pub(super) async fn serve(
             }
         };
 
+    let mut pending = None;
     loop {
-        let Some((conn, can_control)) = next_connection(
-            store,
-            &endpoint,
-            &me,
-            my_id,
-            &my_b32,
-            &registry,
-            role,
-            bridge.as_ref(),
-        )
-        .await
-        else {
-            break;
+        let (conn, can_control) = if let Some(conn) = pending.take() {
+            (conn, true)
+        } else {
+            let Some(found) = next_connection(
+                store,
+                &endpoint,
+                &me,
+                my_id,
+                &my_b32,
+                &registry,
+                role,
+                bridge.as_ref(),
+            )
+            .await
+            else {
+                break;
+            };
+            found
         };
 
         let peer = conn
@@ -120,9 +151,16 @@ pub(super) async fn serve(
             peer,
             can_control,
             conn,
-            Arc::clone(&injector),
-            Arc::clone(&capture),
-            bridge.as_ref(),
+            SessionContext {
+                store,
+                registry: &registry,
+                bridge: bridge.as_ref(),
+            },
+            SessionAdapters {
+                injector: Arc::clone(&injector),
+                capture: Arc::clone(&capture),
+                clipboard: Arc::clone(&clipboard),
+            },
         )
         .await;
         if let Some(bridge) = bridge.as_ref() {
@@ -134,13 +172,52 @@ pub(super) async fn serve(
                 eprintln!("mouserd: session ended; searching for peers");
             }
             SessionEnd::ConnectionLost => {
-                eprintln!("mouserd: connection lost; returning to discovery");
+                if role == "target" || !can_control {
+                    eprintln!("mouserd: connection lost; returning to discovery");
+                    continue;
+                }
+                eprintln!("mouserd: connection lost; redialing {peer:?}");
+                match redial_until_reconnected(
+                    store,
+                    &endpoint,
+                    &me,
+                    &registry,
+                    peer,
+                    bridge.as_ref(),
+                )
+                .await
+                {
+                    ReconnectEnd::Reconnected(conn) => {
+                        pending = Some(conn);
+                    }
+                    ReconnectEnd::Disconnected => {
+                        eprintln!("mouserd: reconnect stopped; searching for peers");
+                    }
+                    ReconnectEnd::Shutdown => break,
+                }
             }
         }
     }
     eprintln!("mouserd: shutting down");
+    bulk_endpoint.close();
+    bulk_task.abort();
     let _ = capture.stop();
     Ok(())
+}
+
+async fn run_bulk_accept_skeleton(endpoint: Arc<mouser_net::BulkEndpoint>) {
+    loop {
+        match endpoint.accept_bulk(0).await {
+            Ok(conn) => {
+                eprintln!("mouserd: bulk connection accepted; file receiver is not wired yet");
+                conn.close();
+            }
+            Err(e) => {
+                eprintln!("mouserd: bulk accept skipped: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 /// Wait for the connection to form: an IPC `Connect{peer_id}` to a trusted,
@@ -180,7 +257,7 @@ async fn next_connection(
                     }
                 }
             }
-            accepted = accept_trusted(endpoint, store, registry, bridge) => {
+            accepted = pairing::accept_trusted(endpoint, store, registry, bridge) => {
                 match accepted {
                     Ok(conn) => return Some((conn, false)),
                     Err(e) => { eprintln!("mouserd: accept error: {e}"); continue; }
@@ -266,16 +343,35 @@ async fn run_session(
     peer: DeviceId,
     can_control: bool,
     conn: InteractiveConnection,
-    injector: Arc<dyn InputInjection>,
-    capture: Arc<dyn InputCapture>,
-    bridge: Option<&IpcBridge>,
+    context: SessionContext<'_>,
+    adapters: SessionAdapters,
 ) -> SessionEnd {
     let core = if can_control {
         EngineCore::new_source(my_id, peer, source_layout())
     } else {
         EngineCore::new_target(my_id, peer)
     };
-    let runtime = RuntimeHandle::start(core, Arc::new(conn), injector, capture);
+    let mut runtime =
+        RuntimeHandle::start(core, Arc::new(conn), adapters.injector, adapters.capture);
+    let peer_os = context
+        .registry
+        .find(&peer)
+        .map(|advert| clipboard_driver::os_from_str(&advert.os))
+        .unwrap_or(mouser_protocol::Os::Unknown);
+    let settings = context
+        .bridge
+        .map(|bridge| SettingsProvider::Bridge(bridge.settings_source()))
+        .unwrap_or_else(|| SettingsProvider::Fixed(context.store.load_settings()));
+    let clipboard_task = runtime.take_control_lane().map(|lane| {
+        tokio::spawn(clipboard_driver::run_driver(
+            lane,
+            adapters.clipboard,
+            my_id,
+            peer,
+            peer_os,
+            settings,
+        ))
+    });
 
     if can_control {
         eprintln!(
@@ -289,13 +385,16 @@ async fn run_session(
     // End the session on ctrl-c or an IPC Disconnect.
     let end = tokio::select! {
         _ = tokio::signal::ctrl_c() => SessionEnd::Shutdown,
-        _ = wait_for_disconnect(bridge) => {
+        _ = wait_for_disconnect(context.bridge) => {
             eprintln!("mouserd: disconnect requested over IPC");
             SessionEnd::Disconnected
         }
         _ = runtime.wait_dead() => SessionEnd::ConnectionLost,
     };
     // Tear down the runtime tasks and the capture adapter (drops any hooks/poll).
+    if let Some(task) = clipboard_task {
+        task.abort();
+    }
     runtime.shutdown();
     end
 }
@@ -380,122 +479,5 @@ async fn dial_discovered(
         if changes.changed().await.is_err() {
             return Err("discovery registry closed".to_string());
         }
-    }
-}
-
-/// Accept inbound connections until one is from a trusted (or just-approved) peer.
-/// A trusted peer is returned immediately. An untrusted peer triggers an interactive
-/// pairing approval over the UI (holding the connection open while the user confirms the
-/// SAS); on approval the peer is trusted and the same connection returned, otherwise it
-/// is closed. With no UI (headless) an untrusted peer is rejected as before.
-async fn accept_trusted(
-    endpoint: &InteractiveEndpoint,
-    store: &DaemonStore,
-    registry: &PeerRegistry,
-    bridge: Option<&IpcBridge>,
-) -> Result<InteractiveConnection, String> {
-    loop {
-        let conn = endpoint
-            .accept_interactive()
-            .await
-            .map_err(|e| e.to_string())?;
-        let Some(peer_id) = conn.peer_device_id() else {
-            eprintln!("mouserd: rejected peer without a valid device_id");
-            conn.close();
-            continue;
-        };
-        if store.is_peer_trusted(&peer_id).map_err(|e| e.to_string())? {
-            return Ok(conn);
-        }
-
-        match bridge {
-            Some(bridge) if pair_via_ui(store, registry, bridge, &conn, &peer_id).await? => {
-                return Ok(conn);
-            }
-            Some(_) => {} // denied or timed out
-            None => {
-                let peer_text = format_device_id(&peer_id);
-                eprintln!(
-                    "mouserd: rejected untrusted peer {peer_text}; run \
-                     `mouserd trust {peer_text}` to allow control (no UI to approve)"
-                );
-            }
-        }
-        conn.close();
-    }
-}
-
-/// How long an inbound pairing request waits for the user's Approve/Deny before closing.
-const PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Clears the pending pairing prompt when dropped, so a request that is decided, times
-/// out, **or** is abandoned (another connection formed first) never leaves a stale modal.
-struct PairingGuard<'a>(&'a IpcBridge);
-
-impl Drop for PairingGuard<'_> {
-    fn drop(&mut self) {
-        self.0.clear_pairing();
-    }
-}
-
-/// Drive an inbound pairing approval through the UI: publish the request naming the
-/// device, wait up to [`PAIRING_TIMEOUT`] for an Approve/Deny matching this peer, and on
-/// approval persist trust. Returns whether the connection was approved.
-async fn pair_via_ui(
-    store: &DaemonStore,
-    registry: &PeerRegistry,
-    bridge: &IpcBridge,
-    conn: &InteractiveConnection,
-    peer_id: &DeviceId,
-) -> Result<bool, String> {
-    let peer_b32 = format_device_id(peer_id);
-    // Name the device for the prompt: the name it announced on connect (phones), else its
-    // advertised name from our discovery registry (desktops), else a generic label.
-    let name = recv_device_name(conn)
-        .await
-        .or_else(|| {
-            registry
-                .find(peer_id)
-                .map(|p| p.name)
-                .filter(|n| !n.is_empty())
-        })
-        .unwrap_or_else(|| "A device".to_string());
-    eprintln!("mouserd: pairing request from {name} ({peer_b32})");
-    bridge.request_pairing(peer_b32.clone(), name);
-    let _guard = PairingGuard(bridge);
-
-    let approved = loop {
-        match tokio::time::timeout(PAIRING_TIMEOUT, bridge.next_pairing_decision()).await {
-            Ok(Some((id, decision))) if id == peer_b32 => break decision,
-            Ok(Some(_)) => continue, // a decision for a different/stale request
-            Ok(None) | Err(_) => break false, // bridge gone, or timed out
-        }
-    };
-    if approved {
-        store.trust_peer(*peer_id).map_err(|e| e.to_string())?;
-        eprintln!("mouserd: paired with {peer_b32}");
-    } else {
-        eprintln!("mouserd: pairing with {peer_b32} not approved");
-    }
-    Ok(approved)
-}
-
-/// Briefly wait for the dialing device's announced display name (a `TYPE_DEVICE_NAME`
-/// control message a controller sends right after connecting). Safe to read here because
-/// the engine runtime — the other reader of control messages — has not started yet on the
-/// accept path. Returns `None` on timeout or if the connection closes first.
-async fn recv_device_name(conn: &InteractiveConnection) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
-        let (ty, payload) = tokio::time::timeout(remaining, conn.recv_control())
-            .await
-            .ok()?
-            .ok()?;
-        if ty == TYPE_DEVICE_NAME {
-            let name = String::from_utf8_lossy(&payload).trim().to_string();
-            return (!name.is_empty()).then_some(name);
-        }
-        // Ignore any other early control message and keep waiting for the name.
     }
 }

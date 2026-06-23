@@ -107,6 +107,13 @@ fn copy_type(t: &NSPasteboardType) -> Retained<NSString> {
 }
 
 impl Clipboard for MacClipboard {
+    fn change_token(&self) -> PlatformResult<u64> {
+        match u64::try_from(self.change_count()) {
+            Ok(token) => Ok(token),
+            Err(_) => Ok(0),
+        }
+    }
+
     fn read(&self, format: ClipFormat) -> PlatformResult<Option<Vec<u8>>> {
         let pb = NSPasteboard::generalPasteboard();
         if matches!(format, ClipFormat::UriList) {

@@ -69,6 +69,18 @@ pub struct IpcBridge {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Cloneable read handle for daemon-owned settings.
+#[derive(Clone)]
+pub(super) struct SettingsSource {
+    shared: Arc<Shared>,
+}
+
+impl SettingsSource {
+    pub(super) fn settings(&self) -> SettingsDto {
+        lock(&self.shared.settings).clone()
+    }
+}
+
 impl IpcBridge {
     /// Start the bridge: bind the IPC server, spawn the republish + command loops.
     pub async fn start(
@@ -141,6 +153,13 @@ impl IpcBridge {
     pub async fn next_disconnect_request(&self) {
         let mut guard = self.disconnect_rx.lock().await;
         let _ = guard.recv().await;
+    }
+
+    /// Cloneable settings source for session tasks.
+    pub(super) fn settings_source(&self) -> SettingsSource {
+        SettingsSource {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Report that the engine connected to `peer_id`; republish the snapshot.

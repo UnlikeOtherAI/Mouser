@@ -30,6 +30,8 @@
 //! the runtime's [`Shared`] state, so the adapter storing the sink never forms a
 //! strong reference cycle with the runtime.
 
+mod control_lane;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -44,17 +46,14 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{Action, CaptureDecision, EngineCore, Inject};
+use control_lane::{is_side_control, ControlLane, ControlMessage, Outgoing};
+
+pub use control_lane::ControlLane as RuntimeControlLane;
 
 /// Engine-private control-stream fallback for absolute pointer motion when QUIC
 /// DATAGRAM is unavailable. Kept out of `mouser-protocol` until the wire registry is
 /// formalized; unknown peers skip it as a forward-compatible control type.
 const TYPE_POINTER_MOTION_FALLBACK: u16 = 0x0043;
-
-/// One queued outbound message for the sender task.
-enum Outgoing {
-    Control(u16, Vec<u8>),
-    Motion(mouser_protocol::PointerMotion),
-}
 
 /// State shared by the runtime's background tasks and the capture sink.
 ///
@@ -160,6 +159,7 @@ pub struct RuntimeHandle {
     cancel: CancellationToken,
     dead: Arc<AtomicBool>,
     dead_notify: Arc<Notify>,
+    control_lane: Option<ControlLane>,
 }
 
 fn apply_inject(
@@ -215,6 +215,7 @@ impl RuntimeHandle {
         tick: Duration,
     ) -> Self {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outgoing>();
+        let (side_tx, side_rx) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
         let (mode_tx, mut mode_rx) = tokio::sync::mpsc::unbounded_channel::<CaptureMode>();
         let cancel = CancellationToken::new();
         let dead = Arc::new(AtomicBool::new(false));
@@ -297,6 +298,9 @@ impl RuntimeHandle {
                                     let actions = lock(&shared.core).on_motion(datagram);
                                     shared.dispatch(actions);
                                 }
+                            }
+                            Ok((ty, payload)) if is_side_control(ty) => {
+                                let _ = side_tx.send(ControlMessage { ty, payload });
                             }
                             Ok((ty, payload)) => {
                                 let actions = lock(&shared.core).on_control(ty, &payload);
@@ -394,13 +398,20 @@ impl RuntimeHandle {
         let initial = lock(&shared.core).initial_actions();
         shared.dispatch(initial);
 
+        let control_lane = ControlLane::new(shared.out_tx.clone(), side_rx);
         Self {
             shared,
             tasks,
             cancel,
             dead,
             dead_notify,
+            control_lane: Some(control_lane),
         }
+    }
+
+    /// Take the daemon side control lane, if it has not already been claimed.
+    pub fn take_control_lane(&mut self) -> Option<RuntimeControlLane> {
+        self.control_lane.take()
     }
 
     /// Feed one captured local event through the core (the `InputSink` seam used by
@@ -456,6 +467,7 @@ impl RuntimeHandle {
             cancel,
             dead: _,
             dead_notify: _,
+            control_lane: _,
         } = self;
         cancel.cancel();
         for task in tasks {

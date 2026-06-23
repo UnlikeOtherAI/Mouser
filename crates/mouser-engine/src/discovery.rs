@@ -25,16 +25,17 @@ const OS_NAME: &str = if cfg!(target_os = "macos") {
     "linux"
 };
 
-/// Build this device's advertisement (§4). `iport` is the bound interactive UDP port.
-pub fn local_advert(identity: &DeviceIdentity, name: &str, iport: u16) -> PeerAdvert {
+/// Build this device's advertisement (§4). `iport` is the bound interactive UDP port;
+/// `bport` is the bound bulk UDP port.
+pub fn local_advert(identity: &DeviceIdentity, name: &str, iport: u16, bport: u16) -> PeerAdvert {
     PeerAdvert {
         id: identity.device_id_base32(),
         name: name.to_string(),
         os: OS_NAME.to_string(),
         ver: env!("CARGO_PKG_VERSION").to_string(),
         iport,
-        bport: 0,
-        caps: "keyboard,mouse".to_string(),
+        bport,
+        caps: "keyboard,mouse,clipboard".to_string(),
         role: "eligible".to_string(),
         addrs: Vec::new(),
     }
@@ -189,7 +190,8 @@ mod tests {
 
     #[test]
     fn peer_socket_addr_pairs_first_address_with_iport() {
-        let mut advert = local_advert(&DeviceIdentity::generate(), "Peer", 51820);
+        let mut advert = local_advert(&DeviceIdentity::generate(), "Peer", 51820, 51821);
+        assert_eq!(advert.bport, 51821);
         assert_eq!(
             peer_socket_addr(&advert),
             None,
@@ -211,7 +213,7 @@ mod tests {
     #[test]
     fn peer_device_id_reads_the_advert_id() {
         let identity = DeviceIdentity::generate();
-        let advert = local_advert(&identity, "Peer", 1);
+        let advert = local_advert(&identity, "Peer", 1, 2);
         assert_eq!(peer_device_id(&advert), Some(identity.device_id()));
     }
 }
