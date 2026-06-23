@@ -17,7 +17,7 @@ use super::source_layout;
 /// exit - a safe transport check that never captures or injects input.
 pub(super) async fn probe(store: &DaemonStore, addr: SocketAddr) -> Result<(), String> {
     let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
-    let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
+    let endpoint = InteractiveEndpoint::bind_client(mouser_net::client_bind_for(addr))
         .map_err(|e| e.to_string())?;
     eprintln!("mouserd: probing {addr}...");
     let conn = tokio::time::timeout(
@@ -72,7 +72,7 @@ pub(super) async fn serve_direct(
     let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
     let my_id = me.device_id();
     eprintln!("mouserd: device_id {}", me.device_id_base32());
-    let endpoint = InteractiveEndpoint::bind_client(SocketAddr::from(([0, 0, 0, 0], 0)))
+    let endpoint = InteractiveEndpoint::bind_client(mouser_net::client_bind_for(addr))
         .map_err(|e| e.to_string())?;
     eprintln!("mouserd: dialing {addr} directly...");
     let conn = endpoint

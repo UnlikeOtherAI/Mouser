@@ -11,35 +11,38 @@ use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::NetError;
 
-/// Create a `ServiceDaemon`, optionally enabling the loopback interfaces (disabled by
-/// default in `mdns-sd`). Loopback is needed for single-host discovery (e.g. tests).
+/// Create a `ServiceDaemon` advertising and browsing on **all real interfaces, IPv4 and
+/// IPv6**, optionally enabling loopback (disabled by default in `mdns-sd`; needed for
+/// single-host tests).
 ///
-/// IPv6 is disabled: hosts (especially macOS) expose many virtual IPv6 link-local
-/// interfaces — `awdl0` (Apple Wireless Direct Link), `llw0`, and per-VPN `utunN`.
-/// Browsing and answering across all of them drowns the real LAN multicast in
-/// `mdns-sd`, so peers on the wire are never received and our own service never answers
-/// remote resolve queries (verified: with IPv6 enabled a LAN peer is invisible;
-/// disabled, it resolves immediately). IPv4 mDNS is sufficient for a local-network KVM.
+/// IPv6 is enabled so we publish AAAA records and accept peers that resolve us over v6
+/// (e.g. an iPhone on a v6 LAN), paired with the dual-stack QUIC listener. We do NOT
+/// blanket-disable IPv6 — that left the daemon v4-only and unreachable over v6. We only
+/// drop Apple's virtual link-local interfaces (`awdl0` AirDrop, `llw0` low-latency WLAN),
+/// whose IPv6 multicast otherwise drowns the real LAN multicast in `mdns-sd` on macOS
+/// (peers on the wire stop being received). Real interfaces — Wi-Fi/Ethernet `enN`, and
+/// VPN `utunN` — stay enabled on both families.
 fn new_daemon(loopback: bool) -> Result<ServiceDaemon, NetError> {
     let daemon = ServiceDaemon::new().map_err(|e| NetError::Discovery(e.to_string()))?;
-    daemon
-        .disable_interface(IfKind::IPv6)
-        .map_err(|e| NetError::Discovery(e.to_string()))?;
-    // The IPv4 analogue of the IPv6 problem above. Multi-interface hosts are now the
-    // norm (Wi-Fi + Ethernet, plus WSL/Docker/Hyper-V/VPN adapters), and an adapter
-    // stuck on an APIPA / link-local address (169.254.0.0/16) is one with no DHCP lease
-    // or a dead link — e.g. an unplugged NIC, or a virtual switch with no upstream.
-    // `mdns-sd` otherwise binds every interface, and such a dead adapter — frequently
-    // holding the *lowest* route metric, so the OS prefers it for multicast egress —
-    // silently swallows LAN discovery: queries leave on it and never reach real peers
+    // Drop Apple's virtual link-local interfaces (awdl0 AirDrop, llw0 low-latency WLAN),
+    // whose IPv6 multicast otherwise drowns the real LAN multicast on macOS. IPv6 itself
+    // stays enabled (we publish AAAA and accept v6 dialers, e.g. iPhones).
+    for noisy in ["awdl0", "llw0"] {
+        // Best-effort: absent on non-macOS hosts; ignore "not found".
+        let _ = daemon.disable_interface(IfKind::Name(noisy.into()));
+    }
+    // The IPv4 analogue: a multi-interface host (Wi-Fi + Ethernet, plus WSL/Docker/
+    // Hyper-V/VPN adapters) may have an adapter stuck on an APIPA / link-local address
+    // (169.254.0.0/16) — no DHCP lease or a dead link. `mdns-sd` otherwise binds every
+    // interface, and such a dead adapter — frequently holding the *lowest* route metric,
+    // so the OS prefers it for multicast egress — silently swallows LAN discovery
     // (observed: a disconnected NIC pinned on 169.254.x made every LAN peer invisible).
-    // Drop those interfaces from the set so discovery runs on the real LAN NIC(s), but
-    // only while at least one routable IPv4 interface remains, so a host that is *only*
-    // on APIPA still tries rather than going dark.
+    // Drop those, but only while at least one routable IPv4 interface remains, so a host
+    // that is *only* on APIPA still tries rather than going dark.
     let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
-    let has_routable = ifaces.iter().any(|i| {
-        !i.is_loopback() && matches!(i.ip(), IpAddr::V4(v4) if !is_unusable_v4(v4))
-    });
+    let has_routable = ifaces
+        .iter()
+        .any(|i| !i.is_loopback() && matches!(i.ip(), IpAddr::V4(v4) if !is_unusable_v4(v4)));
     if has_routable {
         for iface in &ifaces {
             if iface.is_loopback() {

@@ -75,6 +75,14 @@ pub fn client_bind_for(dest: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Unspecified IPv6 bind (`[::]:0`) for a dual-stack server listener — one socket
+/// serving both IPv4 (v4-mapped) and IPv6 dialers (macOS/Linux default
+/// `IPV6_V6ONLY=off`). Used by the daemon so a peer that resolves us to either family
+/// can connect. See [`InteractiveEndpoint::bind_server`].
+pub fn dual_stack_addr() -> SocketAddr {
+    SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0))
+}
+
 /// Build the shared [`TransportConfig`] applied to both endpoints (H1, A4).
 fn transport_config() -> Result<Arc<TransportConfig>, NetError> {
     let mut cfg = TransportConfig::default();
@@ -105,6 +113,12 @@ impl InteractiveEndpoint {
     ) -> Result<Self, NetError> {
         let cert = build_tls_certificate(identity)?;
         let server_config = build_server_config(&cert, peer_policy)?;
+        // Bind via quinn so a `[::]` address listens **dual-stack** (one socket serving
+        // both IPv4 v4-mapped and IPv6 dialers) — a LAN peer may resolve us to either
+        // family, and an iPhone in particular dials us over IPv6. macOS/Linux default
+        // IPV6_V6ONLY to off, so this is genuinely dual-stack there. (NB: hand-rolling
+        // the socket with socket2 + `Endpoint::new` was tried and broke the QUIC
+        // handshake, so we use quinn's own socket setup.)
         let endpoint =
             Endpoint::server(server_config, addr).map_err(|e| NetError::Io(e.to_string()))?;
         Ok(Self {

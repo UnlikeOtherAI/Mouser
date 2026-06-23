@@ -38,8 +38,10 @@ pub(super) async fn serve(
     eprintln!("mouserd: role {role}");
 
     // One endpoint both accepts (TrustOnFirstUse - trust is the §3 cert pin checked
-    // against the mDNS-advertised id) and dials.
-    let bind = SocketAddr::from(([0, 0, 0, 0], 0));
+    // against the mDNS-advertised id) and dials. Bind the dual-stack wildcard ([::]:0)
+    // so the single listener accepts both IPv4 and IPv6 dialers (a peer may resolve us
+    // to either family).
+    let bind = mouser_net::dual_stack_addr();
     let endpoint = InteractiveEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
         .map_err(|e| e.to_string())?;
     let iport = endpoint.local_addr().map_err(|e| e.to_string())?.port();
