@@ -47,6 +47,13 @@ const MAX_IDLE: Duration = Duration::from_secs(20);
 /// instead of a single bad address hanging the whole dial on [`MAX_IDLE`] (20s).
 const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Acceptor-side §5 handshake deadline. Once a peer has completed the QUIC handshake it
+/// must open the control stream and finish the channel proof within this window, else the
+/// accept is abandoned. Without it, a peer that connects and stalls holds the single
+/// accept loop for [`MAX_IDLE`] (20s) and blocks every other inbound peer (LAN DoS). The
+/// dialer side is already bounded by [`DIAL_ATTEMPT_TIMEOUT`].
+const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Bound the quinn datagram send buffer (A4): the app-level keep-newest sender
 /// ([`crate::motion`]) already coalesces, so only a couple of frames need to queue.
 /// 4 KiB is a handful of motion datagrams.
@@ -240,7 +247,19 @@ impl InteractiveEndpoint {
             .my_identity
             .as_deref()
             .ok_or_else(|| NetError::Connect("accept on a client-only endpoint".to_string()))?;
-        InteractiveConnection::establish(connection, ConnectionEnd::Acceptor, identity).await
+        // Bound the channel proof so a peer that completes QUIC then stalls cannot pin the
+        // single accept loop for MAX_IDLE and starve other inbound peers (LAN DoS).
+        match tokio::time::timeout(
+            ACCEPT_HANDSHAKE_TIMEOUT,
+            InteractiveConnection::establish(connection, ConnectionEnd::Acceptor, identity),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(NetError::Connect(
+                "inbound handshake timed out".to_string(),
+            )),
+        }
     }
 
     /// Close the endpoint and drain in-flight connections gracefully (H6): send each
