@@ -25,11 +25,11 @@
 //! - **Transport by size**: a small text payload rides one control-stream message; a
 //!   `png`/over-cap payload is split into ≤ 1 MiB ordered bulk chunks.
 //! - **Reassembly + progress + verify** ([`reassembly`]): inbound chunks accumulate by
-//!   hash, expose [`reassembly::Progress`] for the "Pasting from <device>…" indicator,
-//!   and the reassembled SHA-256 is verified against the offer's hash — dropped on
-//!   mismatch, never applied.
-//! - **Loop prevention**: a locally-applied `(origin, hash)` is recorded and never
-//!   re-offered.
+//!   `(origin, format, hash)`, expose [`reassembly::Progress`] for the "Pasting from
+//!   <device>…" indicator, and the reassembled SHA-256 is verified against the offer's
+//!   hash — dropped on mismatch, never applied.
+//! - **Loop prevention**: a locally-applied `(origin, format, hash)` is recorded in a
+//!   bounded log and suppresses the local clipboard-change echo once.
 //! - **Settings gates** ([`settings`]): the master switch, per-format gates, auto-sync
 //!   size limit, and direction are enforced **on send** *and* **on receipt**.
 //!
@@ -43,12 +43,14 @@ pub mod engine;
 pub mod reassembly;
 pub mod settings;
 pub mod source;
+mod tracking;
 
 pub use canonical::{canonical, content_hash, sha256};
 pub use engine::{transport_for, ClipboardEngine, Transport};
 pub use reassembly::{Progress, Reassembly};
 pub use settings::{is_apple, prefer_native_suppresses, ClipboardSettings, SyncDirection};
 pub use source::{AppliedClip, ClipContentSource, LocalRepr, MemContentSource};
+pub use tracking::{MAX_APPLIED_CLIPS, MAX_PENDING_PULLS, PULL_STALL_TICKS};
 
 /// A 32-byte SHA-256 digest: the canonical-content hash that is an offer/pull's
 /// `hash` field, the dedup key, and the integrity check (§7.7).

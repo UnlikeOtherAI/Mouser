@@ -9,8 +9,8 @@
 //! Flows it implements:
 //! - **Local change → Offer** ([`ClipboardEngine::on_local_change`]): canonicalize +
 //!   hash each enabled representation, emit `ClipboardOffer{entries, origin}`. A
-//!   representation the engine just *applied* (`(origin, hash)`) is suppressed so an
-//!   applied clip is never re-offered (loop prevention).
+//!   representation the engine just *applied* (`(origin, format, hash)`) is suppressed
+//!   once so an applied clip is not bounced back (loop prevention).
 //! - **Inbound Offer → eager auto-pull** ([`ClipboardEngine::on_offer`]): pick the
 //!   best accepted representation and emit `ClipboardPull` immediately, subject to the
 //!   per-format gates, the auto-sync size limit, and the prefer-native-Apple rule.
@@ -18,10 +18,9 @@
 //!   `ClipboardData` for a representation we offered (one control-stream message for
 //!   small payloads, ≤1 MiB bulk chunks for large ones).
 //! - **Inbound Data → reassemble/verify/apply** ([`ClipboardEngine::on_data`]):
-//!   accumulate by hash, expose [`Progress`], verify the hash on `last`, and surface
-//!   the completed [`AppliedClip`] (tagging `(origin, hash)` so it is not re-offered).
-
-use std::collections::HashMap;
+//!   accumulate by `(origin, format, hash)`, expose [`Progress`], verify the hash on
+//!   `last`, and surface the completed [`AppliedClip`] (tagging the representation so
+//!   the local clipboard-change echo is suppressed once).
 
 use mouser_core::DeviceId;
 use mouser_protocol::{
@@ -29,9 +28,10 @@ use mouser_protocol::{
 };
 
 use crate::canonical::content_hash;
-use crate::reassembly::{Progress, Reassembly};
+use crate::reassembly::Progress;
 use crate::settings::prefer_native_suppresses;
 use crate::source::{AppliedClip, ClipContentSource, LocalRepr};
+use crate::tracking::{AppliedLog, Pending, PendingPulls, PullKey};
 use crate::{ClipboardError, ClipboardSettings, Hash, CONTROL_TEXT_CAP, MAX_DATA_CHUNK};
 
 /// Preference order for choosing the best representation to pull (§7.7): `png` first
@@ -52,25 +52,18 @@ fn preference_rank(format: ClipFormat) -> Option<usize> {
     PREFERENCE.iter().position(|f| *f == format)
 }
 
-/// One in-flight inbound pull. Stored in [`ClipboardEngine::pending`] keyed by content
-/// hash; `origin` is retained so a later offer from the same origin can supersede a
-/// stale pull (§7.7) and so the applied content can be tagged `(origin, hash)`.
-struct Pending {
-    origin: DeviceId,
-    reasm: Reassembly,
-}
-
 /// The clipboard sync state machine for one device. Generic-free; all I/O is injected
 /// per call so the engine stays a pure value.
 pub struct ClipboardEngine {
     device_id: DeviceId,
     local_os: Os,
     settings: ClipboardSettings,
-    /// `(origin, hash)` pairs this device has applied from a peer — never re-offered
-    /// (loop prevention, §7.7).
-    applied: Vec<(DeviceId, Hash)>,
-    /// In-flight inbound pulls keyed by content hash.
-    pending: HashMap<Hash, Pending>,
+    /// Recently-applied peer representations used to suppress the local echo.
+    applied: AppliedLog,
+    /// In-flight inbound pulls keyed by origin, format, and content hash.
+    pending: PendingPulls,
+    /// Caller-driven logical tick used to stamp pull deadlines.
+    now_tick: u64,
 }
 
 impl ClipboardEngine {
@@ -81,8 +74,9 @@ impl ClipboardEngine {
             device_id,
             local_os,
             settings,
-            applied: Vec::new(),
-            pending: HashMap::new(),
+            applied: AppliedLog::default(),
+            pending: PendingPulls::default(),
+            now_tick: 0,
         }
     }
 
@@ -109,10 +103,10 @@ impl ClipboardEngine {
     /// Build a `ClipboardOffer` from the local clipboard's current representations.
     ///
     /// Each [`LocalRepr`] is canonicalized + hashed (§7.7); a representation whose
-    /// format is disabled by the settings is skipped, and one whose `(origin == self,
-    /// hash)`… —more precisely any `(any_origin, hash)` we just *applied*— is skipped
-    /// so an applied clip is never bounced back (loop prevention). Returns `None` when
-    /// the master switch/direction forbids offering or nothing remains to offer.
+    /// format is disabled by the settings is skipped, and the first local echo of a
+    /// representation we just applied from a peer is skipped so it is not bounced back.
+    /// Returns `None` when the master switch/direction forbids offering or nothing
+    /// remains to offer.
     #[must_use]
     pub fn on_local_change(&self, reps: &[LocalRepr]) -> Option<ClipboardOffer> {
         if !self.settings.can_offer() {
@@ -124,9 +118,9 @@ impl ClipboardEngine {
                 continue;
             }
             let hash = content_hash(rep.format, &rep.bytes);
-            if self.was_applied(&hash) {
-                // This exact content arrived from a peer and we applied it; re-offering
-                // it would loop it back to the origin. Skip every representation of it.
+            if self.applied.suppress_once(rep.format, &hash) {
+                // This is the clipboard-change echo from a peer-applied clip. Suppress
+                // it once; a later genuine local copy of the same bytes can be offered.
                 continue;
             }
             let size = canonical_size(rep.format, &rep.bytes);
@@ -154,16 +148,16 @@ impl ClipboardEngine {
     /// - the prefer-native-Apple rule suppresses this peer pair (`peer_os` Apple +
     ///   local Apple + setting on) so the OS Universal Clipboard carries it;
     /// - the offer came from *this* device (a reflected own-offer);
-    /// - no entry is for an enabled format;
-    /// - the chosen entry exceeds `max_auto_sync_bytes`.
+    /// - no entry is for an enabled format within `max_auto_sync_bytes`.
     ///
     /// Before choosing, the new offer **supersedes outstanding pulls from the same
-    /// origin** (§7.7): any in-flight pull from `origin` whose hash the new offer no
-    /// longer advertises is dropped, so a stale earlier pull can no longer complete and
-    /// apply.
+    /// origin** (§7.7): any in-flight pull from `origin` whose representation the new
+    /// offer no longer advertises is dropped, so stale earlier data can no longer
+    /// complete and apply.
     ///
     /// On success the engine records the pull as pending so subsequent `ClipboardData`
-    /// for that hash is accepted by [`ClipboardEngine::on_data`].
+    /// for that `(origin, format, hash)` is accepted. A fresh offer for an already
+    /// pending representation resets the reassembly and re-issues the pull.
     pub fn on_offer(
         &mut self,
         offer: &ClipboardOffer,
@@ -172,12 +166,13 @@ impl ClipboardEngine {
         if !self.settings.can_receive() {
             return Ok(None);
         }
-        if prefer_native_suppresses(&self.settings, self.local_os, peer_os) {
-            return Ok(None);
-        }
         let origin = parse_device_id(&offer.origin)?;
         if origin == self.device_id {
             // Our own offer reflected back to us — never pull from ourselves.
+            return Ok(None);
+        }
+        if prefer_native_suppresses(&self.settings, self.local_os, peer_os) {
+            self.pending.remove_origin(origin);
             return Ok(None);
         }
         // A new Offer supersedes outstanding offers from that origin (§7.7): drop any
@@ -187,52 +182,44 @@ impl ClipboardEngine {
         let Some(entry) = self.best_entry(offer) else {
             return Ok(None);
         };
-        if !self.settings.within_auto_sync_limit(entry.size) {
-            return Ok(None);
-        }
         let hash = parse_hash(&entry.hash)?;
-        // A pull already in flight for this hash needn't be re-issued.
-        if self.pending.contains_key(&hash) {
-            return Ok(None);
-        }
-        self.pending.insert(
-            hash,
-            Pending {
-                origin,
-                reasm: Reassembly::new(entry.format, hash, entry.size),
-            },
-        );
+        let key = PullKey::new(origin, entry.format, hash);
+        self.pending
+            .insert(Pending::new(key, entry.size, peer_os, self.now_tick));
         Ok(Some(ClipboardPull {
             hash: hash.to_vec(),
             format: entry.format,
         }))
     }
 
-    /// Pick the most-preferred *enabled* entry from `offer` (§7.7 preference order).
-    /// Ties (duplicate formats) keep the first seen. Returns `None` if no entry is for
-    /// an enabled, known format.
+    /// Pick the most-preferred entry that is enabled and within the auto-sync limit.
+    /// Ties (duplicate formats) keep the first seen. Returns `None` if no known entry
+    /// passes both policy gates.
     fn best_entry<'a>(&self, offer: &'a ClipboardOffer) -> Option<&'a ClipboardEntry> {
         offer
             .entries
             .iter()
             .filter(|e| self.settings.format_enabled(e.format))
+            .filter(|e| self.settings.within_auto_sync_limit(e.size))
             .filter_map(|e| preference_rank(e.format).map(|r| (r, e)))
             .min_by_key(|(r, _)| *r)
             .map(|(_, e)| e)
     }
 
     /// Drop in-flight pulls from `origin` that the new `offer` no longer advertises
-    /// (§7.7 "a new Offer supersedes outstanding offers from that origin"). A pull whose
-    /// hash *is* re-advertised in the new offer is kept (the content is still on offer,
-    /// so its in-flight data is still valid). Pulls from other origins are untouched.
+    /// (§7.7 "a new Offer supersedes outstanding offers from that origin"). Matching
+    /// is by representation `(origin, format, hash)`, not hash alone.
     fn supersede_origin(&mut self, origin: DeviceId, offer: &ClipboardOffer) {
-        let still_offered: Vec<Hash> = offer
+        let still_offered = offer
             .entries
             .iter()
-            .filter_map(|e| parse_hash(&e.hash).ok())
-            .collect();
-        self.pending
-            .retain(|hash, p| p.origin != origin || still_offered.contains(hash));
+            .filter_map(|entry| {
+                parse_hash(&entry.hash)
+                    .ok()
+                    .map(|hash| PullKey::new(origin, entry.format, hash))
+            })
+            .collect::<Vec<_>>();
+        self.pending.retain_origin_offer(origin, &still_offered);
     }
 
     // --- Inbound Pull → Data chunks -------------------------------------------------
@@ -269,12 +256,15 @@ impl ClipboardEngine {
     /// Feed one inbound `ClipboardData` chunk into the matching pending pull (§7.7).
     ///
     /// Returns the completed [`AppliedClip`] once the final chunk arrives and the
-    /// reassembled SHA-256 verifies against the offered hash; the `(origin, hash)` is
-    /// recorded so the applied content is never re-offered (loop prevention). Returns
-    /// `Ok(None)` while more chunks are expected. A hash mismatch (or any framing
-    /// fault) drops the pending payload and surfaces the error so the caller can clear
-    /// the "pasting…" indicator. A chunk for an unknown hash (no matching pull) is a
-    /// protocol error.
+    /// reassembled SHA-256 verifies against the offered hash; the applied
+    /// `(origin, format, hash)` is recorded so the local echo is suppressed once.
+    /// Returns `Ok(None)` while more chunks are expected. A hash mismatch (or any
+    /// framing fault) drops the pending payload and surfaces the error so the caller can
+    /// clear the "pasting…" indicator. A chunk for an unknown hash is a protocol error.
+    ///
+    /// This compatibility method resolves by `(format, hash)` and succeeds only when
+    /// there is a single matching pending origin. Call [`Self::on_data_from`] when the
+    /// caller knows the peer origin.
     ///
     /// The receive gates are **re-checked on apply** (§7.7 "enforced … on receipt …
     /// before any platform clipboard write"): if the master switch, the receive
@@ -283,35 +273,57 @@ impl ClipboardEngine {
     /// so a setting change always takes effect before the OS clipboard is written.
     pub fn on_data(&mut self, data: &ClipboardData) -> Result<Option<AppliedClip>, ClipboardError> {
         let hash = parse_hash(&data.hash)?;
-        let pending = self
+        let key = self.pending.key_for_data(data.format, hash)?;
+        self.on_data_for_key(key, data)
+    }
+
+    /// Origin-aware form of [`Self::on_data`]. Runtime callers should prefer this when
+    /// dispatching data received on a peer connection, because multiple origins may
+    /// legitimately advertise the same `(format, hash)`.
+    pub fn on_data_from(
+        &mut self,
+        origin: DeviceId,
+        data: &ClipboardData,
+    ) -> Result<Option<AppliedClip>, ClipboardError> {
+        let hash = parse_hash(&data.hash)?;
+        let key = self
             .pending
-            .get_mut(&hash)
-            .ok_or(ClipboardError::UnknownHash)?;
-        if data.format != pending.reasm.format() {
-            // The data's format must match what we pulled for this hash.
-            self.pending.remove(&hash);
-            return Err(ClipboardError::Protocol("data format mismatch".into()));
-        }
-        match pending.reasm.push(data.offset, &data.data, data.last) {
+            .key_for_origin_data(origin, data.format, hash)?;
+        self.on_data_for_key(key, data)
+    }
+
+    fn on_data_for_key(
+        &mut self,
+        key: PullKey,
+        data: &ClipboardData,
+    ) -> Result<Option<AppliedClip>, ClipboardError> {
+        let Some(pending) = self.pending.get_mut(&key) else {
+            return Err(ClipboardError::UnknownHash);
+        };
+        match pending.push(data.offset, &data.data, data.last) {
             Ok(Some(bytes)) => {
-                let format = pending.reasm.format();
-                let origin = pending.origin;
-                self.pending.remove(&hash);
-                if !self.settings.can_receive() || !self.settings.format_enabled(format) {
+                let format = pending.format();
+                let origin = pending.origin();
+                let peer_os = pending.peer_os();
+                self.pending.remove(&key);
+                if !self.settings.can_receive()
+                    || !self.settings.format_enabled(format)
+                    || prefer_native_suppresses(&self.settings, self.local_os, peer_os)
+                {
                     // A gate was disabled mid-stream: drop the completed payload without
                     // applying it (and without tagging it applied, since nothing was
                     // written).
                     return Ok(None);
                 }
-                // Tag the applied content so on_local_change won't bounce it back.
-                self.applied.push((origin, hash));
+                // Tag the applied content so on_local_change won't bounce back its echo.
+                self.applied.record(origin, format, key.hash);
                 Ok(Some(AppliedClip { format, bytes }))
             }
             Ok(None) => Ok(None),
             Err(e) => {
                 // Drop the pending payload on any fault (mismatch/oversize/gap): the
                 // partial bytes must not be applied and the slot is cleared.
-                self.pending.remove(&hash);
+                self.pending.remove(&key);
                 Err(e)
             }
         }
@@ -320,19 +332,44 @@ impl ClipboardEngine {
     /// Progress of the in-flight pull for `hash`, if one exists (§7.7 wait indicator).
     #[must_use]
     pub fn progress(&self, hash: &Hash) -> Option<Progress> {
-        self.pending.get(hash).map(|p| p.reasm.progress())
+        self.pending.progress_by_hash(hash)
     }
 
     /// Whether a pull for `hash` is currently in flight.
     #[must_use]
     pub fn is_pulling(&self, hash: &Hash) -> bool {
-        self.pending.contains_key(hash)
+        self.pending.contains_hash(hash)
     }
 
-    /// Whether `(any origin, hash)` has been applied locally (loop-prevention probe).
+    /// Abort every in-flight pull for `hash`, clearing wait/progress state.
+    pub fn abort_pull(&mut self, hash: &Hash) -> bool {
+        self.pending.remove_hash(hash)
+    }
+
+    /// Abort all in-flight pulls from `origin`, such as after peer disconnect.
+    pub fn abort_origin(&mut self, origin: DeviceId) -> usize {
+        self.pending.remove_origin(origin)
+    }
+
+    /// Advance the caller-driven logical clock and clear stalled pull deadlines.
+    ///
+    /// The engine remains clock-free: callers pass a monotonically increasing tick
+    /// value from their runtime. Returns the number of pending pulls swept.
+    pub fn tick(&mut self, now_tick: u64) -> usize {
+        self.now_tick = self.now_tick.max(now_tick);
+        self.pending.expire_stalled(self.now_tick)
+    }
+
+    /// Whether `hash` is in the bounded recently-applied log.
     #[must_use]
     pub fn was_applied(&self, hash: &Hash) -> bool {
-        self.applied.iter().any(|(_, h)| h == hash)
+        self.applied.contains_hash(hash)
+    }
+
+    /// Number of entries currently retained in the bounded applied log.
+    #[must_use]
+    pub fn applied_count(&self) -> usize {
+        self.applied.len()
     }
 }
 
