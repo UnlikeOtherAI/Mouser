@@ -5,7 +5,8 @@
 //! Pinning mode:
 //! - [`PinPolicy::Pinned`] — compare against a known `device_id` (the resume/§3 path).
 //! - [`PinPolicy::TrustOnFirstUse`] — accept any well-formed identity cert and report
-//!   the observed `device_id` (first-contact; SAS/pairing — STUBBED — would gate trust).
+//!   the observed `device_id`; the §5 channel proof still runs, and the daemon gates
+//!   first-contact runtime traffic on SAS approval before trusting that id.
 //!
 //! The TLS *signature* is always cryptographically verified with the ring provider's
 //! webpki algorithms; only the trust decision differs by policy.
@@ -29,8 +30,8 @@ use crate::identity::device_id_from_cert;
 pub enum PinPolicy {
     /// Require `SHA-256(cert SPKI) == device_id` (trusted-peer resume path, §3).
     Pinned(DeviceId),
-    /// Accept any well-formed identity cert (first-contact). Pairing/SAS — STUBBED —
-    /// would gate trust on the reported `device_id` before exchanging input/state.
+    /// Accept any well-formed identity cert (first-contact). SAS pairing in the daemon
+    /// gates trust on the reported `device_id` before exchanging runtime traffic.
     TrustOnFirstUse,
 }
 

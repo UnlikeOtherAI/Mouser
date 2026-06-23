@@ -165,14 +165,17 @@ pub struct HealthItemDto {
 }
 
 /// An inbound pairing request from an untrusted peer that dialed this machine: the peer's
-/// base32 device id and the display name it announced (advisory — trust is still the §3
-/// cert pin keyed on `peer_id`; the name just lets the user recognize the device).
+/// base32 device id, the display name it announced, and the §5 SAS digits the user must
+/// compare on both devices before approving.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingDto {
     /// Base32 device id of the peer requesting control.
     pub peer_id: String,
     /// The peer's announced display name (e.g. "Ondrej's iPhone"), or a generic fallback.
     pub name: String,
+    /// Six decimal SAS digits derived from the interactive TLS exporter (§5 step 3).
+    #[serde(default)]
+    pub sas: String,
 }
 
 /// Daemon-owned, persisted settings — the single source of truth that both the

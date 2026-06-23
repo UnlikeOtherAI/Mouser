@@ -103,6 +103,8 @@ struct EnginePairing {
     peer_id: String,
     /// The peer's announced display name (or a generic fallback).
     name: String,
+    /// Six decimal SAS digits to compare before approval.
+    sas: String,
 }
 
 /// A peer as the engine reports it (mirrors [`mouser_ipc::PeerDto`]).
@@ -180,6 +182,7 @@ impl EngineSnapshot {
             pairing: snapshot.pairing.map(|p| EnginePairing {
                 peer_id: p.peer_id,
                 name: p.name,
+                sas: p.sas,
             }),
             settings: snapshot.settings,
             diagnostics: snapshot.diagnostics,
