@@ -16,7 +16,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const JITTER_PERCENT: u64 = 20;
 
 pub(super) enum ReconnectEnd {
-    Reconnected(InteractiveConnection),
+    Reconnected(Box<InteractiveConnection>),
     Disconnected,
     Shutdown,
 }
@@ -104,7 +104,7 @@ pub(super) async fn redial_until_reconnected(
             .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
             .await
         {
-            Ok(conn) => return ReconnectEnd::Reconnected(conn),
+            Ok(conn) => return ReconnectEnd::Reconnected(Box::new(conn)),
             Err(e) => {
                 let reason = format!("reconnect to {peer_text} failed: {e}");
                 if let Some(bridge) = bridge {

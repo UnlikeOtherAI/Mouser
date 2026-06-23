@@ -1,11 +1,8 @@
 //! Loopback integration: two QUIC endpoints in one process establish an interactive
-//! connection (§6.1), round-trip a `Ping` control frame on the bidi control stream
-//! (§0.2 framing + CBOR), and deliver a `PointerMotion` over the datagram plane
-//! (§7.6, RFC 9221).
-//!
-//! Stubbed (skeleton): the §5 `Hello`/`HelloAck` handshake, the mandatory SAS
-//! pairing, and the `channel_sig` identity proof are NOT exchanged. Cert pinning
-//! (§3) IS exercised — both ends pin the peer's `device_id`.
+//! connection (§6.1), complete the §5 `Hello`/`HelloAck` channel proof, round-trip a
+//! `Ping` control frame on the bidi control stream (§0.2 framing + CBOR), and deliver
+//! a `PointerMotion` over the datagram plane (§7.6, RFC 9221). Cert pinning (§3) is
+//! exercised — both ends pin the peer's `device_id`.
 
 use std::time::Duration;
 

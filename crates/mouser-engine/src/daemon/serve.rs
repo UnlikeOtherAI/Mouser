@@ -189,7 +189,7 @@ pub(super) async fn serve(
                 .await
                 {
                     ReconnectEnd::Reconnected(conn) => {
-                        pending = Some(conn);
+                        pending = Some(*conn);
                     }
                     ReconnectEnd::Disconnected => {
                         eprintln!("mouserd: reconnect stopped; searching for peers");

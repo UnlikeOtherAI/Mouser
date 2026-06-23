@@ -48,7 +48,18 @@ pub fn compute_sas(
     my_id: DeviceId,
     peer_id: DeviceId,
 ) -> Result<String, NetError> {
-    // ctx = min(idA,idB) || max(idA,idB), ordered ascending by byte value (§5 step 3).
+    let context = exporter_context(my_id, peer_id)?;
+
+    // k = tls_exporter(label="mouser-sas-v1", context=ctx, length=32) over the interactive
+    // connection (RFC 5705 / RFC 8446 §7.5).
+    let mut k = [0u8; SAS_EXPORT_LEN];
+    conn.export_keying_material(&mut k, SAS_LABEL, &context)
+        .map_err(|_| NetError::Tls("sas exporter unavailable".to_string()))?;
+
+    sas_from_exporter(&k)
+}
+
+fn exporter_context(my_id: DeviceId, peer_id: DeviceId) -> Result<[u8; 64], NetError> {
     let (low, high) = if my_id <= peer_id {
         (my_id, peer_id)
     } else {
@@ -63,15 +74,12 @@ pub fn compute_sas(
         .get_mut(32..64)
         .ok_or_else(|| NetError::Tls("sas context build failed".to_string()))?
         .copy_from_slice(&high);
+    Ok(context)
+}
 
-    // k = tls_exporter(label="mouser-sas-v1", context=ctx, length=32) over the interactive
-    // connection (RFC 5705 / RFC 8446 §7.5).
-    let mut k = [0u8; SAS_EXPORT_LEN];
-    conn.export_keying_material(&mut k, SAS_LABEL, &context)
-        .map_err(|_| NetError::Tls("sas exporter unavailable".to_string()))?;
-
+fn sas_from_exporter(k: &[u8; SAS_EXPORT_LEN]) -> Result<String, NetError> {
     // digest = HKDF-SHA256(salt="mouser-sas-v1", ikm=k, info="sas", L=4).
-    let hk = Hkdf::<Sha256>::new(Some(SAS_LABEL), &k);
+    let hk = Hkdf::<Sha256>::new(Some(SAS_LABEL), k);
     let mut digest = [0u8; SAS_DIGEST_LEN];
     hk.expand(SAS_INFO, &mut digest)
         .map_err(|_| NetError::Tls("sas hkdf expand failed".to_string()))?;
@@ -87,15 +95,42 @@ mod tests {
 
     #[test]
     fn ascending_context_is_order_independent() {
-        // The two distinct ids, in either argument order, must build the same context →
-        // (the exporter is mocked away in this unit test; the loopback integration test
-        // exercises the real exporter). Here we assert the pure sort logic the derivation
-        // depends on: min||max is identical regardless of which arg is "mine".
         let a: DeviceId = [1u8; 32];
         let b: DeviceId = [2u8; 32];
-        let order_ab = if a <= b { (a, b) } else { (b, a) };
-        let order_ba = if b <= a { (b, a) } else { (a, b) };
-        assert_eq!(order_ab, order_ba, "min||max must be order-independent");
+        assert_eq!(
+            exporter_context(a, b).expect("context ab"),
+            exporter_context(b, a).expect("context ba"),
+            "min||max must be order-independent"
+        );
+    }
+
+    #[test]
+    fn ascending_context_changes_for_different_device_pairs() {
+        let a: DeviceId = [1u8; 32];
+        let b: DeviceId = [2u8; 32];
+        let c: DeviceId = [3u8; 32];
+        assert_ne!(
+            exporter_context(a, b).expect("context ab"),
+            exporter_context(a, c).expect("context ac"),
+            "changing the ordered device-id pair must change the exporter context"
+        );
+    }
+
+    #[test]
+    fn sas_rendering_is_deterministic_for_exporter_input() {
+        let first = [0xA5u8; SAS_EXPORT_LEN];
+        let second = [0x5Au8; SAS_EXPORT_LEN];
+        let a = sas_from_exporter(&first).expect("first sas");
+        assert_eq!(
+            sas_from_exporter(&first).expect("first sas again"),
+            a,
+            "same exporter input must produce the same SAS"
+        );
+        assert_ne!(
+            sas_from_exporter(&second).expect("second sas"),
+            a,
+            "different exporter input should produce a different SAS"
+        );
     }
 
     #[test]

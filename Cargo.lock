@@ -2723,6 +2723,7 @@ dependencies = [
  "mouser-files",
  "mouser-protocol",
  "quinn",
+ "rand_core 0.6.4",
  "rcgen",
  "rustls",
  "rustls-pki-types",

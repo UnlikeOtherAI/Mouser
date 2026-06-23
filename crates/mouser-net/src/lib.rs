@@ -1,7 +1,7 @@
 //! mouser-net — the QUIC transport + mDNS discovery layer (docs/communication-interface.md
 //! §0, §2, §4, §6, §7.6; docs/tech-stack.md §2).
 //!
-//! This crate currently implements the **transport skeleton**:
+//! This crate implements the transport layer:
 //! - [`discovery`] — advertise/browse `_mouser._udp.local` over mDNS (§4).
 //! - [`identity`] — the TLS leaf cert built from the [`mouser_core::DeviceIdentity`]
 //!   key, plus `device_id_from_cert` which feeds the single `mouser-core` SPKI→hash
@@ -10,7 +10,8 @@
 //! - [`tls`] — TLS 1.3 rustls configs with ALPN `mouser/1` (§2).
 //! - [`motion`] — app-level keep-newest pointer-motion datagram sender (§8/§7.6).
 //! - [`transport`] — a `quinn` interactive connection: long-lived control stream
-//!   (framed CBOR, §0.2/§6.1) + RFC 9221 datagram plane for `PointerMotion` (§7.6).
+//!   (framed CBOR, §0.2/§6.1), §5 `Hello`/`HelloAck` channel binding, and RFC 9221
+//!   datagram plane for `PointerMotion` (§7.6).
 //! - [`bulk`] — the second QUIC connection (§6.2): `BulkHello` binding to the
 //!   interactive session (§5 step 5) + one dedicated framed stream per `transfer_id`,
 //!   reusing the interactive plane's cert/pin/TLS builders.
@@ -18,10 +19,9 @@
 //!   identical 6-digit code from the interactive TLS exporter + ascending-id context for
 //!   the user to compare. Exposed as [`InteractiveConnection::sas`].
 //!
-//! **Stubbed for this skeleton** (see module docs): the §5 `Hello`/`HelloAck` handshake
-//! on the *interactive* plane. The bulk plane's `channel_sig` binding (§5 step 5) IS
-//! implemented in [`bulk`], and the mandatory SAS pairing (§5 step 3) in [`sas`]. Cert
-//! pinning (§3) is enforced on both planes.
+//! Cert pinning (§3) is enforced on both planes. Interactive connections are returned
+//! only after `channel_sig` verifies against the pinned leaf cert key; first-contact
+//! human trust approval is enforced by the daemon before it starts runtime traffic.
 
 // §0.3 panic-free decode discipline: the decode/runtime path must never panic.
 // Decoders use checked slicing + `try_into` and return `NetError` instead.
@@ -30,6 +30,7 @@
 pub mod bulk;
 mod control;
 pub mod discovery;
+mod handshake;
 pub mod identity;
 pub mod motion;
 pub mod pin;

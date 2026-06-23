@@ -225,8 +225,8 @@ impl IpcBridge {
 
     /// Surface a pending inbound pairing request to connected UIs (Allow/Deny prompt),
     /// naming the device that asked to connect.
-    pub fn request_pairing(&self, peer_id: String, name: String) {
-        *lock(&self.shared.pairing) = Some(PairingDto { peer_id, name });
+    pub fn request_pairing(&self, peer_id: String, name: String, sas: String) {
+        *lock(&self.shared.pairing) = Some(PairingDto { peer_id, name, sas });
         self.republish();
     }
 

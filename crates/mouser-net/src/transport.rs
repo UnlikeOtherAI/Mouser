@@ -11,9 +11,11 @@
 //! can deadlock (A2). A [`quinn::TransportConfig`] sets QUIC keep-alive + a bounded
 //! idle timeout on both ends (H1).
 //!
-//! Hello / SAS pairing / `channel_sig` (§5) are **STUBBED** here: the control stream
-//! and datagram plane are wired and round-trip, but no `Hello` handshake, no SAS, and
-//! no identity-proof signature are exchanged yet. Cert pinning (§3) *is* enforced.
+//! After the stream exists, both peers exchange `Hello` / `HelloAck` (§7.1) and verify
+//! `channel_sig = Ed25519_sign(identity_key, tls_exporter("mouser-channel-v1",
+//! context=device_id, length=64))` against the pinned leaf cert key (§5 step 4). An
+//! [`InteractiveConnection`] is returned only after that channel proof succeeds; the
+//! daemon then gates first-contact runtime traffic on the human SAS approval (§5 step 3).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,7 +29,7 @@ use quinn::{
 };
 
 use crate::control::{self, ControlStream};
-use crate::identity::{build_tls_certificate, device_id_from_cert, TlsCertificate};
+use crate::identity::{build_tls_certificate, TlsCertificate};
 use crate::motion::{MotionPlane, MotionSender};
 use crate::pin::PinPolicy;
 use crate::{tls, NetError};
@@ -99,10 +101,10 @@ fn transport_config() -> Result<Arc<TransportConfig>, NetError> {
 /// A bound QUIC endpoint that can accept inbound interactive connections and dial out.
 pub struct InteractiveEndpoint {
     endpoint: Endpoint,
-    /// This endpoint's own `device_id` (§3), set when bound as a server so an accepted
-    /// connection knows its local id for the §5 SAS derivation. A client-only endpoint
-    /// dials with an explicit `identity`, so it carries the local id per-connect instead.
-    my_device_id: Option<DeviceId>,
+    /// This endpoint's own identity (§3), set when bound as a server so an accepted
+    /// connection can sign the §5 interactive channel proof. A client-only endpoint
+    /// dials with an explicit `identity`, so it carries the local identity per-connect.
+    my_identity: Option<Arc<DeviceIdentity>>,
 }
 
 impl InteractiveEndpoint {
@@ -125,7 +127,7 @@ impl InteractiveEndpoint {
             Endpoint::server(server_config, addr).map_err(|e| NetError::Io(e.to_string()))?;
         Ok(Self {
             endpoint,
-            my_device_id: Some(identity.device_id()),
+            my_identity: Some(Arc::new(DeviceIdentity::from_seed(&identity.secret_seed()))),
         })
     }
 
@@ -134,7 +136,7 @@ impl InteractiveEndpoint {
         let endpoint = Endpoint::client(addr).map_err(|e| NetError::Io(e.to_string()))?;
         Ok(Self {
             endpoint,
-            my_device_id: None,
+            my_identity: None,
         })
     }
 
@@ -163,20 +165,20 @@ impl InteractiveEndpoint {
         let connection = connecting
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
-        InteractiveConnection::establish(connection, ConnectionEnd::Initiator, identity.device_id())
-            .await
+        InteractiveConnection::establish(connection, ConnectionEnd::Initiator, identity).await
     }
 
     /// Accept the next inbound interactive connection (§6.1). The control stream is
     /// accepted and the priming frame consumed before returning (A2).
     pub async fn accept_interactive(&self) -> Result<InteractiveConnection, NetError> {
         let connection = accept_after_retry(&self.endpoint).await?;
-        // A server endpoint always carries its own `device_id` (set at `bind_server`); a
+        // A server endpoint always carries its own identity (set at `bind_server`); a
         // client-only endpoint cannot accept, so this is `Some` on every real accept path.
-        let my_device_id = self
-            .my_device_id
+        let identity = self
+            .my_identity
+            .as_deref()
             .ok_or_else(|| NetError::Connect("accept on a client-only endpoint".to_string()))?;
-        InteractiveConnection::establish(connection, ConnectionEnd::Acceptor, my_device_id).await
+        InteractiveConnection::establish(connection, ConnectionEnd::Acceptor, identity).await
     }
 
     /// Close the endpoint and drain in-flight connections gracefully (H6): send each
@@ -253,6 +255,15 @@ pub struct InteractiveConnection {
     /// This end's own `device_id` (§3), captured at establish so [`Self::sas`] can build
     /// the §5 ascending-id exporter context without re-deriving from the local cert.
     my_device_id: DeviceId,
+    /// Peer id verified by both cert pinning (§3) and the interactive `channel_sig`
+    /// proof (§5 step 4). This is set only after the handshake succeeds.
+    verified_peer_id: DeviceId,
+    /// Local random session id sent in `Hello` (§7.1).
+    local_session_id: u64,
+    /// Peer random session id received in `Hello` (§7.1).
+    peer_session_id: u64,
+    /// Advisory display name from the peer's `Hello`, if it sent one.
+    peer_name: Option<String>,
 }
 
 impl InteractiveConnection {
@@ -262,7 +273,7 @@ impl InteractiveConnection {
     async fn establish(
         connection: Connection,
         end: ConnectionEnd,
-        my_device_id: DeviceId,
+        identity: &DeviceIdentity,
     ) -> Result<Self, NetError> {
         // `seed` carries any bytes already read off the recv stream during setup that are
         // NOT the priming frame, so the first real frame isn't lost (consume_prime
@@ -297,12 +308,17 @@ impl InteractiveConnection {
             }
         };
         let control = ControlStream::new(send, recv, seed);
+        let verified = crate::handshake::exchange(&connection, &control, identity).await?;
         let motion = MotionSender::spawn(connection.clone());
         Ok(Self {
             connection,
             control,
             motion,
-            my_device_id,
+            my_device_id: identity.device_id(),
+            verified_peer_id: verified.peer_id,
+            local_session_id: verified.local_session_id,
+            peer_session_id: verified.peer_session_id,
+            peer_name: verified.peer_name,
         })
     }
 
@@ -316,12 +332,30 @@ impl InteractiveConnection {
 
     /// The peer's pinned `device_id` derived from its presented leaf cert (§3).
     pub fn peer_device_id(&self) -> Option<DeviceId> {
-        let identity = self.connection.peer_identity()?;
-        let certs = identity
-            .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
-            .ok()?;
-        let leaf = certs.first()?;
-        device_id_from_cert(leaf).ok()
+        Some(self.verified_peer_id)
+    }
+
+    /// This type is only constructed after the §5 interactive `channel_sig` proof has
+    /// verified against the pinned cert key. Exposed so daemon gates can assert the
+    /// trust boundary before starting runtime traffic.
+    pub fn is_channel_verified(&self) -> bool {
+        true
+    }
+
+    /// The local random session id sent in `Hello` (§7.1).
+    pub fn session_id(&self) -> u64 {
+        self.local_session_id
+    }
+
+    /// The peer's random session id received in `Hello` (§7.1).
+    pub fn peer_session_id(&self) -> u64 {
+        self.peer_session_id
+    }
+
+    /// Advisory display name from the peer's `Hello`, if present. Trust decisions remain
+    /// keyed solely on [`Self::peer_device_id`]; this is UI text only.
+    pub fn peer_name(&self) -> Option<&str> {
+        self.peer_name.as_deref()
     }
 
     /// The mandatory 6-digit §5 SAS for this interactive connection, derived from the
@@ -330,10 +364,7 @@ impl InteractiveConnection {
     /// (§5 step 3). Errors if the peer presented no usable cert or the exporter is
     /// unavailable. See [`crate::sas`] for the full derivation.
     pub fn sas(&self) -> Result<String, NetError> {
-        let peer_id = self
-            .peer_device_id()
-            .ok_or_else(|| NetError::Connect("no peer device_id for SAS".to_string()))?;
-        crate::sas::compute_sas(&self.connection, self.my_device_id, peer_id)
+        crate::sas::compute_sas(&self.connection, self.my_device_id, self.verified_peer_id)
     }
 
     /// Send a framed control message (§0.2): `encode_frame(msg_type, 0, payload)` on

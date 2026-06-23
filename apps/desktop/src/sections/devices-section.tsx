@@ -57,6 +57,7 @@ export function DevicesSection(): React.JSX.Element {
       {pairing ? (
         <PairingPrompt
           name={pairing.name}
+          sas={pairing.sas}
           onApprove={() => void approvePairing(pairing.peerId)}
           onDeny={() => void denyPairing(pairing.peerId)}
         />
@@ -266,6 +267,7 @@ function PeerRow({
 
 interface PairingPromptProps {
   name: string;
+  sas: string;
   onApprove: () => void;
   onDeny: () => void;
 }
@@ -275,6 +277,7 @@ interface PairingPromptProps {
  *  pin authenticates the specific device, the name is just a human label). */
 function PairingPrompt({
   name,
+  sas,
   onApprove,
   onDeny,
 }: PairingPromptProps): React.JSX.Element {
@@ -285,7 +288,10 @@ function PairingPrompt({
         computer
       </p>
       <p className="mt-1 text-xs text-muted">
-        Allow only if you recognize this device.
+        Compare this code on both devices before allowing:{" "}
+        <span className="font-mono text-sm font-semibold text-fg">
+          {sas}
+        </span>
       </p>
       <div className="mt-3 flex justify-end gap-2">
         <button
