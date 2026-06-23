@@ -36,7 +36,7 @@ use tauri::{
 
 mod appreveal;
 mod engine;
-use engine::{stop_engine, supervise_engine, EngineProcess};
+use engine::EngineHandle;
 
 /// Compile-time OS kind, matching the frontend `OsKind` union.
 const OS_KIND: &str = if cfg!(target_os = "macos") {
@@ -526,7 +526,7 @@ pub fn run() {
             None,
         ))
         .manage(DesktopPreferences::default())
-        .manage(EngineProcess::default())
+        .manage(EngineHandle::default())
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
@@ -534,12 +534,13 @@ pub fn run() {
             // live window + its WKWebView are inspectable over `_appreveal._tcp` (parity
             // with the iOS/Android apps). No-op on release / non-macOS — see [`appreveal`].
             appreveal::start();
-            // The app administers the engine: launch + supervise the headless `mouserd`
-            // daemon (relaunch it if it dies), so the user never starts a daemon by hand.
-            // The engine owns mDNS discovery; the app reads peers from its IPC snapshot
-            // rather than running a second browse (which would race the engine's and miss
-            // peers).
-            supervise_engine(app.handle());
+            // The app IS the engine: it runs the engine IN-PROCESS (no separate `mouserd`
+            // child), so the user never starts a daemon by hand. `start` builds the host's
+            // per-OS adapters, opens the daemon store, and spawns `run_engine` on the Tauri
+            // async runtime, hosting the IPC server the #[tauri::command]s talk to. The
+            // engine owns mDNS discovery; the app reads peers from its IPC snapshot rather
+            // than running a second browse (which would race the engine's and miss peers).
+            engine::start(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -571,10 +572,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Mouser desktop shell");
 
-    // Stop the engine we launched when the app exits, so we don't orphan the daemon.
+    // Stop the in-process engine when the app exits: abort the serve task AND call
+    // `capture.stop()` to release any installed input hooks (the no-stuck-keys path).
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            stop_engine(app_handle);
+            engine::shutdown(app_handle);
         }
     });
 }

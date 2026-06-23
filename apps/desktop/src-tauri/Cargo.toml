@@ -37,5 +37,21 @@ tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 whoami = "1"
-tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 mouser-ipc = { path = "../../../crates/mouser-ipc" }
+# The app now runs the engine IN-PROCESS (no separate `mouserd`): it builds the
+# per-OS adapters and calls `mouser_engine::daemon::run_engine`. `mouser-core`
+# supplies the platform traits (`InputInjection`/`InputCapture`/`Clipboard`).
+mouser-engine = { path = "../../../crates/mouser-engine" }
+mouser-core = { path = "../../../crates/mouser-core" }
+
+# The in-process engine plugs the real per-OS adapters into the runtime, mirroring
+# crates/mouser-engine/Cargo.toml and crates/mouser-engine/src/bin/mouserd.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+platform-mac = { path = "../../../crates/platform-mac" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+platform-win = { path = "../../../crates/platform-win" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+platform-linux = { path = "../../../crates/platform-linux" }

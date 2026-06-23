@@ -2627,7 +2627,12 @@ dependencies = [
 name = "mouser-desktop"
 version = "0.0.0"
 dependencies = [
+ "mouser-core",
+ "mouser-engine",
  "mouser-ipc",
+ "platform-linux",
+ "platform-mac",
+ "platform-win",
  "serde",
  "serde_json",
  "tauri",

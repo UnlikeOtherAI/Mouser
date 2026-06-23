@@ -1,163 +1,198 @@
-//! The bundled `mouserd` engine the desktop app administers — so the user never starts a
-//! daemon by hand. The app resolves the binary, launches it, **supervises** it (relaunch
-//! if it exits), and stops it on quit. Discovery, trust, and the live connection all live
-//! in the engine; the UI reads its state over `mouser_ipc`.
+//! The Mouser engine, run **in-process** by the desktop app — so the user never starts a
+//! daemon by hand and there is no separate `mouserd` child to supervise. The app builds
+//! the host's per-OS capture/injection/clipboard adapters, opens the daemon store, and
+//! spawns [`mouser_engine::daemon::run_engine`] on the Tauri async runtime. Discovery,
+//! trust, and the live connection all live in the engine; the UI reads its state over
+//! `mouser_ipc` against the IPC server `run_engine` hosts on the well-known socket.
+//!
+//! Lifecycle is caller-owned: [`start`] spawns the engine task and stashes its
+//! `JoinHandle` plus an [`InputCapture`] handle in Tauri-managed state; [`shutdown`]
+//! aborts the task AND calls `capture.stop()` so any installed input hooks are released
+//! on quit (the no-stuck-keys path).
 
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
+use mouser_core::platform::InputCapture;
+use tauri::async_runtime::JoinHandle;
 use tauri::Manager;
 
 use crate::lock_recover;
 
-/// How often the supervisor checks the engine is reachable (and relaunches it if not).
-const SUPERVISE_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Windows process-creation flags: run the engine with no console window and detached
-/// from the app's console, so the bundled `mouserd` never flashes a terminal.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-#[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-
-/// Handle to the `mouserd` engine the app launches and supervises (spawn on launch,
-/// relaunch on crash, stop on quit). `None` when an engine was already running and we
-/// attached to it instead of spawning our own.
+/// Handle to the in-process engine task and its capture adapter, kept in Tauri-managed
+/// state. On quit [`shutdown`] aborts the task and calls `capture.stop()` to release input
+/// hooks. `None` when the engine could not be started (e.g. Linux `/dev/uinput` missing).
 #[derive(Default)]
-pub struct EngineProcess {
-    child: Mutex<Option<Child>>,
+pub struct EngineHandle {
+    inner: Mutex<Option<EngineRunning>>,
 }
 
-/// Resolve the bundled `mouserd` engine from the installed app resources, else fall back
-/// to a `mouserd` on `PATH` (dev runs).
-fn resolve_mouserd(app: &tauri::AppHandle) -> PathBuf {
-    if let Ok(dir) = app.path().resource_dir() {
-        let binaries = dir.join("binaries");
-        let platform = binaries.join(mouserd_exe_name());
-        if platform.exists() {
-            return platform;
+struct EngineRunning {
+    task: JoinHandle<()>,
+    capture: Arc<dyn InputCapture>,
+}
+
+/// Build the host's per-OS adapters, open the daemon store, and spawn the engine in-process
+/// on the Tauri async runtime. Mirrors the adapter construction in
+/// `crates/mouser-engine/src/bin/mouserd.rs`. The spawned task owns the store + adapter
+/// `Arc`s (so it is `'static`); a clone of the capture adapter is retained in state so
+/// [`shutdown`] can release input hooks on quit.
+///
+/// Engine startup failures are logged and skipped rather than fatal: the app stays alive in
+/// the tray and the UI degrades to the "engine not running" hint (the IPC socket simply
+/// never answers).
+pub fn start(app: &tauri::AppHandle) {
+    let store = match mouser_engine::daemon_store::DaemonStore::open_default() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("mouser-desktop: cannot open engine store: {e}; engine not started");
+            return;
         }
-        let extensionless = binaries.join("mouserd");
-        if extensionless.exists() {
-            return extensionless;
-        }
-    }
-    PathBuf::from(mouserd_exe_name())
-}
+    };
 
-fn mouserd_exe_name() -> &'static str {
-    if cfg!(windows) {
-        "mouserd.exe"
-    } else {
-        "mouserd"
-    }
-}
+    #[cfg(target_os = "macos")]
+    let adapters: Option<Adapters> = {
+        let injector = Arc::new(platform_mac::adapter::MacInjector::new());
+        let capture = Arc::new(platform_mac::adapter::MacCapture::new());
+        let clipboard = Arc::new(platform_mac::MacClipboard::new());
+        Some(Adapters {
+            injector,
+            capture,
+            clipboard,
+        })
+    };
 
-fn mouserd_launch_args() -> &'static [&'static str] {
-    // No explicit role on any platform: the daemon defaults to `auto` (advertise +
-    // browse, either side can control). Windows used to be pinned to `target` because
-    // becoming a source installed always-on low-level hooks that degraded local input;
-    // capture is now ownership-driven (passive edge-sensing while idle, suppressing
-    // hooks only while actively controlling), so Windows is a first-class controller.
-    &[]
-}
+    #[cfg(target_os = "windows")]
+    let adapters: Option<Adapters> = {
+        let injector = Arc::new(platform_win::WinInjector::new());
+        let capture = Arc::new(platform_win::WinCapture::new());
+        let clipboard = Arc::new(platform_win::WinClipboard::new());
+        Some(Adapters {
+            injector,
+            capture,
+            clipboard,
+        })
+    };
 
-/// Supervise the engine: keep a `mouserd` reachable over IPC, relaunching the bundled
-/// binary whenever it isn't (initial start, or after a crash). Runs until the app exits.
-/// Windows starts in explicit receive-only target mode, avoiding global capture hooks
-/// until the user explicitly connects.
-pub fn supervise_engine(app: &tauri::AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            // An engine already answers (our child, a prior app instance, or a user-run
-            // daemon) — nothing to do. Otherwise (re)launch the bundled engine.
-            if mouser_ipc::Client::connect().await.is_err() {
-                respawn_if_needed(&app);
+    #[cfg(target_os = "linux")]
+    let adapters: Option<Adapters> = {
+        // `UinputInjector::new()` opens /dev/uinput and can fail (permissions). Log + skip
+        // engine start rather than panicking — the app stays alive in the tray.
+        match platform_linux::UinputInjector::new() {
+            Ok(injector) => Some(Adapters {
+                injector: Arc::new(injector),
+                capture: Arc::new(platform_linux::LinuxCapture::new()),
+                clipboard: Arc::new(platform_linux::LinuxClipboard::new()),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "mouser-desktop: cannot open /dev/uinput ({e}); add the user to the \
+                     `input` group (or run as root) and relaunch. Engine not started."
+                );
+                None
             }
-            tokio::time::sleep(SUPERVISE_INTERVAL).await;
         }
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let adapters: Option<Adapters> = {
+        eprintln!(
+            "mouser-desktop: this host's platform adapters are not wired into the engine \
+             yet (macOS, Windows and Linux are supported). Engine not started."
+        );
+        None
+    };
+
+    let Some(adapters) = adapters else {
+        return;
+    };
+
+    // Retain a capture handle for the shutdown path (release hooks on quit), then move the
+    // OWNED store + adapter Arcs into the 'static task.
+    let capture_for_shutdown = Arc::clone(&adapters.capture) as Arc<dyn InputCapture>;
+    let Adapters {
+        injector,
+        capture,
+        clipboard,
+    } = adapters;
+
+    let task = tauri::async_runtime::spawn(async move {
+        if let Err(e) = mouser_engine::daemon::run_engine(
+            store,
+            "auto".to_string(),
+            injector,
+            capture,
+            clipboard,
+        )
+        .await
+        {
+            eprintln!("mouser-desktop: engine exited: {e}");
+        }
+    });
+
+    let state = app.state::<EngineHandle>();
+    *lock_recover(&state.inner) = Some(EngineRunning {
+        task,
+        capture: capture_for_shutdown,
     });
 }
 
-/// Spawn the bundled engine if our previously-launched child is absent or has exited.
-/// Never kills a child that is still running (it may just be slow to bind the IPC
-/// socket), so a healthy-but-starting daemon is not double-spawned.
-fn respawn_if_needed(app: &tauri::AppHandle) {
-    let state = app.state::<EngineProcess>();
-    {
-        let mut guard = lock_recover(&state.child);
-        if let Some(child) = guard.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => *guard = None, // exited (or unknown) → reap + respawn
-                Ok(None) => return,                    // still running → don't double-spawn
-            }
-        }
-    }
-    let path = resolve_mouserd(app);
-    let mut command = Command::new(&path);
-    for arg in mouserd_launch_args() {
-        command.arg(arg);
-    }
-    // The engine is a headless daemon; detach its stdio and (on Windows) suppress the
-    // console window so it never flashes a terminal when (re)launched. Its stderr (the
-    // daemon's own diagnostics: discovery, dials, trust checks, capture mode) is routed
-    // to a log file the Diagnostics view can read, instead of being discarded.
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
-    match engine_log_path(app).and_then(|p| open_log_file(&p)) {
-        Some(file) => {
-            command.stderr(Stdio::from(file));
-        }
-        None => {
-            command.stderr(Stdio::null());
-        }
-    }
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-    match command.spawn() {
-        Ok(child) => {
-            *lock_recover(&state.child) = Some(child);
-            eprintln!("mouser-desktop: launched engine {}", path.display());
-        }
-        Err(e) => eprintln!(
-            "mouser-desktop: failed to launch engine {}: {e}",
-            path.display()
-        ),
+/// Per-OS adapter bundle handed to the in-process engine. The concrete types differ per
+/// platform; the engine takes them as trait objects.
+struct Adapters {
+    #[cfg(target_os = "macos")]
+    injector: Arc<platform_mac::adapter::MacInjector>,
+    #[cfg(target_os = "macos")]
+    capture: Arc<platform_mac::adapter::MacCapture>,
+    #[cfg(target_os = "macos")]
+    clipboard: Arc<platform_mac::MacClipboard>,
+
+    #[cfg(target_os = "windows")]
+    injector: Arc<platform_win::WinInjector>,
+    #[cfg(target_os = "windows")]
+    capture: Arc<platform_win::WinCapture>,
+    #[cfg(target_os = "windows")]
+    clipboard: Arc<platform_win::WinClipboard>,
+
+    #[cfg(target_os = "linux")]
+    injector: Arc<platform_linux::UinputInjector>,
+    #[cfg(target_os = "linux")]
+    capture: Arc<platform_linux::LinuxCapture>,
+    #[cfg(target_os = "linux")]
+    clipboard: Arc<platform_linux::LinuxClipboard>,
+}
+
+/// Stop the in-process engine on app exit: abort the serve task AND call `capture.stop()`
+/// to release any installed input hooks. `capture.stop()` is the no-stuck-keys path — the
+/// serve loop's own `ctrl_c` arms never fire in a windowed app, so the abort alone would
+/// leave low-level hooks installed. Idempotent: a second call is a no-op.
+pub fn shutdown(app: &tauri::AppHandle) {
+    let state = app.state::<EngineHandle>();
+    let running = lock_recover(&state.inner).take();
+    if let Some(running) = running {
+        // Release input hooks first (no stuck keys), then abort the serve task. `stop()` is
+        // idempotent; we ignore its result since we're tearing down regardless.
+        let _ = running.capture.stop();
+        running.task.abort();
     }
 }
 
-/// Path to the file the bundled engine's stderr is routed to (the daemon's own
-/// diagnostics). `None` if the per-app log directory can't be resolved.
+/// Path to the engine log file. The in-process engine logs to the app's stderr now (the
+/// child-stderr -> file path is gone), so this file generally won't exist this phase and
+/// [`read_log_tail`] returns empty. Kept so the Diagnostics command still compiles.
+// TODO(P2): in-memory log ring buffer
 pub fn engine_log_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     let dir = app.path().app_log_dir().ok()?;
     Some(dir.join("mouserd.log"))
 }
 
-/// Open the engine log file for the daemon's stderr, creating the directory and
-/// truncating so each launch starts a fresh log. `None` on any I/O failure (then we
-/// fall back to discarding stderr — logging is best-effort, never fatal).
-fn open_log_file(path: &Path) -> Option<File> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .ok()
-}
-
-/// Read the tail (up to `max_bytes`) of the engine log. Returns an empty string when
-/// the log doesn't exist yet (engine not launched by us / just started).
+/// Read the tail (up to `max_bytes`) of the engine log. Returns an empty string when the
+/// log doesn't exist yet — which, with the in-process engine, is the normal case this phase
+/// (the engine logs to the app's stderr, not a file).
+// TODO(P2): in-memory log ring buffer
 pub fn read_log_tail(path: &Path, max_bytes: usize) -> Result<String, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -169,14 +204,4 @@ pub fn read_log_tail(path: &Path, max_bytes: usize) -> Result<String, String> {
     // workspace's `indexing_slicing` lint.
     let tail = bytes.get(start..).unwrap_or(&[]);
     Ok(String::from_utf8_lossy(tail).into_owned())
-}
-
-/// Stop the engine we launched (called on app exit) so we don't orphan the daemon.
-pub fn stop_engine(app: &tauri::AppHandle) {
-    let state = app.state::<EngineProcess>();
-    let child = lock_recover(&state.child).take();
-    if let Some(mut child) = child {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
