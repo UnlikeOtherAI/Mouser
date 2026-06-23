@@ -417,3 +417,69 @@ async fn send_control_cancel_safe_does_not_corrupt_next_frame() {
     client_conn.shutdown().await;
     server_conn.close();
 }
+
+/// `connect_interactive_any` must skip a dead candidate and connect on a live one — the
+/// failover the multi-address dialer exists for (a peer mDNS-resolved to a family it isn't
+/// listening on must still connect via its other address).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_interactive_any_fails_over_to_a_live_address() {
+    let server_id = DeviceIdentity::generate();
+    let client_id = DeviceIdentity::generate();
+    let server_device_id = server_id.device_id();
+    let client_device_id = client_id.device_id();
+
+    let server = InteractiveEndpoint::bind_server(
+        &server_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::Pinned(client_device_id),
+    )
+    .expect("bind server");
+    let server_addr = server.local_addr().expect("server addr");
+
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+
+    let accept = tokio::spawn(async move {
+        let conn = server.accept_interactive().await.expect("accept");
+        (server, conn)
+    });
+
+    // Dead candidate first (nothing listens on loopback:1), real server second. The dialer
+    // must try the dead one, fail, and connect on the second.
+    let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let conn = client
+        .connect_interactive_any(
+            &client_id,
+            &[dead, server_addr],
+            PinPolicy::Pinned(server_device_id),
+        )
+        .await
+        .expect("failover to the live address");
+    assert_eq!(conn.peer_device_id(), Some(server_device_id));
+
+    let (_server_endpoint, _server_conn) = accept.await.expect("accept task");
+}
+
+/// `connect_interactive_any` returns an error (not a hang) when every candidate is dead,
+/// and does so without waiting on the 20s idle timeout per address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_interactive_any_errors_when_all_addresses_dead() {
+    let client_id = DeviceIdentity::generate();
+    let peer_device_id = DeviceIdentity::generate().device_id();
+    let client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+
+    // A single dead candidate (nothing listens on loopback:1) is abandoned at the
+    // per-address timeout and surfaces an error rather than hanging on the 20s idle limit.
+    let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let result = client
+        .connect_interactive_any(&client_id, &[dead], PinPolicy::Pinned(peer_device_id))
+        .await;
+    assert!(result.is_err(), "a dead candidate must error, not connect");
+
+    // An empty candidate list is also an error, never a hang.
+    let empty = client
+        .connect_interactive_any(&client_id, &[], PinPolicy::Pinned(peer_device_id))
+        .await;
+    assert!(empty.is_err(), "no candidates must error");
+}

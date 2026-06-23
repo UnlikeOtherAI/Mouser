@@ -77,10 +77,11 @@ pub fn peer_bulk_socket_addr(advert: &PeerAdvert) -> Option<SocketAddr> {
 /// ALL dialable socket addresses for a peer's interactive endpoint, ordered
 /// most-reachable-first (routable IPv4, then routable IPv6), dropping bare link-local
 /// IPv6 (unreachable without a scope id — it only burns a dial timeout). Empty if the
-/// peer has no interactive port or no usable address. Feeds the happy-eyeballs dialer
-/// ([`mouser_net::InteractiveEndpoint::connect_interactive_any`]) so a peer that resolved
-/// to a family it isn't listening on (e.g. an IPv6-only mDNS resolution of an IPv4-only
-/// Windows peer) is recovered by trying the other address instead of timing out.
+/// peer has no interactive port or no usable address. Feeds the ordered multi-address
+/// dialer ([`mouser_net::InteractiveEndpoint::connect_interactive_any`], which tries each
+/// candidate in turn under a per-address timeout) so a peer that resolved to a family it
+/// isn't listening on (e.g. an IPv6-only mDNS resolution of an IPv4-only Windows peer) is
+/// recovered by trying the other address instead of timing out.
 pub fn peer_socket_addrs(advert: &PeerAdvert) -> Vec<SocketAddr> {
     if advert.iport == 0 {
         return Vec::new();
@@ -356,7 +357,7 @@ mod tests {
 
     #[test]
     fn peer_socket_addrs_returns_all_routable_ipv4_first() {
-        // The happy-eyeballs dialer must get EVERY routable address (so a wrong family is
+        // The multi-address dialer must get EVERY routable address (so a wrong family is
         // recovered by trying the other), ordered IPv4-first, with bare link-local IPv6
         // dropped (unreachable without a scope id — it would only burn a timeout).
         let id = DeviceIdentity::generate();
