@@ -24,10 +24,10 @@
 //! Unlike macOS (`NSPasteboard.changeCount`) and Windows
 //! (`GetClipboardSequenceNumber`), the Wayland data-control protocol exposes **no**
 //! monotonic change counter. [`LinuxClipboard::change_token`] therefore returns a
-//! content **hash** of the current `text/plain` representation: a poller compares
-//! successive tokens and treats any difference as "the clipboard changed" (spec
-//! §7.7). This catches the common text case; binary-only changes (e.g. an image
-//! copy with no text rep) are caught by the engine's per-format offer hashing.
+//! content **hash** over a stable ordered concatenation of every supported MIME
+//! representation that can be read (`text/plain`, HTML, RTF, PNG, URI list). A
+//! poller compares successive tokens and treats any difference as "the clipboard
+//! changed" (spec §7.7), including binary-only image/file changes.
 //!
 //! ## Build
 //! The Wayland backend is `#[cfg(target_os = "linux")]`; on other hosts only the
@@ -38,6 +38,15 @@
 #![allow(clippy::module_name_repetitions)]
 
 use mouser_core::platform::ClipFormat;
+
+#[cfg(any(test, target_os = "linux"))]
+const TOKEN_FORMATS: [ClipFormat; 5] = [
+    ClipFormat::Utf8Text,
+    ClipFormat::Html,
+    ClipFormat::Rtf,
+    ClipFormat::Png,
+    ClipFormat::UriList,
+];
 
 /// The MIME type a [`ClipFormat`] is carried as on the Wayland clipboard.
 ///
@@ -63,7 +72,7 @@ mod imp {
         get_contents, ClipboardType, Error as PasteError, MimeType as PasteMime, Seat,
     };
 
-    use super::mime_type;
+    use super::{change_token_from_reader, mime_type};
 
     /// `wl-clipboard-rs`-backed [`Clipboard`] over the regular Wayland clipboard.
     ///
@@ -82,16 +91,15 @@ mod imp {
 
         /// A content token for change detection (Wayland has no native counter).
         ///
-        /// Returns a 64-bit hash of the current `text/plain` clipboard contents, or
-        /// `0` when the clipboard is empty / has no text. A poller compares
-        /// successive tokens; any change means the clipboard changed (spec §7.7).
-        /// Binary-only changes are caught by the engine's per-format offer hashing.
+        /// Returns a 64-bit hash over every supported MIME representation that can
+        /// be read. A poller compares successive tokens; any change means the
+        /// clipboard changed (spec §7.7), including binary-only image/file changes.
         #[must_use]
         pub fn change_token(&self) -> u64 {
-            match read_mime(mime_type(ClipFormat::Utf8Text)) {
-                Ok(Some(bytes)) => fnv1a(&bytes),
-                _ => 0,
-            }
+            change_token_from_reader(|format| match read_mime(mime_type(format)) {
+                Ok(Some(bytes)) => Some(bytes),
+                _ => None,
+            })
         }
     }
 
@@ -132,19 +140,9 @@ mod imp {
         }
     }
 
-    /// FNV-1a 64-bit hash — a tiny, dependency-free content fingerprint for change
-    /// detection. Not cryptographic; the engine owns the SHA-256 offer hashing.
-    fn fnv1a(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
-    }
-
     #[cfg(test)]
     mod tests {
+        use super::super::fnv1a;
         use super::*;
 
         #[test]
@@ -224,6 +222,49 @@ impl std::fmt::Display for Unsupported {
 #[cfg(not(target_os = "linux"))]
 impl std::error::Error for Unsupported {}
 
+/// Build a stable token from the readable clipboard representations.
+#[cfg(any(test, target_os = "linux"))]
+fn change_token_from_reader<F>(mut read: F) -> u64
+where
+    F: FnMut(ClipFormat) -> Option<Vec<u8>>,
+{
+    let mut h = FNV_OFFSET;
+    for format in TOKEN_FORMATS {
+        fnv1a_update(&mut h, mime_type(format).as_bytes());
+        fnv1a_update(&mut h, &[0]);
+        if let Some(bytes) = read(format) {
+            fnv1a_update(&mut h, &[1]);
+            fnv1a_update(&mut h, &(bytes.len() as u64).to_le_bytes());
+            fnv1a_update(&mut h, &bytes);
+        } else {
+            fnv1a_update(&mut h, &[0]);
+        }
+    }
+    h
+}
+
+#[cfg(any(test, target_os = "linux"))]
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+#[cfg(any(test, target_os = "linux"))]
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a 64-bit hash — a tiny, dependency-free content fingerprint for change
+/// detection. Not cryptographic; the engine owns the SHA-256 offer hashing.
+#[cfg(all(test, target_os = "linux"))]
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = FNV_OFFSET;
+    fnv1a_update(&mut h, bytes);
+    h
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn fnv1a_update(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(FNV_PRIME);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +287,32 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), formats.len());
+    }
+
+    #[test]
+    fn change_token_includes_binary_only_representations() {
+        let text_only = change_token_from_reader(|format| {
+            matches!(format, ClipFormat::Utf8Text).then(|| b"same".to_vec())
+        });
+        let with_png = change_token_from_reader(|format| match format {
+            ClipFormat::Utf8Text => Some(b"same".to_vec()),
+            ClipFormat::Png => Some(vec![0x89, b'P', b'N', b'G']),
+            _ => None,
+        });
+        let png_only = change_token_from_reader(|format| {
+            matches!(format, ClipFormat::Png).then(|| vec![0x89, b'P', b'N', b'G'])
+        });
+
+        assert_ne!(text_only, with_png);
+        assert_ne!(text_only, png_only);
+        assert_eq!(
+            with_png,
+            change_token_from_reader(|format| match format {
+                ClipFormat::Utf8Text => Some(b"same".to_vec()),
+                ClipFormat::Png => Some(vec![0x89, b'P', b'N', b'G']),
+                _ => None,
+            })
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

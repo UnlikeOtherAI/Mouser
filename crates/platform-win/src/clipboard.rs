@@ -16,7 +16,8 @@
 //! | `UriList`    | `CF_HDROP` ↔ a `text/uri-list` of `file://` URIs       |
 //!
 //! `Utf8Text` is the one format the clipboard stores in a different encoding than
-//! the wire: Windows uses UTF-16LE (`CF_UNICODETEXT`), so we transcode both ways.
+//! the wire: Windows uses UTF-16LE (`CF_UNICODETEXT`) with CRLF line endings, so
+//! we transcode both ways while keeping the engine-facing form UTF-8/LF.
 //! `Html` is wrapped into / unwrapped from the CF_HTML description-header format
 //! ([`crate::cfhtml`]) so a round-trip with the raw-fragment mac/linux clipboards
 //! interoperates. `Rtf`/`Png` are opaque bytes carried verbatim. `UriList` bridges the wire
@@ -49,6 +50,10 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
 };
 use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+
+use crate::clipboard_text::{
+    cf_unicodetext_bytes_to_engine_utf8, engine_utf8_to_cf_unicodetext_bytes,
+};
 
 mod hdrop;
 
@@ -102,7 +107,7 @@ impl Clipboard for WinClipboard {
 
         let raw = read_hglobal_bytes(handle)?;
         let decoded = match format {
-            ClipFormat::Utf8Text => utf16le_bytes_to_utf8(&raw),
+            ClipFormat::Utf8Text => cf_unicodetext_bytes_to_engine_utf8(&raw),
             ClipFormat::UriList => hdrop::hdrop_bytes_to_uri_list(handle)?,
             // CF_HTML carries a description header around the fragment; strip it
             // so the wire/mac/linux raw-fragment representation is returned.
@@ -120,7 +125,7 @@ impl Clipboard for WinClipboard {
         let payload: Vec<u8> = match format {
             ClipFormat::Utf8Text => {
                 let s = std::str::from_utf8(data).map_err(|e| -> PlatformError { Box::new(e) })?;
-                utf8_to_utf16le_bytes(s)
+                engine_utf8_to_cf_unicodetext_bytes(s)
             }
             ClipFormat::UriList => hdrop::uri_list_to_hdrop_bytes(data)?,
             // Windows CF_HTML requires the description header (Version/StartHTML/
@@ -130,15 +135,17 @@ impl Clipboard for WinClipboard {
         };
 
         let _session = ClipboardSession::open()?;
+        let hglobal = alloc_global(&payload)?;
         // SAFETY: clipboard is open; `EmptyClipboard` takes ownership for this process,
         // a precondition for `SetClipboardData`.
-        unsafe { EmptyClipboard() }.map_err(boxed)?;
+        if let Err(e) = unsafe { EmptyClipboard() } {
+            // SAFETY: `hglobal` is our still-owned, unlocked allocation.
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
+            return Err(boxed(e));
+        }
 
-        let hglobal = alloc_global(&payload)?;
-        // SAFETY: clipboard is open and emptied; on success Windows takes ownership of
-        // `hglobal` (we must NOT free it). `HGLOBAL`→`HANDLE` is a pointer newtype cast.
-        match unsafe { SetClipboardData(fmt, Some(HANDLE(hglobal.0))) } {
-            Ok(_) => Ok(()),
+        match set_clipboard_data_immediate(fmt, hglobal) {
+            Ok(()) => Ok(()),
             Err(e) => {
                 // Ownership did not transfer; reclaim the block so it doesn't leak.
                 // SAFETY: `hglobal` is our still-owned, unlocked allocation.
@@ -184,15 +191,18 @@ fn register(name: &str) -> PlatformResult<u32> {
 
 /// RAII guard around `OpenClipboard`/`CloseClipboard`.
 ///
-/// Opening with a `None` owner associates the clipboard with the current task; the
-/// guard's `Drop` runs `CloseClipboard` even on an early `?` return, so the
-/// clipboard is never left open (which would lock every other app out of it).
+/// Opening with a `None` owner is intentional here because this adapter only uses
+/// immediate rendering: every `SetClipboardData` call passes an allocated
+/// `HGLOBAL`, never delayed-render `None`. A future delayed-render path must use a
+/// real owner window. The guard's `Drop` runs `CloseClipboard` even on an early `?`
+/// return, so the clipboard is never left open (which would lock every other app
+/// out of it).
 struct ClipboardSession;
 
 impl ClipboardSession {
     /// Open the clipboard for this task.
     fn open() -> PlatformResult<Self> {
-        // SAFETY: passing `None` is valid (associates with the current task). On
+        // SAFETY: passing `None` is valid for immediate-render clipboard writes. On
         // failure (another process holds it) we return an error and do not close.
         unsafe { OpenClipboard(None) }.map_err(boxed)?;
         Ok(Self)
@@ -271,31 +281,15 @@ fn alloc_global(bytes: &[u8]) -> PlatformResult<HGLOBAL> {
     Ok(hglobal)
 }
 
-/// Decode `CF_UNICODETEXT` clipboard bytes (UTF-16LE, possibly NUL-terminated) to
-/// UTF-8, stripping a trailing NUL. Lone surrogates become U+FFFD.
-fn utf16le_bytes_to_utf8(raw: &[u8]) -> Vec<u8> {
-    let units: Vec<u16> = raw
-        .chunks_exact(2)
-        // `chunks_exact(2)` only yields 2-byte slices; the slice pattern is
-        // infallible here but lets us read the pair without panicking indexes.
-        .filter_map(|c| match c {
-            [lo, hi] => Some(u16::from_le_bytes([*lo, *hi])),
-            _ => None,
-        })
-        .take_while(|&u| u != 0)
-        .collect();
-    String::from_utf16_lossy(&units).into_bytes()
-}
-
-/// Encode a UTF-8 string as `CF_UNICODETEXT` bytes: UTF-16LE with a trailing NUL,
-/// which Windows clipboard consumers expect.
-fn utf8_to_utf16le_bytes(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len() * 2 + 2);
-    for u in s.encode_utf16() {
-        out.extend_from_slice(&u.to_le_bytes());
-    }
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out
+/// Immediate-render `SetClipboardData`.
+///
+/// This helper intentionally takes a concrete `HGLOBAL` and always passes
+/// `Some(handle)` so the `OpenClipboard(None)` session above cannot accidentally be
+/// reused for delayed rendering. Delayed rendering requires a real owner window.
+fn set_clipboard_data_immediate(format: u32, hglobal: HGLOBAL) -> Result<(), windows::core::Error> {
+    // SAFETY: clipboard is open and emptied; on success Windows takes ownership of
+    // `hglobal` (we must NOT free it). `HGLOBAL` -> `HANDLE` is a pointer newtype cast.
+    unsafe { SetClipboardData(format, Some(HANDLE(hglobal.0))) }.map(|_| ())
 }
 
 /// Errors raised by the Windows clipboard adapter that aren't a raw `windows::Error`.
@@ -320,33 +314,3 @@ impl std::fmt::Display for ClipboardError {
 }
 
 impl std::error::Error for ClipboardError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn utf16_roundtrip_strips_nul() {
-        let s = "héllo — ✓\nline2";
-        let wide = utf8_to_utf16le_bytes(s);
-        // Trailing NUL (2 bytes) present.
-        assert_eq!(&wide[wide.len() - 2..], &[0, 0]);
-        let back = utf16le_bytes_to_utf8(&wide);
-        assert_eq!(back, s.as_bytes());
-    }
-
-    #[test]
-    fn utf16_decode_handles_unterminated() {
-        // No trailing NUL: still decodes fully.
-        let s = "abc";
-        let wide: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        assert_eq!(utf16le_bytes_to_utf8(&wide), s.as_bytes());
-    }
-
-    #[test]
-    fn utf16_decode_ignores_odd_trailing_byte() {
-        // An odd byte count can't form a full UTF-16 unit; it's dropped, not panicked.
-        let bytes = [0x41, 0x00, 0x42]; // "A" + stray 0x42
-        assert_eq!(utf16le_bytes_to_utf8(&bytes), b"A");
-    }
-}
