@@ -50,6 +50,7 @@ pub use keymap::{hid_usage_to_scancode, hid_usage_to_vk, supported_hid_usages, S
 // always compiled so the CF_HTML round-trip is unit-tested on every host even
 // though the clipboard adapter that uses it is Windows-only.
 mod cfhtml;
+mod clipboard_text;
 
 #[cfg(target_os = "windows")]
 pub mod adapter;
