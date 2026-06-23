@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import {
   faSpinner,
@@ -26,6 +26,7 @@ export function DevicesSection(): React.JSX.Element {
     connectingPeerId,
     connectFailure,
     dismissConnectFailure,
+    cancelConnect,
     disconnectPeer,
     trustPeer,
     approvePairing,
@@ -125,6 +126,7 @@ export function DevicesSection(): React.JSX.Element {
             }
             busy={busyPeerId === peer.id}
             onConnect={() => void runAction(peer.id, () => connectPeer(peer.id))}
+            onCancel={() => void cancelConnect()}
             onDisconnect={() => void runAction(peer.id, disconnectPeer)}
             onPair={() => void runAction(peer.id, () => trustPeer(peer.id))}
             localId={localId}
@@ -169,6 +171,7 @@ interface PeerRowProps {
   connecting: boolean;
   busy: boolean;
   onConnect: () => void;
+  onCancel: () => void;
   onDisconnect: () => void;
   onPair: () => void;
   localId: string | null;
@@ -182,6 +185,7 @@ function PeerRow({
   connecting,
   busy,
   onConnect,
+  onCancel,
   onDisconnect,
   onPair,
   localId,
@@ -189,7 +193,7 @@ function PeerRow({
   const status = connected
     ? { label: "Connected", dot: "bg-emerald-400", text: "text-emerald-300" }
     : connecting
-      ? { label: "Connecting", dot: "bg-amber-400", text: "text-amber-300" }
+      ? { label: "Connecting…", dot: "bg-amber-400", text: "text-amber-300" }
       : peer.trusted
         ? { label: "Trusted", dot: "bg-sky-400", text: "text-sky-300" }
         : { label: "Not paired", dot: "bg-slate-500", text: "text-muted" };
@@ -216,7 +220,12 @@ function PeerRow({
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <span className="flex items-center gap-2">
+          {/* Live region so screen readers hear connection state changes. */}
+          <span
+            className="flex items-center gap-2"
+            role="status"
+            aria-live="polite"
+          >
             <span
               aria-hidden="true"
               className={cx("h-2.5 w-2.5 rounded-full", status.dot)}
@@ -236,25 +245,27 @@ function PeerRow({
             </button>
           ) : peer.trusted ? (
             dialable ? (
-              <button
-                type="button"
-                disabled={busy || connecting}
-                onClick={onConnect}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/50 px-3 py-1 text-xs font-medium text-sky-200 hover:bg-sky-500/10 disabled:opacity-60"
-              >
-                {connecting ? (
-                  <>
-                    <FontAwesomeIcon
-                      icon={faSpinner}
-                      spin
-                      aria-hidden="true"
-                    />
-                    Connecting…
-                  </>
-                ) : (
-                  "Connect"
-                )}
-              </button>
+              connecting ? (
+                // While dialing, the action becomes Cancel so the user is never locked
+                // watching the spinner until the timeout fires.
+                <button
+                  type="button"
+                  onClick={onCancel}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-fg hover:bg-ink-line"
+                >
+                  <FontAwesomeIcon icon={faSpinner} spin aria-hidden="true" />
+                  Cancel
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={onConnect}
+                  className="rounded-lg border border-sky-500/50 px-3 py-1 text-xs font-medium text-sky-200 hover:bg-sky-500/10 disabled:opacity-60"
+                >
+                  Connect
+                </button>
+              )
             ) : (
               <span className="text-xs font-medium text-muted">Controller</span>
             )
@@ -305,6 +316,17 @@ function ConnectFailureModal({
   onRetry,
   onDismiss,
 }: ConnectFailureModalProps): React.JSX.Element {
+  const retryRef = useRef<HTMLButtonElement>(null);
+  // Move focus into the dialog on open and close on Escape — a `role="dialog"` that
+  // can't be dismissed by keyboard / strands focus is an a11y violation.
+  useEffect(() => {
+    retryRef.current?.focus();
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") onDismiss();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onDismiss]);
   return (
     <div
       role="dialog"
@@ -312,10 +334,11 @@ function ConnectFailureModal({
       aria-labelledby="connect-failure-title"
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
     >
-      {/* Backdrop is a real button so it's keyboard-accessible (click/Enter to close). */}
+      {/* Backdrop closes on click; kept out of the tab order (Escape handles keyboard). */}
       <button
         type="button"
-        aria-label="Dismiss"
+        aria-hidden="true"
+        tabIndex={-1}
         onClick={onDismiss}
         className="absolute inset-0 bg-black/50"
       />
@@ -343,6 +366,7 @@ function ConnectFailureModal({
             Dismiss
           </button>
           <button
+            ref={retryRef}
             type="button"
             onClick={onRetry}
             className="rounded-lg border border-sky-500/50 bg-sky-500/20 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-500/30"
