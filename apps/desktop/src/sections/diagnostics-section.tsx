@@ -17,10 +17,23 @@ async function tauriInvoke(): Promise<
   }
 }
 
+/** Human label for a remediation action id (see the engine's `HealthItemDto`). */
+function remediationLabel(action: string): string {
+  switch (action) {
+    case "open_network_settings":
+      return "Open network settings";
+    case "check_firewall":
+      return "Open firewall settings";
+    default:
+      return "Fix";
+  }
+}
+
 /** Live diagnostics: this device's pairing id + discovered peers, the in-app action
  * log, and the engine daemon's own log — so connect/pair problems are visible. */
 export function DiagnosticsSection(): React.JSX.Element {
-  const { localId, peers, connection, engineRunning } = useWorkspace();
+  const { localId, peers, connection, engineRunning, diagnostics, runRemediation } =
+    useWorkspace();
   const actionLog = useDebugLog();
   const [engineLog, setEngineLog] = useState<string>("");
   const [engineLogError, setEngineLogError] = useState<string | null>(null);
@@ -48,6 +61,60 @@ export function DiagnosticsSection(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
+      <SectionCard title="Connectivity health">
+        {diagnostics.length === 0 ? (
+          <p className="px-1 text-xs text-emerald-300">
+            All clear — no connectivity problems detected.
+          </p>
+        ) : (
+          <ul className="space-y-2">
+            {diagnostics.map((item) => {
+              const remediation = item.remediation;
+              const tone =
+                item.severity === "error"
+                  ? "border-rose-500/40 bg-rose-500/5"
+                  : item.severity === "warning"
+                    ? "border-amber-500/40 bg-amber-500/5"
+                    : "border-ink-line bg-ink";
+              const dot =
+                item.severity === "error"
+                  ? "bg-rose-400"
+                  : item.severity === "warning"
+                    ? "bg-amber-400"
+                    : "bg-sky-400";
+              return (
+                <li
+                  key={item.code}
+                  className={cx("rounded-lg border px-3 py-2 text-xs", tone)}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="flex items-center gap-2 font-semibold text-fg">
+                        <span
+                          aria-hidden="true"
+                          className={cx("h-2 w-2 rounded-full", dot)}
+                        />
+                        {item.title}
+                      </p>
+                      <p className="text-muted">{item.detail}</p>
+                    </div>
+                    {remediation ? (
+                      <button
+                        type="button"
+                        onClick={() => void runRemediation(remediation)}
+                        className="shrink-0 rounded-lg border border-sky-500/50 px-3 py-1 text-xs font-medium text-sky-200 hover:bg-sky-500/10"
+                      >
+                        {remediationLabel(remediation)}
+                      </button>
+                    ) : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </SectionCard>
+
       <SectionCard title="This device">
         <div className="space-y-2 px-1 py-1 text-xs">
           <p className="text-muted">

@@ -26,7 +26,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use mouser_ipc::{Client, Command, SettingsDto, Snapshot};
+use mouser_ipc::{Client, Command, HealthItemDto, SettingsDto, Snapshot};
 use serde::Serialize;
 use tauri::{
     menu::MenuBuilder,
@@ -92,6 +92,8 @@ struct EngineSnapshot {
     pairing: Option<EnginePairing>,
     /// Daemon-owned settings (input/clipboard/security) the UI reads + edits.
     settings: SettingsDto,
+    /// Connectivity/permission health the engine detected (empty = healthy).
+    diagnostics: Vec<HealthItemDto>,
 }
 
 /// A pending inbound pairing request (mirrors [`mouser_ipc::PairingDto`]).
@@ -146,6 +148,7 @@ impl EngineSnapshot {
             },
             pairing: None,
             settings: SettingsDto::default(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -179,6 +182,7 @@ impl EngineSnapshot {
                 name: p.name,
             }),
             settings: snapshot.settings,
+            diagnostics: snapshot.diagnostics,
         }
     }
 }
@@ -323,6 +327,56 @@ async fn deny_pairing(peer_id: String) -> Result<(), String> {
 #[tauri::command]
 async fn set_settings(settings: SettingsDto) -> Result<(), String> {
     send_command(Command::UpdateSettings { settings }).await
+}
+
+/// Apply a connectivity remediation flagged by the engine's diagnostics: open the OS
+/// settings pane where the user can fix it (e.g. Network Connections to disable a dead
+/// adapter, or the firewall). Mapped per-OS; an unknown action is a no-op error.
+#[tauri::command]
+fn run_remediation(action: String) -> Result<(), String> {
+    let (program, args) = match action.as_str() {
+        "open_network_settings" => network_settings_command(),
+        "check_firewall" => firewall_settings_command(),
+        other => return Err(format!("unknown remediation action: {other}")),
+    };
+    std::process::Command::new(program)
+        .args(&args)
+        .spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("could not open settings for {action}: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn network_settings_command() -> (&'static str, Vec<&'static str>) {
+    // Network Connections (ncpa.cpl) — where a dead/disconnected adapter is disabled.
+    ("control", vec!["ncpa.cpl"])
+}
+#[cfg(target_os = "windows")]
+fn firewall_settings_command() -> (&'static str, Vec<&'static str>) {
+    ("control", vec!["firewall.cpl"])
+}
+#[cfg(target_os = "macos")]
+fn network_settings_command() -> (&'static str, Vec<&'static str>) {
+    (
+        "open",
+        vec!["x-apple.systempreferences:com.apple.Network-Settings.extension"],
+    )
+}
+#[cfg(target_os = "macos")]
+fn firewall_settings_command() -> (&'static str, Vec<&'static str>) {
+    (
+        "open",
+        vec!["x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"],
+    )
+}
+#[cfg(target_os = "linux")]
+fn network_settings_command() -> (&'static str, Vec<&'static str>) {
+    // Best-effort: the exact pane varies by desktop environment.
+    ("xdg-open", vec!["settings:///network"])
+}
+#[cfg(target_os = "linux")]
+fn firewall_settings_command() -> (&'static str, Vec<&'static str>) {
+    ("xdg-open", vec!["settings:///network"])
 }
 
 /// Open a short-lived IPC client, fetch one snapshot, and close. Commands are rare and
@@ -511,6 +565,7 @@ pub fn run() {
             approve_pairing,
             deny_pairing,
             set_settings,
+            run_remediation,
             set_tray_icon_visible
         ])
         .build(tauri::generate_context!())

@@ -20,8 +20,8 @@ pub mod server;
 pub use client::Client;
 pub use codec::{read_message, write_message, IpcError, MAX_FRAME};
 pub use dto::{
-    Command, ConnectionDto, ConnectionStateDto, DeviceDto, PairingDto, PeerDto, ServerMessage,
-    SettingsDto, Snapshot,
+    Command, ConnectionDto, ConnectionStateDto, DeviceDto, HealthItemDto, HealthSeverity,
+    PairingDto, PeerDto, ServerMessage, SettingsDto, Snapshot,
 };
 pub use path::{default_socket_path, SOCKET_FILE};
 pub use server::{Publisher, Server};
@@ -53,6 +53,7 @@ mod loopback_tests {
             connection: ConnectionDto::default(),
             pairing: None,
             settings: SettingsDto::default(),
+            diagnostics: Vec::new(),
         }
     }
 

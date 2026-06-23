@@ -5,11 +5,12 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use mouser_core::DeviceId;
 use mouser_ipc::{
-    Command, ConnectionDto, ConnectionStateDto, DeviceDto, PairingDto, PeerDto, Publisher, Server,
-    SettingsDto, Snapshot,
+    Command, ConnectionDto, ConnectionStateDto, DeviceDto, HealthItemDto, HealthSeverity,
+    PairingDto, PeerDto, Publisher, Server, SettingsDto, Snapshot,
 };
 use tokio::sync::mpsc;
 
@@ -45,6 +46,9 @@ struct Shared {
     /// Daemon-owned, persisted settings, surfaced in every snapshot and updated via
     /// [`Command::UpdateSettings`] (the single source of truth for UI + MCP).
     settings: Mutex<SettingsDto>,
+    /// When the bridge started, for time-based health checks (e.g. only warn about
+    /// finding no peers after a startup grace window, to avoid flapping).
+    started: Instant,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -85,6 +89,7 @@ impl IpcBridge {
             connection: Mutex::new(ConnectionDto::default()),
             pairing: Mutex::new(None),
             settings: Mutex::new(settings),
+            started: Instant::now(),
         });
 
         let server = Server::bind(build_snapshot(&shared))
@@ -245,13 +250,65 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
         })
         .collect();
     peers.sort_by(|a, b| a.id.cmp(&b.id));
+    let diagnostics = build_diagnostics(shared, &peers);
     Snapshot {
         local: shared.local.clone(),
         peers,
         connection: lock(&shared.connection).clone(),
         pairing: lock(&shared.pairing).clone(),
         settings: lock(&shared.settings).clone(),
+        diagnostics,
     }
+}
+
+/// How long discovery may find nothing before surfacing the "advertising but no peers"
+/// hint — long enough not to flap during the normal startup browse.
+const ZERO_PEERS_GRACE: Duration = Duration::from_secs(12);
+
+/// Derive connectivity health items (spec §9) from the current engine state. These are
+/// the platform-agnostic checks; richer per-OS probes (firewall rule present, OS
+/// permissions, dead-adapter egress) will append further items via the platform layer.
+/// `peers` is the already-built, self-filtered peer list.
+fn build_diagnostics(shared: &Shared, peers: &[PeerDto]) -> Vec<HealthItemDto> {
+    let mut items = Vec::new();
+
+    // Is there a usable local network address? `local_ipv4()` returns the source address
+    // of the default route; `None`, an unspecified, or a link-local 169.254.x value means
+    // the host has no real network (DHCP failed / link down), so it can neither reach the
+    // LAN nor be reached. This is the most fundamental discovery blocker.
+    let local_ok = match discovery::local_ipv4() {
+        Some(IpAddr::V4(v4)) => !v4.is_link_local() && !v4.is_unspecified(),
+        Some(IpAddr::V6(_)) => true,
+        None => false,
+    };
+    if !local_ok {
+        items.push(HealthItemDto {
+            code: "no_network_address".to_string(),
+            severity: HealthSeverity::Error,
+            title: "No network connection".to_string(),
+            detail: "This computer doesn't have a usable network address — it isn't \
+                getting an IP from the router. Connect to Wi-Fi or Ethernet so Mouser can \
+                find your other devices."
+                .to_string(),
+            remediation: Some("open_network_settings".to_string()),
+        });
+    } else if peers.is_empty() && shared.started.elapsed() > ZERO_PEERS_GRACE {
+        // On a network, but discovery has turned up nothing for a while — usually a
+        // firewall blocking inbound, or no other device is advertising. Replaces the
+        // silent "no devices found" with an actionable hint.
+        items.push(HealthItemDto {
+            code: "advertising_zero_peers".to_string(),
+            severity: HealthSeverity::Warning,
+            title: "No other devices found".to_string(),
+            detail: "Mouser is advertising on this network but hasn't discovered any \
+                other devices. Make sure another device is running Mouser on the same \
+                network, and that a firewall isn't blocking it."
+                .to_string(),
+            remediation: Some("check_firewall".to_string()),
+        });
+    }
+
+    items
 }
 
 /// Republish a fresh snapshot whenever the shared discovery registry changes, so

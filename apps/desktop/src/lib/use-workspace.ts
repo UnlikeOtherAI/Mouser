@@ -6,6 +6,7 @@ import {
   type EngineConnection,
   type EngineConnectionState,
   type EngineSettings,
+  type HealthItem,
   type OsKind,
   type Peer,
 } from "./types";
@@ -64,6 +65,7 @@ interface RawEngineSnapshot {
   connection: RawEngineConnection;
   pairing: RawEnginePairing | null;
   settings: EngineSettings;
+  diagnostics: HealthItem[];
 }
 
 /** A pending inbound pairing request awaiting the user's Approve/Deny. */
@@ -184,6 +186,10 @@ export interface Workspace {
   settings: EngineSettings;
   /** Update one or more settings (merged over current) — persisted by the daemon. */
   updateSettings: (patch: Partial<EngineSettings>) => Promise<void>;
+  /** Connectivity/permission health the engine detected (empty = healthy). */
+  diagnostics: HealthItem[];
+  /** Trigger a remediation action (e.g. open the relevant OS settings pane). */
+  runRemediation: (action: string) => Promise<void>;
 }
 
 async function tauriInvoke(): Promise<
@@ -213,6 +219,7 @@ export function useWorkspace(): Workspace {
   const [engineRunning, setEngineRunning] = useState(false);
   const [pairing, setPairing] = useState<Pairing | null>(null);
   const [settings, setSettings] = useState<EngineSettings>(DEFAULT_ENGINE_SETTINGS);
+  const [diagnostics, setDiagnostics] = useState<HealthItem[]>([]);
   const [loading, setLoading] = useState(true);
   // Last logged engine/connection signatures, so the poll logs transitions only.
   const lastRunning = useRef<boolean | null>(null);
@@ -287,6 +294,7 @@ export function useWorkspace(): Workspace {
           if (Date.now() - settingsEditedAt.current > 2500) {
             setSettings(raw.settings);
           }
+          setDiagnostics(raw.diagnostics ?? []);
         } catch {
           // Transient invoke failure — keep the last snapshot.
         }
@@ -372,6 +380,18 @@ export function useWorkspace(): Workspace {
     [settings],
   );
 
+  const runRemediation = useCallback(async (action: string): Promise<void> => {
+    const invoke = await tauriInvoke();
+    if (invoke === null) return; // browser dev — nothing to open
+    logDebug("info", `remediation requested: ${action}`);
+    try {
+      await invoke("run_remediation", { action });
+    } catch (e) {
+      logDebug("error", `remediation "${action}" failed: ${errMessage(e)}`);
+      throw e;
+    }
+  }, []);
+
   return {
     devices,
     peers,
@@ -387,5 +407,7 @@ export function useWorkspace(): Workspace {
     denyPairing,
     settings,
     updateSettings,
+    diagnostics,
+    runRemediation,
   };
 }

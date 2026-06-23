@@ -72,6 +72,24 @@ export interface EngineConnection {
   error: string | null;
 }
 
+/** Severity of a connectivity/permission health item (mirrors Rust `HealthSeverity`). */
+export type HealthSeverity = "info" | "warning" | "error";
+
+/**
+ * One connectivity/permission health finding the engine detected, mirroring
+ * `mouser_ipc::HealthItemDto`. The UI surfaces these (with an optional one-click
+ * remediation) instead of a silent "no devices found".
+ */
+export interface HealthItem {
+  /** Stable machine code, e.g. "advertising_zero_peers" — the UI keys off this. */
+  code: string;
+  severity: HealthSeverity;
+  title: string;
+  detail: string;
+  /** Optional remediation action id the UI can trigger (null = nothing to auto-fix). */
+  remediation: string | null;
+}
+
 /** Edge transfer behaviour (mirrors `SettingsDto.edge_behavior`). */
 export type EdgeBehavior = "instant" | "delayed" | "locked";
 

@@ -110,6 +110,58 @@ pub struct Snapshot {
     /// server both read these here and write them via [`Command::UpdateSettings`].
     #[serde(default)]
     pub settings: SettingsDto,
+    /// Connectivity/permission health the daemon detected (empty = healthy). Surfaced in
+    /// the UI and over MCP so problems (discovery leaving via a dead adapter, a firewall
+    /// blocking inbound, advertising-but-no-peers, a missing OS permission) are explained
+    /// with an optional one-click fix, instead of a silent "no devices found".
+    #[serde(default)]
+    pub diagnostics: Vec<HealthItemDto>,
+}
+
+/// Severity of a [`HealthItemDto`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthSeverity {
+    /// Informational — discovery works, but something is worth noting.
+    #[default]
+    Info,
+    /// Likely degrades discovery/connection, but not necessarily fatal.
+    Warning,
+    /// Prevents discovery/connection until resolved.
+    Error,
+}
+
+impl HealthSeverity {
+    /// The lowercase wire/UI label (`"info" | "warning" | "error"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HealthSeverity::Info => "info",
+            HealthSeverity::Warning => "warning",
+            HealthSeverity::Error => "error",
+        }
+    }
+}
+
+/// One connectivity/permission health finding the daemon detected (spec §9). Surfaced in
+/// the [`Snapshot`] so the UI and the MCP server can explain *why* discovery/connection
+/// is failing and offer a one-click fix. Forward compatible: optional fields default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthItemDto {
+    /// Stable machine code, e.g. `"advertising_zero_peers"` or `"mdns_dead_egress"` —
+    /// the UI/MCP key off this, the human text may change.
+    pub code: String,
+    /// How serious it is.
+    #[serde(default)]
+    pub severity: HealthSeverity,
+    /// Short human-readable title.
+    pub title: String,
+    /// Concrete detail, including the offending value (adapter name, address, …) so the
+    /// explanation is specific.
+    pub detail: String,
+    /// Optional remediation action id the UI/MCP can trigger (e.g.
+    /// `"open_network_settings"`, `"add_firewall_rule"`). `None` = nothing to auto-fix.
+    #[serde(default)]
+    pub remediation: Option<String>,
 }
 
 /// An inbound pairing request from an untrusted peer that dialed this machine: the peer's
