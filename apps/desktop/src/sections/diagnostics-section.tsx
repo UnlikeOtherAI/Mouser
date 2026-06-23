@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { SectionCard } from "../components/section-card";
-import { useWorkspace } from "../lib/use-workspace";
+import { useWorkspace } from "../lib/workspace-context";
 import { clearDebugLog, useDebugLog } from "../lib/debug-log";
 import { cx } from "../lib/cx";
 

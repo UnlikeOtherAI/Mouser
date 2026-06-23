@@ -1,7 +1,7 @@
 import { SectionCard } from "../components/section-card";
 import { SettingRow } from "../components/setting-row";
 import { Toggle } from "../components/toggle";
-import { useWorkspace } from "../lib/use-workspace";
+import { useWorkspace } from "../lib/workspace-context";
 
 /** Trust & permission preferences — daemon-owned, edited over IPC. */
 export function SecuritySection(): React.JSX.Element {
