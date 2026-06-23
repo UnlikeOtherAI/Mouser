@@ -94,14 +94,17 @@ pub(super) async fn redial_until_reconnected(
             }
         }
 
-        let addr = match wait_for_peer_addr(registry, &peer_id, bridge).await {
-            ResolveEnd::Addr(addr) => addr,
+        let addrs = match wait_for_peer_addr(registry, &peer_id, bridge).await {
+            ResolveEnd::Addrs(addrs) => addrs,
             ResolveEnd::Disconnected => return ReconnectEnd::Disconnected,
             ResolveEnd::Shutdown => return ReconnectEnd::Shutdown,
         };
-        eprintln!("mouserd: redialing {peer_text} at {addr}");
+        eprintln!(
+            "mouserd: redialing {peer_text} ({} candidate address(es))",
+            addrs.len()
+        );
         match endpoint
-            .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
+            .connect_interactive_any(me, &addrs, PinPolicy::Pinned(peer_id))
             .await
         {
             Ok(conn) => return ReconnectEnd::Reconnected(Box::new(conn)),
@@ -126,7 +129,7 @@ pub(super) async fn redial_until_reconnected(
 }
 
 enum ResolveEnd {
-    Addr(SocketAddr),
+    Addrs(Vec<SocketAddr>),
     Disconnected,
     Shutdown,
 }
@@ -138,11 +141,12 @@ async fn wait_for_peer_addr(
 ) -> ResolveEnd {
     let mut changes = registry.subscribe();
     loop {
-        if let Some(addr) = registry
+        let addrs = registry
             .find(peer_id)
-            .and_then(|p| discovery::peer_socket_addr(&p))
-        {
-            return ResolveEnd::Addr(addr);
+            .map(|p| discovery::peer_socket_addrs(&p))
+            .unwrap_or_default();
+        if !addrs.is_empty() {
+            return ResolveEnd::Addrs(addrs);
         }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return ResolveEnd::Shutdown,

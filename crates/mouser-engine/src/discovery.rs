@@ -74,6 +74,40 @@ pub fn peer_bulk_socket_addr(advert: &PeerAdvert) -> Option<SocketAddr> {
     best_dialable_ip(&advert.addrs).map(|ip| SocketAddr::new(ip, advert.bport))
 }
 
+/// ALL dialable socket addresses for a peer's interactive endpoint, ordered
+/// most-reachable-first (routable IPv4, then routable IPv6), dropping bare link-local
+/// IPv6 (unreachable without a scope id — it only burns a dial timeout). Empty if the
+/// peer has no interactive port or no usable address. Feeds the happy-eyeballs dialer
+/// ([`mouser_net::InteractiveEndpoint::connect_interactive_any`]) so a peer that resolved
+/// to a family it isn't listening on (e.g. an IPv6-only mDNS resolution of an IPv4-only
+/// Windows peer) is recovered by trying the other address instead of timing out.
+pub fn peer_socket_addrs(advert: &PeerAdvert) -> Vec<SocketAddr> {
+    if advert.iport == 0 {
+        return Vec::new();
+    }
+    ordered_dialable_ips(&advert.addrs)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, advert.iport))
+        .collect()
+}
+
+/// `addrs` ordered for dialing: routable IPv4 first (most reliable on a LAN), then
+/// routable IPv6; loopback / unspecified / bare link-local IPv6 are dropped.
+fn ordered_dialable_ips(addrs: &[IpAddr]) -> Vec<IpAddr> {
+    let mut ordered: Vec<IpAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|ip| matches!(ip, IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()))
+        .collect();
+    ordered.extend(
+        addrs
+            .iter()
+            .copied()
+            .filter(|ip| matches!(ip, IpAddr::V6(v6) if !v6.is_loopback() && !is_ipv6_link_local(v6) && !v6.is_unspecified())),
+    );
+    ordered
+}
+
 /// Choose which advertised IP to dial. A peer commonly advertises several addresses at
 /// once — an IPv4, a global IPv6, and a link-local IPv6 — and the order is not
 /// meaningful. A bare link-local `fe80::/10` is NOT reachable from another host without
@@ -309,6 +343,30 @@ mod tests {
             peer_socket_addr(&merged),
             Some(SocketAddr::from(([192, 168, 1, 203], 60040))),
         );
+    }
+
+    #[test]
+    fn peer_socket_addrs_returns_all_routable_ipv4_first() {
+        // The happy-eyeballs dialer must get EVERY routable address (so a wrong family is
+        // recovered by trying the other), ordered IPv4-first, with bare link-local IPv6
+        // dropped (unreachable without a scope id — it would only burn a timeout).
+        let id = DeviceIdentity::generate();
+        let mut advert = local_advert(&id, "MINIS", 60040, 0);
+        advert.addrs = vec![
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), // link-local → dropped
+            IpAddr::V6(Ipv6Addr::new(0x2a00, 0, 0, 0, 0, 0, 0, 1)), // routable v6
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 203)),            // routable v4
+        ];
+        assert_eq!(
+            peer_socket_addrs(&advert),
+            vec![
+                SocketAddr::from(([192, 168, 1, 203], 60040)),
+                SocketAddr::from((Ipv6Addr::new(0x2a00, 0, 0, 0, 0, 0, 0, 1), 60040)),
+            ],
+        );
+        // No interactive port → nothing dialable.
+        advert.iport = 0;
+        assert!(peer_socket_addrs(&advert).is_empty());
     }
 
     #[test]

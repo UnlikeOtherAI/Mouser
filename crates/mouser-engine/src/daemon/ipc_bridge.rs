@@ -3,7 +3,6 @@
 //! registry change, plus the channels the serve loop uses to learn about UI
 //! `Connect`/`Disconnect` commands and to report connection state.
 
-use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -32,7 +31,6 @@ const OS_KIND: &str = if cfg!(target_os = "macos") {
 /// engine dials it directly; otherwise the engine resolves the id from its registry).
 pub(super) struct ConnectRequest {
     pub peer_id: DeviceId,
-    pub addr: Option<SocketAddr>,
 }
 
 /// A UI `SendFiles` request resolved to the currently active peer.
@@ -326,12 +324,8 @@ async fn command_loop(
 ) {
     loop {
         match server.recv_command().await {
-            Some(Command::Connect {
-                peer_id,
-                host,
-                port,
-            }) => match discovery::decode_device_id(&peer_id) {
-                Some(id) => match connect_request(&shared, id, host, port) {
+            Some(Command::Connect { peer_id }) => match discovery::decode_device_id(&peer_id) {
+                Some(id) => match connect_request(&shared, id) {
                     Ok(request) => {
                         let _ = connect_tx.send(request);
                     }
@@ -419,43 +413,18 @@ fn file_send_request(shared: &Shared, paths: Vec<String>) -> Result<FileSendRequ
     })
 }
 
-/// Pair an optional desktop-supplied host + port into a dialable [`SocketAddr`]. Returns
-/// `None` (engine resolves the id from its own registry) unless both are present and the
-/// host parses as an IP.
-fn connect_addr(host: Option<String>, port: Option<u16>) -> Option<SocketAddr> {
-    let (Some(host), Some(port)) = (host, port) else {
-        return None;
-    };
-    let ip: IpAddr = match host.parse() {
-        Ok(ip) => ip,
-        Err(e) => {
-            eprintln!("mouserd: IPC Connect with invalid host {host}: {e}");
-            return None;
-        }
-    };
-    Some(SocketAddr::new(ip, port))
-}
-
-fn connect_request(
-    shared: &Shared,
-    peer_id: DeviceId,
-    host: Option<String>,
-    port: Option<u16>,
-) -> Result<ConnectRequest, String> {
-    let Some(advert) = shared.registry.find(&peer_id) else {
+/// Validate a requested peer (in the live registry + trusted) before queuing the dial.
+/// The engine resolves the address(es) itself, so no caller-supplied host/port is taken.
+fn connect_request(shared: &Shared, peer_id: DeviceId) -> Result<ConnectRequest, String> {
+    if shared.registry.find(&peer_id).is_none() {
         return Err("peer is not in the live discovery registry".to_string());
-    };
+    }
     match shared.store.is_peer_trusted(&peer_id) {
         Ok(true) => {}
         Ok(false) => return Err("peer is not trusted".to_string()),
         Err(e) => return Err(format!("trust check failed: {e}")),
     }
-    let registry_addr = discovery::peer_socket_addr(&advert);
-    let supplied_addr = connect_addr(host, port).filter(|addr| Some(*addr) == registry_addr);
-    Ok(ConnectRequest {
-        peer_id,
-        addr: supplied_addr,
-    })
+    Ok(ConnectRequest { peer_id })
 }
 
 fn publish_connect_error(shared: &Shared, publisher: &Publisher, reason: &str) {

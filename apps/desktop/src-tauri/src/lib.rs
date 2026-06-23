@@ -277,12 +277,7 @@ async fn engine_snapshot() -> Result<EngineSnapshot, String> {
 /// not run — the engine owns discovery).
 #[tauri::command]
 async fn connect_peer(peer_id: String) -> Result<(), String> {
-    send_command(Command::Connect {
-        peer_id,
-        host: None,
-        port: None,
-    })
-    .await
+    send_command(Command::Connect { peer_id }).await
 }
 
 /// Ask the engine to tear down the current connection.

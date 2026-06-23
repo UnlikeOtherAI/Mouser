@@ -285,41 +285,48 @@ async fn dial_connect_request(
             format_device_id(&peer_id)
         ));
     }
-    let registry_addr = registry_addr_for(registry, &peer_id).await.ok_or_else(|| {
-        format!(
+    // Dial every address the registry resolved for the peer, IPv4-first, so one wrong
+    // family doesn't sink the connect (the §3 cert pin is the only trust anchor).
+    let addrs = registry_addrs_for(registry, &peer_id).await;
+    if addrs.is_empty() {
+        return Err(format!(
             "peer {} not currently discoverable",
             format_device_id(&peer_id)
-        )
-    })?;
-    let addr = request
-        .addr
-        .filter(|addr| *addr == registry_addr)
-        .unwrap_or(registry_addr);
-    eprintln!("mouserd: dialing {addr} (IPC connect)");
+        ));
+    }
+    eprintln!(
+        "mouserd: dialing {} ({} candidate address(es), IPC connect)",
+        format_device_id(&peer_id),
+        addrs.len()
+    );
     endpoint
-        .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
+        .connect_interactive_any(me, &addrs, PinPolicy::Pinned(peer_id))
         .await
         .map_err(|e| e.to_string())
 }
 
-/// Wait up to 5s for `peer_id`'s current socket address to appear in the shared
+/// Wait up to 5s for `peer_id`'s current socket addresses to appear in the shared
 /// discovery registry (used by an IPC dial), re-checking on each registry change.
-async fn registry_addr_for(registry: &PeerRegistry, peer_id: &DeviceId) -> Option<SocketAddr> {
+/// Returns every dialable address (IPv4-first), or empty if none resolve in time.
+async fn registry_addrs_for(registry: &PeerRegistry, peer_id: &DeviceId) -> Vec<SocketAddr> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut changes = registry.subscribe();
     loop {
-        if let Some(addr) = registry
+        let addrs = registry
             .find(peer_id)
-            .and_then(|p| discovery::peer_socket_addr(&p))
-        {
-            return Some(addr);
+            .map(|p| discovery::peer_socket_addrs(&p))
+            .unwrap_or_default();
+        if !addrs.is_empty() {
+            return addrs;
         }
-        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return Vec::new(); // deadline passed
+        };
         if tokio::time::timeout(remaining, changes.changed())
             .await
             .is_err()
         {
-            return None; // timed out before the peer became discoverable
+            return Vec::new(); // timed out before the peer became discoverable
         }
     }
 }
@@ -377,12 +384,17 @@ async fn dial_discovered(
                     continue;
                 }
             }
-            let Some(addr) = discovery::peer_socket_addr(&peer) else {
+            let addrs = discovery::peer_socket_addrs(&peer);
+            if addrs.is_empty() {
                 continue;
-            };
-            eprintln!("mouserd: dialing {} at {addr}", peer.instance_name());
+            }
+            eprintln!(
+                "mouserd: dialing {} ({} candidate address(es))",
+                peer.instance_name(),
+                addrs.len()
+            );
             return endpoint
-                .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
+                .connect_interactive_any(me, &addrs, PinPolicy::Pinned(peer_id))
                 .await
                 .map_err(|e| e.to_string());
         }
