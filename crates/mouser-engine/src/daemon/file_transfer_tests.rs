@@ -48,7 +48,7 @@ async fn daemon_bulk_loopback_sends_file_into_quarantine() {
         &sender,
         &sender_id,
         receiver_device,
-        receiver_addr,
+        &[receiver_addr],
         vec![source_path],
     )
     .await

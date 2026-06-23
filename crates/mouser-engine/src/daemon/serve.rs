@@ -45,13 +45,21 @@ pub(super) async fn serve(
     // One endpoint both accepts (TrustOnFirstUse - trust is the §3 cert pin checked
     // against the mDNS-advertised id) and dials. Bind the dual-stack wildcard ([::]:0)
     // so the single listener accepts both IPv4 and IPv6 dialers (a peer may resolve us
-    // to either family).
+    // to either family). On a host with IPv6 disabled the [::] bind fails, so fall back
+    // to the IPv4 wildcard rather than refusing to start (IPv4 LAN connectivity still
+    // works; only inbound IPv6 peers, e.g. an iPhone over v6-only, are lost).
     let bind = mouser_net::dual_stack_addr();
+    let v4_bind = SocketAddr::from(([0u8, 0, 0, 0], 0));
     let endpoint = InteractiveEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
+        .or_else(|e| {
+            eprintln!("mouserd: dual-stack bind failed ({e}); falling back to IPv4-only");
+            InteractiveEndpoint::bind_server(&me, v4_bind, PinPolicy::TrustOnFirstUse)
+        })
         .map_err(|e| e.to_string())?;
     let iport = endpoint.local_addr().map_err(|e| e.to_string())?.port();
     let bulk_endpoint = Arc::new(
         mouser_net::BulkEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
+            .or_else(|_| mouser_net::BulkEndpoint::bind_server(&me, v4_bind, PinPolicy::TrustOnFirstUse))
             .map_err(|e| e.to_string())?,
     );
     let bport = bulk_endpoint
@@ -223,6 +231,11 @@ async fn next_connection(
     // `target` only accepts; `source`/`auto` may dial. Either way an IPC Connect can
     // explicitly drive a dial to a chosen trusted peer.
     let can_dial = role != "target";
+    // Consecutive auto-dial failures, so a reachable-but-failing peer (mid-restart, cert
+    // mismatch, firewall) is re-dialed with a capped backoff instead of being hammered
+    // back-to-back. The reconnect supervisor already does this post-session; this is the
+    // initial-dial equivalent.
+    let mut dial_failures = 0u32;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -249,10 +262,16 @@ async fn next_connection(
                     Err(e) => { eprintln!("mouserd: accept error: {e}"); continue; }
                 }
             }
-            dialed = dial_discovered(store, endpoint, me, my_id, my_b32, registry, role == "source"), if can_dial => {
+            dialed = dial_discovered_backoff(store, endpoint, me, my_id, my_b32, registry, role == "source", dial_failures), if can_dial => {
                 match dialed {
+                    // On success we return out of next_connection; dial_failures is local
+                    // to this call, so the next call starts fresh at 0 — no reset needed.
                     Ok(conn) => return Some((conn, true)),
-                    Err(e) => { eprintln!("mouserd: dial error: {e}"); continue; }
+                    Err(e) => {
+                        eprintln!("mouserd: dial error: {e}");
+                        dial_failures = dial_failures.saturating_add(1);
+                        continue;
+                    }
                 }
             }
         }
@@ -329,6 +348,28 @@ async fn registry_addrs_for(registry: &PeerRegistry, peer_id: &DeviceId) -> Vec<
             return Vec::new(); // timed out before the peer became discoverable
         }
     }
+}
+
+/// [`dial_discovered`] plus a capped backoff on repeated failure. The backoff sleeps
+/// **inside** this future (one arm of [`next_connection`]'s `select!`), so the accept and
+/// IPC arms stay responsive while we wait — a peer reconnecting to us is still picked up.
+/// `failures` is the count of consecutive prior failures (0 ⇒ retry immediately).
+#[allow(clippy::too_many_arguments)]
+async fn dial_discovered_backoff(
+    store: &DaemonStore,
+    endpoint: &InteractiveEndpoint,
+    me: &DeviceIdentity,
+    my_id: DeviceId,
+    my_b32: &str,
+    registry: &PeerRegistry,
+    force: bool,
+    failures: u32,
+) -> Result<InteractiveConnection, String> {
+    let result = dial_discovered(store, endpoint, me, my_id, my_b32, registry, force).await;
+    if result.is_err() && failures > 0 {
+        tokio::time::sleep(super::reconnect::reconnect_backoff(failures)).await;
+    }
+    result
 }
 
 /// Browse mDNS until a dialable peer appears and dial it (device_id-pinned, §3).

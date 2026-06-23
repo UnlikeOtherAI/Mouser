@@ -42,17 +42,19 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// engine's heartbeat window, so a transient stall doesn't tear down the connection.
 const MAX_IDLE: Duration = Duration::from_secs(20);
 
-/// Per-address dial timeout for [`InteractiveEndpoint::connect_interactive_any`]. A
-/// wrong-family or dead candidate is abandoned this fast and the next address tried,
-/// instead of a single bad address hanging the whole dial on [`MAX_IDLE`] (20s).
-const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
+/// Per-address dial timeout for [`InteractiveEndpoint::connect_interactive_any`] (and the
+/// bulk plane's [`crate::bulk::BulkEndpoint::connect_bulk_any`]). A wrong-family or dead
+/// candidate is abandoned this fast and the next address tried, instead of a single bad
+/// address hanging the whole dial on [`MAX_IDLE`] (20s).
+pub(crate) const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// Acceptor-side §5 handshake deadline. Once a peer has completed the QUIC handshake it
-/// must open the control stream and finish the channel proof within this window, else the
-/// accept is abandoned. Without it, a peer that connects and stalls holds the single
-/// accept loop for [`MAX_IDLE`] (20s) and blocks every other inbound peer (LAN DoS). The
-/// dialer side is already bounded by [`DIAL_ATTEMPT_TIMEOUT`].
-const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Acceptor-side §5 handshake deadline (shared by the interactive and bulk accept loops).
+/// Once a peer has completed the QUIC handshake it must open the control stream and finish
+/// the channel proof within this window, else the accept is abandoned. Without it, a peer
+/// that connects and stalls holds the single accept loop for [`MAX_IDLE`] (20s) and blocks
+/// every other inbound peer (LAN DoS). The dialer side is bounded by
+/// [`DIAL_ATTEMPT_TIMEOUT`].
+pub(crate) const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Bound the quinn datagram send buffer (A4): the app-level keep-newest sender
 /// ([`crate::motion`]) already coalesces, so only a couple of frames need to queue.

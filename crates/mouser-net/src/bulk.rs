@@ -22,13 +22,16 @@
 use std::net::SocketAddr;
 
 use ed25519_dalek::{Signature, Verifier};
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream};
 
 use crate::identity::{
     build_tls_certificate, device_id_from_cert, peer_leaf_cert, verifying_key_from_cert,
 };
 use crate::pin::PinPolicy;
-use crate::transport::{bind_dual_stack_server, build_client_config, build_server_config};
+use crate::transport::{
+    bind_dual_stack_server, build_client_config, build_server_config, ACCEPT_HANDSHAKE_TIMEOUT,
+    DIAL_ATTEMPT_TIMEOUT,
+};
 use crate::NetError;
 use mouser_core::DeviceIdentity;
 
@@ -111,34 +114,57 @@ impl BulkEndpoint {
         })
     }
 
+    /// Dial a peer's bulk endpoint across several candidate addresses, returning the first
+    /// connection to complete the [`BulkHello`] binding handshake. Mirrors the interactive
+    /// plane's [`crate::transport::InteractiveEndpoint::connect_interactive_any`]: addresses
+    /// are tried most-reachable-first under [`DIAL_ATTEMPT_TIMEOUT`], so a peer that mDNS
+    /// resolved to a family it isn't listening on no longer hangs the bulk dial on the 20s
+    /// idle timeout (which would silently stall clipboard-over-bulk and file sends).
+    pub async fn connect_bulk_any(
+        &self,
+        identity: &DeviceIdentity,
+        addrs: &[SocketAddr],
+        peer_policy: PinPolicy,
+        interactive_session_id: u64,
+    ) -> Result<BulkConnection, NetError> {
+        let mut last_err = NetError::Connect("no dialable address for peer".to_string());
+        for &addr in addrs {
+            match tokio::time::timeout(
+                DIAL_ATTEMPT_TIMEOUT,
+                self.connect_bulk(identity, addr, peer_policy.clone(), interactive_session_id),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last_err = e,
+                Err(_) => last_err = NetError::Connect(format!("timed out dialing {addr}")),
+            }
+        }
+        Err(last_err)
+    }
+
     /// Accept the next inbound bulk connection and verify its [`BulkHello`] binds to
     /// `expected_session_id` (§5 step 5). Rejects a binding for a different session.
     pub async fn accept_bulk(&self, expected_session_id: u64) -> Result<BulkConnection, NetError> {
-        let connection = self
+        let incoming = self
             .endpoint
             .accept()
             .await
-            .ok_or_else(|| NetError::Connect("endpoint closed".to_string()))?
-            .await
-            .map_err(|e| NetError::Connect(e.to_string()))?;
-
-        let (_send, mut recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| NetError::Connect(e.to_string()))?;
-        let (msg_type, payload) = read_frame(&mut recv, mouser_protocol::MAX_CONTROL_FRAME).await?;
-        if msg_type != mouser_protocol::TYPE_BULK_HELLO {
-            return Err(NetError::Connect(format!(
-                "expected BulkHello (0x04), got type {msg_type:#06x}"
-            )));
+            .ok_or_else(|| NetError::Connect("endpoint closed".to_string()))?;
+        // Bound the QUIC + BulkHello binding handshake so a peer that connects then stalls
+        // cannot pin this single accept loop for MAX_IDLE and starve all other bulk
+        // transfers (LAN DoS) — same guard as the interactive accept loop.
+        match tokio::time::timeout(
+            ACCEPT_HANDSHAKE_TIMEOUT,
+            accept_bulk_binding(incoming, expected_session_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(NetError::Connect(
+                "inbound bulk handshake timed out".to_string(),
+            )),
         }
-        let hello: mouser_protocol::BulkHello =
-            mouser_protocol::from_cbor(&payload).map_err(|e| NetError::Frame(e.to_string()))?;
-        verify_bulk_hello(&hello, &connection, expected_session_id)?;
-        Ok(BulkConnection {
-            connection,
-            _control_send: _send,
-        })
     }
 
     /// Gracefully shut down the bulk endpoint (H6, mirrored from the interactive plane):
@@ -153,6 +179,35 @@ impl BulkEndpoint {
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"shutdown");
     }
+}
+
+/// Complete an inbound bulk connection's QUIC handshake and verify its [`BulkHello`]
+/// binding. Factored out of [`BulkEndpoint::accept_bulk`] so the whole post-incoming
+/// handshake can be wrapped in one [`ACCEPT_HANDSHAKE_TIMEOUT`].
+async fn accept_bulk_binding(
+    incoming: Incoming,
+    expected_session_id: u64,
+) -> Result<BulkConnection, NetError> {
+    let connection = incoming
+        .await
+        .map_err(|e| NetError::Connect(e.to_string()))?;
+    let (_send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|e| NetError::Connect(e.to_string()))?;
+    let (msg_type, payload) = read_frame(&mut recv, mouser_protocol::MAX_CONTROL_FRAME).await?;
+    if msg_type != mouser_protocol::TYPE_BULK_HELLO {
+        return Err(NetError::Connect(format!(
+            "expected BulkHello (0x04), got type {msg_type:#06x}"
+        )));
+    }
+    let hello: mouser_protocol::BulkHello =
+        mouser_protocol::from_cbor(&payload).map_err(|e| NetError::Frame(e.to_string()))?;
+    verify_bulk_hello(&hello, &connection, expected_session_id)?;
+    Ok(BulkConnection {
+        connection,
+        _control_send: _send,
+    })
 }
 
 /// The exporter→signature input for the bulk binding (§5 step 5): `tls_exporter(label,

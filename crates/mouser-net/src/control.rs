@@ -163,11 +163,17 @@ async fn recv_frame(state: &mut RecvState) -> Result<(u16, Vec<u8>), NetError> {
         .ok_or_else(|| NetError::Frame("short control frame header".to_string()))?;
     let (msg_type, payload_len) = parse_frame_header(&header)?;
 
-    // Ensure header + payload are buffered, then split off exactly one frame.
+    // Ensure header + payload are buffered, then split off exactly one frame. Copy just
+    // the payload out (one allocation) and drain the consumed bytes in place — the old
+    // `drain().collect()` + `split_off(8)` allocated twice per frame on the key/click path.
     let frame_len = 8 + payload_len;
     fill_to(state, frame_len).await?;
-    let mut frame: Vec<u8> = state.buf.drain(0..frame_len).collect();
-    let payload = frame.split_off(8);
+    let payload = state
+        .buf
+        .get(8..frame_len)
+        .ok_or_else(|| NetError::Frame("short control frame payload".to_string()))?
+        .to_vec();
+    state.buf.drain(0..frame_len);
     Ok((msg_type, payload))
 }
 

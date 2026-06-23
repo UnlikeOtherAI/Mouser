@@ -127,13 +127,14 @@ pub async fn send_paths_to_peer(
             crate::daemon_store::format_device_id(&peer)
         )
     })?;
-    let addr = discovery::peer_bulk_socket_addr(&advert).ok_or_else(|| {
-        format!(
+    let addrs = discovery::peer_bulk_socket_addrs(&advert);
+    if addrs.is_empty() {
+        return Err(format!(
             "peer {} did not advertise a dialable bulk endpoint",
             advert.instance_name()
-        )
-    })?;
-    send_paths_to_addr(&endpoint, identity.as_ref(), peer, addr, paths).await
+        ));
+    }
+    send_paths_to_addr(&endpoint, identity.as_ref(), peer, &addrs, paths).await
 }
 
 #[cfg(not(unix))]
@@ -152,13 +153,13 @@ async fn send_paths_to_addr(
     endpoint: &BulkEndpoint,
     identity: &DeviceIdentity,
     peer: DeviceId,
-    addr: SocketAddr,
+    addrs: &[SocketAddr],
     paths: Vec<PathBuf>,
 ) -> Result<(), String> {
     let transfer_id = next_transfer_id();
     let files = prepare_sources(paths)?;
     let conn = endpoint
-        .connect_bulk(identity, addr, PinPolicy::Pinned(peer), BULK_SESSION_ID)
+        .connect_bulk_any(identity, addrs, PinPolicy::Pinned(peer), BULK_SESSION_ID)
         .await
         .map_err(|e| e.to_string())?;
     let mut stream = conn
