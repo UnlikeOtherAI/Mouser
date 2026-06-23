@@ -35,7 +35,7 @@ pub fn local_advert(identity: &DeviceIdentity, name: &str, iport: u16, bport: u1
         ver: env!("CARGO_PKG_VERSION").to_string(),
         iport,
         bport,
-        caps: "keyboard,mouse,clipboard".to_string(),
+        caps: "keyboard,mouse,clipboard,files".to_string(),
         role: "eligible".to_string(),
         addrs: Vec::new(),
     }
@@ -65,6 +65,18 @@ pub fn peer_socket_addr(advert: &PeerAdvert) -> Option<SocketAddr> {
         .addrs
         .first()
         .map(|ip| SocketAddr::new(*ip, advert.iport))
+}
+
+/// The first dialable socket address for a peer's bulk endpoint.
+/// `None` if the peer advertised no address or no bulk port.
+pub fn peer_bulk_socket_addr(advert: &PeerAdvert) -> Option<SocketAddr> {
+    if advert.bport == 0 {
+        return None;
+    }
+    advert
+        .addrs
+        .first()
+        .map(|ip| SocketAddr::new(*ip, advert.bport))
 }
 
 /// Best-effort primary outbound IPv4 of this host, to advertise an A record on the
@@ -208,6 +220,19 @@ mod tests {
             None,
             "no interactive port → not dialable"
         );
+    }
+
+    #[test]
+    fn peer_bulk_socket_addr_pairs_first_address_with_bport() {
+        let mut advert = local_advert(&DeviceIdentity::generate(), "Peer", 51820, 51821);
+        assert_eq!(peer_bulk_socket_addr(&advert), None);
+        advert.addrs = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))];
+        assert_eq!(
+            peer_bulk_socket_addr(&advert),
+            Some(SocketAddr::from(([192, 168, 1, 50], 51821))),
+        );
+        advert.bport = 0;
+        assert_eq!(peer_bulk_socket_addr(&advert), None);
     }
 
     #[test]
