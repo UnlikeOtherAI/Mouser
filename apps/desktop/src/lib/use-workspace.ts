@@ -90,7 +90,7 @@ const OFFLINE_GRACE_POLLS = 3;
 const CONNECTING_POLL_MS = 350;
 // How long to wait for a dial to land before declaring it failed, when the engine
 // never reports an explicit error (e.g. the peer is offline / its address moved).
-const CONNECT_TIMEOUT_MS = 12000;
+const CONNECT_TIMEOUT_MS = 9000;
 
 /** A connect attempt that failed, surfaced to the user as a dismissible pop-up. */
 export interface ConnectFailure {
@@ -200,6 +200,8 @@ export interface Workspace {
   connectFailure: ConnectFailure | null;
   /** Dismiss the connect-failure pop-up. */
   dismissConnectFailure: () => void;
+  /** Cancel an in-flight connect (stop the spinner, abandon the dial). */
+  cancelConnect: () => Promise<void>;
   /** Ask the engine to tear down the current connection. */
   disconnectPeer: () => Promise<void>;
   /** Pair (trust) a discovered peer on this machine by id. */
@@ -255,6 +257,15 @@ export function useWorkspace(): Workspace {
   const [connectFailure, setConnectFailure] = useState<ConnectFailure | null>(null);
   // Mirror of `connectingPeerId` for the poll loop (which closes over its initial state).
   const connectingRef = useRef<string | null>(null);
+  // Latest polled connection, so the timeout backstop reads the freshest state (not the
+  // value captured when the timer was armed) — lets it confirm a missed "connected" edge.
+  const connectionRef = useRef<EngineConnection>(connection);
+  // The engine error already present when a connect starts: ignored as stale so a fresh
+  // tap doesn't instantly surface the *previous* attempt's leftover idle+error.
+  const connectBaselineErrorRef = useRef<string | null>(null);
+  // Whether the engine has acknowledged THIS attempt (moved to connecting/connected),
+  // which lets a genuinely new failure through even if its message equals the stale one.
+  const connectAckedRef = useRef(false);
   // Last logged engine/connection signatures, so the poll logs transitions only.
   const lastRunning = useRef<boolean | null>(null);
   const lastConnSig = useRef<string | null>(null);
@@ -374,6 +385,11 @@ export function useWorkspace(): Workspace {
     // Drive the spinner immediately (independent of the poll) and clear any prior
     // failure, so the user sees steady "Connecting…" — never the old flicker.
     setConnectFailure(null);
+    // Remember the error already in the snapshot (a previous attempt's) and that the
+    // engine hasn't acknowledged us yet, so the resolver doesn't instantly fail this
+    // fresh attempt on that stale error.
+    connectBaselineErrorRef.current = connectionRef.current.error;
+    connectAckedRef.current = false;
     setConnectingPeerId(peerId);
     connectingRef.current = peerId;
     logDebug("info", `connect requested → ${shortId(peerId)}`);
@@ -390,37 +406,64 @@ export function useWorkspace(): Workspace {
     }
   }, []);
 
-  // Keep the poll loop's fast/slow choice in sync with the live connecting state.
+  // Keep refs in sync for the poll loop (fast/slow choice) and the timeout backstop.
   useEffect(() => {
     connectingRef.current = connectingPeerId;
   }, [connectingPeerId]);
+  useEffect(() => {
+    connectionRef.current = connection;
+  }, [connection]);
 
-  // Resolve a pending connect from the polled snapshot: success once the engine reports
-  // it connected, failure on an explicit engine error.
+  // Resolve a pending connect from the polled snapshot. Guards against two snapshot races:
+  // (1) a stale idle+error left by a *previous* attempt instantly failing this one, and
+  // (2) a missed "connected" edge — handled here on success and by the backstop on timeout.
   useEffect(() => {
     if (connectingPeerId === null) return;
+    // The engine has taken up our attempt once it moves to connecting (or connected to us).
+    if (
+      connection.state === "connecting" ||
+      (connection.state === "connected" && connection.peerId === connectingPeerId)
+    ) {
+      connectAckedRef.current = true;
+    }
+    // Success.
     if (connection.state === "connected" && connection.peerId === connectingPeerId) {
       setConnectingPeerId(null);
       return;
     }
-    if (connection.state === "idle" && connection.error) {
+    // Failure — only a *fresh* error counts: either the engine has acknowledged this
+    // attempt, or the error differs from the one already present when we started. This
+    // stops a leftover error from the last attempt from failing a brand-new tap.
+    if (
+      connection.state === "idle" &&
+      connection.error &&
+      (connectAckedRef.current ||
+        connection.error !== connectBaselineErrorRef.current)
+    ) {
       setConnectFailure({ peerId: connectingPeerId, message: connection.error });
       setConnectingPeerId(null);
     }
   }, [connection, connectingPeerId]);
 
-  // Backstop: if neither connected nor an explicit error arrives within the window, treat
-  // it as failed so the attempt never hangs on a silent spinner. Keyed only on
-  // `connectingPeerId` so a routine snapshot poll doesn't keep resetting the timer.
+  // Backstop: if neither connected nor a fresh error arrives within the window, resolve so
+  // the spinner never hangs. Re-checks the *latest* snapshot first, so a missed "connected"
+  // edge reports success — never a false "timed out" for a connection that actually landed.
+  // Keyed only on `connectingPeerId` so a routine poll doesn't keep resetting the timer.
   useEffect(() => {
     if (connectingPeerId === null) return;
     const peerId = connectingPeerId;
     const timer = setTimeout(() => {
+      const c = connectionRef.current;
+      if (c.state === "connected" && c.peerId === peerId) {
+        setConnectingPeerId(null); // succeeded; the poll just missed the edge
+        return;
+      }
       setConnectFailure({
         peerId,
         message:
+          c.error ??
           "Timed out — the device didn't answer. It may be offline, still starting up, " +
-          "or its address changed. Make sure it's running and try again.",
+            "or its address changed. Make sure it's running and try again.",
       });
       setConnectingPeerId(null);
     }, CONNECT_TIMEOUT_MS);
@@ -428,6 +471,21 @@ export function useWorkspace(): Workspace {
   }, [connectingPeerId]);
 
   const dismissConnectFailure = useCallback(() => setConnectFailure(null), []);
+
+  // Cancel an in-flight connect: stop the spinner immediately and tell the engine to
+  // abandon the dial, so the user is never locked watching the spinner until timeout.
+  const cancelConnect = useCallback(async (): Promise<void> => {
+    setConnectingPeerId(null);
+    connectingRef.current = null;
+    setConnectFailure(null);
+    const invoke = await tauriInvoke();
+    if (invoke === null) return;
+    try {
+      await invoke("disconnect_peer");
+    } catch {
+      // Best-effort — the dial future is dropped engine-side on the next state read.
+    }
+  }, []);
 
   const disconnectPeer = useCallback(async (): Promise<void> => {
     const invoke = await tauriInvoke();
@@ -525,6 +583,7 @@ export function useWorkspace(): Workspace {
     connectingPeerId,
     connectFailure,
     dismissConnectFailure,
+    cancelConnect,
     disconnectPeer,
     trustPeer,
     approvePairing,
