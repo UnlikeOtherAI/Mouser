@@ -110,3 +110,70 @@ pub fn decode_frame(buf: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
         total,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrips_a_max_size_control_payload() {
+        let payload = vec![0xABu8; (MAX_CONTROL_FRAME as usize) - (HEADER - 4)];
+        let encoded = encode_frame(0x0102, 0x0304, &payload).expect("encode max payload");
+        let (frame, total) = decode_frame(&encoded).expect("decode max payload");
+        assert_eq!(frame.msg_type, 0x0102);
+        assert_eq!(frame.flags, 0x0304);
+        assert_eq!(frame.payload, &payload[..]);
+        assert_eq!(total, encoded.len());
+    }
+
+    #[test]
+    fn encode_rejects_oversized_control_payload() {
+        // One byte past the cap (the cap counts type+flags+payload).
+        let payload = vec![0u8; (MAX_CONTROL_FRAME as usize) - (HEADER - 4) + 1];
+        assert_eq!(encode_frame(0, 0, &payload), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn encode_bulk_allows_payload_above_control_cap() {
+        // A payload larger than the control cap but within the bulk cap must encode as a
+        // bulk frame and be rejected as a control frame — the two planes have distinct
+        // ceilings (§0.3).
+        let payload = vec![0u8; MAX_CONTROL_FRAME as usize + 1];
+        assert!(encode_bulk_frame(0, 0, &payload).is_ok());
+        assert_eq!(encode_frame(0, 0, &payload), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn decode_rejects_a_huge_declared_length_without_allocating() {
+        // An attacker-supplied len of 0xFFFF_FFFF must be rejected by the cap before any
+        // caller is told to allocate that much — the memory-exhaustion guard.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // type + flags
+        assert_eq!(decode_frame(&buf), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn decode_rejects_len_below_the_header_minimum() {
+        // len must cover at least type(2)+flags(2) = 4. len = 3 is malformed.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]);
+        assert_eq!(decode_frame(&buf), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn decode_reports_truncation_one_byte_short() {
+        let payload = [1u8, 2, 3, 4];
+        let encoded = encode_frame(0x11, 0x22, &payload).expect("encode");
+        let short = &encoded[..encoded.len() - 1];
+        assert_eq!(decode_frame(short), Err(FrameError::Truncated));
+        // The full buffer still decodes.
+        assert!(decode_frame(&encoded).is_ok());
+    }
+
+    #[test]
+    fn decode_reports_truncation_on_a_partial_header() {
+        assert_eq!(decode_frame(&[0u8; 3]), Err(FrameError::Truncated));
+    }
+}
