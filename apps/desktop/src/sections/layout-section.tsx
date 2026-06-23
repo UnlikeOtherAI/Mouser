@@ -1,5 +1,5 @@
 import { LayoutCanvas } from "../components/layout-canvas";
-import { useWorkspace } from "../lib/use-workspace";
+import { useWorkspace } from "../lib/workspace-context";
 
 /**
  * Workspace Layout section — the brief's "central visual feature". Shows this

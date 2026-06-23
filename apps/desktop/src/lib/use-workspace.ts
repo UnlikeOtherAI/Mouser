@@ -240,8 +240,13 @@ async function tauriInvoke(): Promise<
  * Outside Tauri (browser dev) it falls back to a representative two-screen Mac and an
  * empty/offline engine so the UI is still usable. When the daemon is not running the
  * engine snapshot reports `engine_running: false`, which the UI surfaces as a hint.
+ *
+ * This is the single backing state machine: it runs one poll loop and one connect state
+ * machine. Mount it exactly once via [`WorkspaceProvider`] and read it from sections with
+ * the `useWorkspace` context hook — calling this directly in multiple components would
+ * spin up a duplicate poll loop and a second, divergent connection state per component.
  */
-export function useWorkspace(): Workspace {
+export function useWorkspaceState(): Workspace {
   const [devices, setDevices] = useState<Device[]>(FALLBACK);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [connection, setConnection] = useState<EngineConnection>(IDLE_CONNECTION);

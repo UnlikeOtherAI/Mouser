@@ -11,7 +11,7 @@ import {
   writeSectionPreference,
 } from "./lib/section-preference";
 import { useApplySettings } from "./lib/use-apply-settings";
-import { useWorkspace } from "./lib/use-workspace";
+import { useWorkspace } from "./lib/workspace-context";
 import type { ClipboardTransfer, SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";

@@ -2,7 +2,7 @@ import { SectionCard } from "../components/section-card";
 import { Segmented } from "../components/segmented";
 import { SettingRow } from "../components/setting-row";
 import { Toggle } from "../components/toggle";
-import { useWorkspace } from "../lib/use-workspace";
+import { useWorkspace } from "../lib/workspace-context";
 import type { EdgeBehavior } from "../lib/types";
 
 /** Input ownership / pointer-crossing preferences — daemon-owned, edited over IPC

@@ -4,7 +4,7 @@ import {
   faSpinner,
   faTriangleExclamation,
 } from "@fortawesome/free-solid-svg-icons";
-import { useWorkspace } from "../lib/use-workspace";
+import { useWorkspace } from "../lib/workspace-context";
 import { osIcon, osLabel, stateMeta } from "../lib/os-meta";
 import { cx } from "../lib/cx";
 import type { Peer } from "../lib/types";
