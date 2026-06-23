@@ -122,6 +122,12 @@ final class PeerBrowser: ObservableObject {
             // The base32 device_id is mandatory (the cert-pin key); skip TXT-less
             // or id-less services — they are not dialable peers.
             guard let id = txt["id"], !id.isEmpty else { continue }
+            // Skip controller-only peers — phones (including this device's own
+            // advert) publish iport=0 to mean "present but not connectable". The
+            // picker lists only dialable desktops, so a phone never lists itself
+            // or other phones.
+            let iport = txt["iport"].flatMap { UInt16($0) } ?? 0
+            guard iport != 0 else { continue }
             resolve(result.endpoint, id: id, txt: txt)
         }
 
