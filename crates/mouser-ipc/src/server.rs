@@ -10,16 +10,25 @@
 //! this module is the transport.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::codec::{read_message, write_message, IpcError};
 use crate::dto::{Command, ServerMessage, Snapshot};
 use crate::path::default_socket_path;
+
+const MAX_CLIENTS: usize = 4;
+const COMMAND_QUEUE_CAPACITY: usize = 32;
 
 #[cfg(unix)]
 type IpcServerStream = UnixStream;
@@ -50,7 +59,7 @@ pub struct Server {
     /// Latest snapshot, watched by every connected client task.
     snapshot_tx: watch::Sender<Snapshot>,
     /// Commands forwarded from connected clients to the daemon.
-    command_rx: mpsc::UnboundedReceiver<Command>,
+    command_rx: mpsc::Receiver<Command>,
     accept_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -70,6 +79,8 @@ impl Server {
     ) -> Result<Self, IpcError> {
         let socket_path = socket_path.into();
         #[cfg(unix)]
+        crate::path::prepare_default_socket_parent(&socket_path).map_err(IpcError::Io)?;
+        #[cfg(unix)]
         match std::fs::remove_file(&socket_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -77,9 +88,15 @@ impl Server {
         }
         let listener = IpcListener::bind(socket_path.clone())?;
         let (snapshot_tx, _snapshot_rx) = watch::channel(initial);
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let client_slots = Arc::new(Semaphore::new(MAX_CLIENTS));
 
-        let accept_task = tokio::spawn(accept_loop(listener, snapshot_tx.clone(), command_tx));
+        let accept_task = tokio::spawn(accept_loop(
+            listener,
+            snapshot_tx.clone(),
+            command_tx,
+            client_slots,
+        ));
 
         Ok(Self {
             socket_path,
@@ -133,13 +150,18 @@ struct IpcListener {
 #[cfg(unix)]
 impl IpcListener {
     fn bind(path: PathBuf) -> Result<Self, IpcError> {
-        Ok(Self {
-            inner: UnixListener::bind(path)?,
-        })
+        let inner = UnixListener::bind(&path)?;
+        if let Err(e) = std::fs::set_permissions(&path, Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&path);
+            return Err(IpcError::Io(e));
+        }
+        Ok(Self { inner })
     }
 
     async fn accept(&mut self) -> Result<IpcServerStream, std::io::Error> {
-        self.inner.accept().await.map(|(stream, _addr)| stream)
+        let (stream, _addr) = self.inner.accept().await?;
+        verify_peer_uid(&stream)?;
+        Ok(stream)
     }
 }
 
@@ -152,31 +174,46 @@ struct IpcListener {
 #[cfg(windows)]
 impl IpcListener {
     fn bind(pipe_name: PathBuf) -> Result<Self, IpcError> {
-        let pending = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(pipe_name.as_os_str())?;
+        let pending = pipe_options(true).create(pipe_name.as_os_str())?;
         Ok(Self { pipe_name, pending })
     }
 
     async fn accept(&mut self) -> Result<IpcServerStream, std::io::Error> {
         self.pending.connect().await?;
-        let next = ServerOptions::new().create(self.pipe_name.as_os_str())?;
+        let next = pipe_options(false).create(self.pipe_name.as_os_str())?;
         Ok(std::mem::replace(&mut self.pending, next))
     }
+}
+
+#[cfg(windows)]
+fn pipe_options(first_instance: bool) -> ServerOptions {
+    let mut options = ServerOptions::new();
+    options.reject_remote_clients(true);
+    if first_instance {
+        options.first_pipe_instance(true);
+    }
+    // TODO(R3-H3): attach a current-user DACL once this unsafe-free crate has a
+    // safe Windows SECURITY_ATTRIBUTES wrapper available.
+    options
 }
 
 /// Accept connections forever, spawning a per-client task for each.
 async fn accept_loop(
     mut listener: IpcListener,
     snapshot_tx: watch::Sender<Snapshot>,
-    command_tx: mpsc::UnboundedSender<Command>,
+    command_tx: mpsc::Sender<Command>,
+    client_slots: Arc<Semaphore>,
 ) {
     loop {
         match listener.accept().await {
             Ok(stream) => {
+                let permit = match client_slots.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => continue,
+                };
                 let rx = snapshot_tx.subscribe();
                 let command_tx = command_tx.clone();
-                tokio::spawn(serve_client(stream, rx, command_tx));
+                tokio::spawn(serve_client(stream, rx, command_tx, permit));
             }
             // A transient accept error should not kill the server; yield and retry.
             Err(_) => {
@@ -190,7 +227,8 @@ async fn accept_loop(
 async fn serve_client(
     stream: IpcServerStream,
     mut snapshot_rx: watch::Receiver<Snapshot>,
-    command_tx: mpsc::UnboundedSender<Command>,
+    command_tx: mpsc::Sender<Command>,
+    _client_slot: OwnedSemaphorePermit,
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
@@ -234,7 +272,7 @@ async fn serve_client(
                         }
                     }
                     Ok(other) => {
-                        if command_tx.send(other).is_err() {
+                        if command_tx.send(other).await.is_err() {
                             return; // daemon gone
                         }
                     }
@@ -244,4 +282,60 @@ async fn serve_client(
             }
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn verify_peer_uid(stream: &UnixStream) -> Result<(), std::io::Error> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    use nix::unistd::Uid;
+
+    let peer = getsockopt(stream, PeerCredentials).map_err(std::io::Error::from)?;
+    verify_uid(peer.uid(), Uid::current().as_raw())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn verify_peer_uid(stream: &UnixStream) -> Result<(), std::io::Error> {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerCred};
+    use nix::unistd::Uid;
+
+    let peer = getsockopt(stream, LocalPeerCred).map_err(std::io::Error::from)?;
+    verify_uid(peer.uid(), Uid::current().as_raw())
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
+fn verify_peer_uid(_stream: &UnixStream) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "ipc peer credential check is unsupported on this Unix target",
+    ))
+}
+
+#[cfg(unix)]
+fn verify_uid(peer_uid: u32, daemon_uid: u32) -> Result<(), std::io::Error> {
+    if peer_uid == daemon_uid {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "ipc peer uid does not match daemon uid",
+    ))
 }

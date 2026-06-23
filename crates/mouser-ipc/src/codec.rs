@@ -5,6 +5,8 @@
 //! the payload bytes). Frames are read/written with the async helpers below so neither
 //! side needs to manage a parse buffer.
 
+use std::io;
+
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -31,6 +33,9 @@ pub enum IpcError {
     /// The peer closed the connection at a frame boundary (clean EOF).
     #[error("ipc connection closed")]
     Closed,
+    /// The peer closed the connection after sending part of a frame.
+    #[error("ipc truncated frame")]
+    TruncatedFrame,
 }
 
 /// Encode `value` as CBOR and write it as one length-prefixed frame.
@@ -61,18 +66,43 @@ where
     T: DeserializeOwned,
 {
     let mut len_bytes = [0u8; 4];
-    match reader.read_exact(&mut len_bytes).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(IpcError::Closed),
-        Err(e) => return Err(IpcError::Io(e)),
+    if !read_exact_or_boundary(reader, &mut len_bytes).await? {
+        return Err(IpcError::Closed);
     }
     let len = u32::from_le_bytes(len_bytes);
     if len > MAX_FRAME {
         return Err(IpcError::TooLarge(len));
     }
-    let mut payload = vec![0u8; len as usize];
-    reader.read_exact(&mut payload).await?;
+    let payload_len = usize::try_from(len).map_err(|_| IpcError::TooLarge(len))?;
+    let mut payload = vec![0u8; payload_len];
+    if !read_exact_or_boundary(reader, &mut payload).await? {
+        return Err(IpcError::TruncatedFrame);
+    }
     ciborium::from_reader(payload.as_slice()).map_err(|e| IpcError::Decode(e.to_string()))
+}
+
+async fn read_exact_or_boundary<R>(reader: &mut R, buf: &mut [u8]) -> Result<bool, IpcError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut filled = 0;
+    while filled < buf.len() {
+        let Some(dst) = buf.get_mut(filled..) else {
+            return Err(IpcError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ipc frame buffer cursor exceeded buffer length",
+            )));
+        };
+        let read = reader.read(dst).await?;
+        if read == 0 {
+            if filled == 0 {
+                return Ok(false);
+            }
+            return Err(IpcError::TruncatedFrame);
+        }
+        filled += read;
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -114,5 +144,22 @@ mod tests {
         let mut reader = bytes.as_slice();
         let err = read_message::<_, Probe>(&mut reader).await.unwrap_err();
         assert!(matches!(err, IpcError::TooLarge(_)));
+    }
+
+    #[tokio::test]
+    async fn partial_header_reports_truncated_frame() {
+        let partial_header = [1u8, 0, 0];
+        let mut reader = partial_header.as_slice();
+        let err = read_message::<_, Probe>(&mut reader).await.unwrap_err();
+        assert!(matches!(err, IpcError::TruncatedFrame));
+    }
+
+    #[tokio::test]
+    async fn partial_payload_reports_truncated_frame() {
+        let mut bytes = 4u32.to_le_bytes().to_vec();
+        bytes.push(0);
+        let mut reader = bytes.as_slice();
+        let err = read_message::<_, Probe>(&mut reader).await.unwrap_err();
+        assert!(matches!(err, IpcError::TruncatedFrame));
     }
 }
