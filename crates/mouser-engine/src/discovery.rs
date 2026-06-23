@@ -178,9 +178,26 @@ impl PeerRegistry {
     /// Fold one browse event into the registry; returns whether the peer set changed.
     fn apply(&self, event: PeerEvent) -> bool {
         let changed = match event {
-            PeerEvent::Found(advert) => {
+            PeerEvent::Found(mut advert) => {
                 let key = format!("{}.{}", advert.instance_name(), mouser_net::SERVICE_TYPE);
                 let mut guard = self.peers_guard();
+                // mdns-sd often resolves a peer's A and AAAA records in separate events.
+                // Replacing the entry each time would drop one family, so the dialer's
+                // chosen address flaps between IPv4 and IPv6 and times out whenever it
+                // lands on a family the peer isn't listening on. Merge instead: keep the
+                // latest TXT/port but the *union* of all resolved addresses, ordered
+                // IPv4-first so `best_dialable_ip` prefers the most LAN-reliable family.
+                // (A peer that genuinely leaves clears its entry via Removed.)
+                if let Some(prev) = guard.get(&key) {
+                    for ip in &prev.addrs {
+                        if !advert.addrs.contains(ip) {
+                            advert.addrs.push(*ip);
+                        }
+                    }
+                }
+                advert
+                    .addrs
+                    .sort_by_key(|ip| (ip.is_ipv6(), ip.to_string()));
                 // A re-announce with new address/port counts as a change so dialers and
                 // snapshots stay current; an identical re-announce does not.
                 let changed = guard.get(&key) != Some(&advert);
@@ -259,6 +276,39 @@ mod tests {
         );
         advert.bport = 0;
         assert_eq!(peer_bulk_socket_addr(&advert), None);
+    }
+
+    #[test]
+    fn registry_unions_addresses_across_separate_resolutions() {
+        // mdns-sd commonly delivers a peer's AAAA and A in separate events; the registry
+        // must keep both so the dialer doesn't flap families and time out.
+        let id = DeviceIdentity::generate();
+        let reg = PeerRegistry::new();
+
+        let mut v6_only = local_advert(&id, "MINIS", 60040, 0);
+        v6_only.addrs = vec![IpAddr::V6(Ipv6Addr::new(0x2a00, 0, 0, 0, 0, 0, 0, 1))];
+        reg.apply(PeerEvent::Found(v6_only));
+
+        let mut v4_only = local_advert(&id, "MINIS", 60040, 0);
+        v4_only.addrs = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 203))];
+        reg.apply(PeerEvent::Found(v4_only));
+
+        let merged = reg.find(&id.device_id()).expect("peer present");
+        assert!(
+            merged
+                .addrs
+                .contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 203)))
+                && merged
+                    .addrs
+                    .contains(&IpAddr::V6(Ipv6Addr::new(0x2a00, 0, 0, 0, 0, 0, 0, 1))),
+            "both families retained, got {:?}",
+            merged.addrs,
+        );
+        // IPv6 resolved last, but the dial still prefers the routable IPv4.
+        assert_eq!(
+            peer_socket_addr(&merged),
+            Some(SocketAddr::from(([192, 168, 1, 203], 60040))),
+        );
     }
 
     #[test]
