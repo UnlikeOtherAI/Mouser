@@ -21,7 +21,8 @@ fn main() {
     {
         let injector = std::sync::Arc::new(platform_mac::adapter::MacInjector::new());
         let capture = std::sync::Arc::new(platform_mac::adapter::MacCapture::new());
-        mouser_engine::daemon::run(injector, capture);
+        let clipboard = std::sync::Arc::new(platform_mac::MacClipboard::new());
+        mouser_engine::daemon::run(injector, capture, clipboard);
     }
     #[cfg(target_os = "linux")]
     {
@@ -36,13 +37,15 @@ fn main() {
             }
         };
         let capture = std::sync::Arc::new(platform_linux::LinuxCapture::new());
-        mouser_engine::daemon::run(injector, capture);
+        let clipboard = std::sync::Arc::new(platform_linux::LinuxClipboard::new());
+        mouser_engine::daemon::run(injector, capture, clipboard);
     }
     #[cfg(target_os = "windows")]
     {
         let injector = std::sync::Arc::new(platform_win::WinInjector::new());
         let capture = std::sync::Arc::new(platform_win::WinCapture::new());
-        mouser_engine::daemon::run(injector, capture);
+        let clipboard = std::sync::Arc::new(platform_win::WinClipboard::new());
+        mouser_engine::daemon::run(injector, capture, clipboard);
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {

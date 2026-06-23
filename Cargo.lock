@@ -2643,7 +2643,9 @@ name = "mouser-engine"
 version = "0.0.0"
 dependencies = [
  "data-encoding",
+ "mouser-clipboard",
  "mouser-core",
+ "mouser-files",
  "mouser-ipc",
  "mouser-net",
  "mouser-protocol",

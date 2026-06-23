@@ -31,6 +31,10 @@ impl WinClipboard {
 }
 
 impl Clipboard for WinClipboard {
+    fn change_token(&self) -> PlatformResult<u64> {
+        Ok(0)
+    }
+
     fn read(&self, _format: ClipFormat) -> PlatformResult<Option<Vec<u8>>> {
         Err(Box::new(Unsupported))
     }

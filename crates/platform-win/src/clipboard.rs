@@ -87,6 +87,13 @@ impl WinClipboard {
 }
 
 impl Clipboard for WinClipboard {
+    fn change_token(&self) -> PlatformResult<u64> {
+        match u64::try_from(self.change_count()) {
+            Ok(token) => Ok(token),
+            Err(_) => Ok(0),
+        }
+    }
+
     fn read(&self, format: ClipFormat) -> PlatformResult<Option<Vec<u8>>> {
         let fmt = clipboard_format(format)?;
         let _session = ClipboardSession::open()?;

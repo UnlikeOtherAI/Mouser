@@ -4,13 +4,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mouser_core::platform::{InputCapture, InputInjection};
+use mouser_core::platform::{Clipboard, InputCapture, InputInjection};
 use mouser_core::DeviceId;
 use mouser_net::{InteractiveEndpoint, PinPolicy};
+use mouser_protocol::Os;
 
 use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::{EngineCore, RuntimeHandle};
 
+use super::clipboard::{run_driver, SettingsProvider};
 use super::source_layout;
 
 /// Connect to an explicit peer (TrustOnFirstUse) and report the handshake, then
@@ -57,6 +59,7 @@ pub(super) async fn serve_direct(
     expected_peer: DeviceId,
     injector: Arc<dyn InputInjection>,
     capture: Arc<dyn InputCapture>,
+    clipboard: Arc<dyn Clipboard>,
 ) -> Result<(), String> {
     if !store
         .is_peer_trusted(&expected_peer)
@@ -85,13 +88,26 @@ pub(super) async fn serve_direct(
     eprintln!("mouserd: connected directly; this machine can control the peer");
 
     let core = EngineCore::new_source(my_id, peer, source_layout());
-    let runtime = RuntimeHandle::start(core, Arc::new(conn), injector, capture);
+    let mut runtime = RuntimeHandle::start(core, Arc::new(conn), injector, capture);
+    let clipboard_task = runtime.take_control_lane().map(|lane| {
+        tokio::spawn(run_driver(
+            lane,
+            clipboard,
+            my_id,
+            peer,
+            Os::Unknown,
+            SettingsProvider::Fixed(store.load_settings()),
+        ))
+    });
     eprintln!(
         "mouserd: passive edge sensing active - local keyboard/mouse stay native; \
          suppressing capture installs only while controlling the peer"
     );
 
     tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
+    if let Some(task) = clipboard_task {
+        task.abort();
+    }
     runtime.shutdown();
     Ok(())
 }

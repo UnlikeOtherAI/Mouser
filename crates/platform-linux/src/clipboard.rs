@@ -104,6 +104,10 @@ mod imp {
     }
 
     impl Clipboard for LinuxClipboard {
+        fn change_token(&self) -> PlatformResult<u64> {
+            Ok(LinuxClipboard::change_token(self))
+        }
+
         fn read(&self, format: ClipFormat) -> PlatformResult<Option<Vec<u8>>> {
             read_mime(mime_type(format))
         }
@@ -191,6 +195,10 @@ impl LinuxClipboard {
 
 #[cfg(not(target_os = "linux"))]
 impl mouser_core::platform::Clipboard for LinuxClipboard {
+    fn change_token(&self) -> mouser_core::platform::PlatformResult<u64> {
+        Ok(0)
+    }
+
     fn read(&self, _format: ClipFormat) -> mouser_core::platform::PlatformResult<Option<Vec<u8>>> {
         Err(Box::new(Unsupported))
     }

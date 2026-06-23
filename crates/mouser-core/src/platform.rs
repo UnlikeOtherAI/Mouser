@@ -224,6 +224,9 @@ pub trait InputCapture: Send + Sync {
 /// Payload transport, hashing, dedup, and loop-prevention live in the engine; the
 /// adapter only moves bytes to/from the OS clipboard for a given format.
 pub trait Clipboard: Send + Sync {
+    /// A monotonic or content-derived token for change detection.
+    fn change_token(&self) -> PlatformResult<u64>;
+
     /// Read the current clipboard contents for `format`, or `None` if absent.
     fn read(&self, format: ClipFormat) -> PlatformResult<Option<Vec<u8>>>;
 

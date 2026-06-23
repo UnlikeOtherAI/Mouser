@@ -24,7 +24,7 @@ async fn mdns_discovery_drives_quic_connect() {
     )
     .expect("bind acceptor");
     let iport = acceptor.local_addr().expect("acceptor addr").port();
-    let advert = discovery::local_advert(&acceptor_id, "Acceptor", iport);
+    let advert = discovery::local_advert(&acceptor_id, "Acceptor", iport, 0);
     let _advertiser = Advertiser::advertise_loopback(&advert).expect("advertise");
 
     let accept = tokio::spawn(async move {
