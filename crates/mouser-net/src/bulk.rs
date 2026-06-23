@@ -24,7 +24,9 @@ use std::net::SocketAddr;
 use ed25519_dalek::{Signature, Verifier};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
-use crate::identity::{build_tls_certificate, device_id_from_cert, verifying_key_from_cert};
+use crate::identity::{
+    build_tls_certificate, device_id_from_cert, peer_leaf_cert, verifying_key_from_cert,
+};
 use crate::pin::PinPolicy;
 use crate::transport::{bind_dual_stack_server, build_client_config, build_server_config};
 use crate::NetError;
@@ -218,21 +220,6 @@ fn verify_bulk_hello(
         .verify(&expected, &signature)
         .map_err(|_| NetError::Connect("bulk channel_sig verification failed".to_string()))?;
     Ok(())
-}
-
-fn peer_leaf_cert(
-    connection: &Connection,
-) -> Result<rustls_pki_types::CertificateDer<'static>, NetError> {
-    let identity = connection
-        .peer_identity()
-        .ok_or_else(|| NetError::Connect("peer presented no certificate".to_string()))?;
-    let certs = identity
-        .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
-        .map_err(|_| NetError::Connect("unexpected peer identity type".to_string()))?;
-    certs
-        .first()
-        .cloned()
-        .ok_or_else(|| NetError::Connect("empty peer certificate chain".to_string()))
 }
 
 /// An established, identity-bound bulk connection (§6.2). Spawns one bidi stream per
