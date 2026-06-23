@@ -79,6 +79,19 @@ export interface Pairing {
 // How often we re-poll the engine snapshot over IPC. The daemon pushes snapshots
 // on change, but the UI uses a simple request/reply poll (no event subscription).
 const SNAPSHOT_POLL_MS = 2000;
+// While a connect is in flight we poll faster so the connected/failed outcome
+// surfaces promptly instead of being missed between 2s polls (a dial can fail in a
+// fraction of a second).
+const CONNECTING_POLL_MS = 350;
+// How long to wait for a dial to land before declaring it failed, when the engine
+// never reports an explicit error (e.g. the peer is offline / its address moved).
+const CONNECT_TIMEOUT_MS = 12000;
+
+/** A connect attempt that failed, surfaced to the user as a dismissible pop-up. */
+export interface ConnectFailure {
+  peerId: string;
+  message: string;
+}
 
 // Browser/dev fallback when there is no Tauri runtime (e.g. `pnpm dev` in a
 // plain browser). Two screens side by side so snapping is exercised.
@@ -176,6 +189,12 @@ export interface Workspace {
   loading: boolean;
   /** Ask the engine to connect to a discovered, trusted peer by id. */
   connectPeer: (peerId: string) => Promise<void>;
+  /** The peer a connect is currently in flight to (drives the per-row spinner), or null. */
+  connectingPeerId: string | null;
+  /** The last connect attempt that failed (drives the failure pop-up), or null. */
+  connectFailure: ConnectFailure | null;
+  /** Dismiss the connect-failure pop-up. */
+  dismissConnectFailure: () => void;
   /** Ask the engine to tear down the current connection. */
   disconnectPeer: () => Promise<void>;
   /** Pair (trust) a discovered peer on this machine by id. */
@@ -223,6 +242,12 @@ export function useWorkspace(): Workspace {
   const [settings, setSettings] = useState<EngineSettings>(DEFAULT_ENGINE_SETTINGS);
   const [diagnostics, setDiagnostics] = useState<HealthItem[]>([]);
   const [loading, setLoading] = useState(true);
+  // The peer a connect is in flight to (set on tap, cleared on connected/failed/timeout)
+  // and the last failure, so the UI shows a steady spinner then a pop-up — never a flicker.
+  const [connectingPeerId, setConnectingPeerId] = useState<string | null>(null);
+  const [connectFailure, setConnectFailure] = useState<ConnectFailure | null>(null);
+  // Mirror of `connectingPeerId` for the poll loop (which closes over its initial state).
+  const connectingRef = useRef<string | null>(null);
   // Last logged engine/connection signatures, so the poll logs transitions only.
   const lastRunning = useRef<boolean | null>(null);
   const lastConnSig = useRef<string | null>(null);
@@ -305,27 +330,85 @@ export function useWorkspace(): Workspace {
           // Transient invoke failure — keep the last snapshot.
         }
       };
+      // Recursive timeout (not setInterval) so we can poll faster while a connect is
+      // in flight — the connected/failed outcome then shows in ~350ms, not up to 2s.
+      const schedule = (): void => {
+        const delay = connectingRef.current ? CONNECTING_POLL_MS : SNAPSHOT_POLL_MS;
+        timer = setTimeout(() => {
+          void poll().finally(() => {
+            if (!cancelled) schedule();
+          });
+        }, delay);
+      };
       await poll();
-      if (!cancelled) timer = setInterval(() => void poll(), SNAPSHOT_POLL_MS);
+      if (!cancelled) schedule();
     })();
     return () => {
       cancelled = true;
-      if (timer !== undefined) clearInterval(timer);
+      if (timer !== undefined) clearTimeout(timer);
     };
   }, []);
 
   const connectPeer = useCallback(async (peerId: string): Promise<void> => {
     const invoke = await tauriInvoke();
     if (invoke === null) return;
+    // Drive the spinner immediately (independent of the poll) and clear any prior
+    // failure, so the user sees steady "Connecting…" — never the old flicker.
+    setConnectFailure(null);
+    setConnectingPeerId(peerId);
+    connectingRef.current = peerId;
     logDebug("info", `connect requested → ${shortId(peerId)}`);
     try {
       await invoke("connect_peer", { peerId });
       logDebug("info", "connect command accepted by engine (dialing…)");
     } catch (e) {
-      logDebug("error", `connect command rejected: ${errMessage(e)}`);
-      throw e;
+      // The command itself was rejected (engine offline / bad request) — fail now.
+      const message = errMessage(e);
+      setConnectingPeerId(null);
+      connectingRef.current = null;
+      setConnectFailure({ peerId, message });
+      logDebug("error", `connect command rejected: ${message}`);
     }
   }, []);
+
+  // Keep the poll loop's fast/slow choice in sync with the live connecting state.
+  useEffect(() => {
+    connectingRef.current = connectingPeerId;
+  }, [connectingPeerId]);
+
+  // Resolve a pending connect from the polled snapshot: success once the engine reports
+  // it connected, failure on an explicit engine error.
+  useEffect(() => {
+    if (connectingPeerId === null) return;
+    if (connection.state === "connected" && connection.peerId === connectingPeerId) {
+      setConnectingPeerId(null);
+      return;
+    }
+    if (connection.state === "idle" && connection.error) {
+      setConnectFailure({ peerId: connectingPeerId, message: connection.error });
+      setConnectingPeerId(null);
+    }
+  }, [connection, connectingPeerId]);
+
+  // Backstop: if neither connected nor an explicit error arrives within the window, treat
+  // it as failed so the attempt never hangs on a silent spinner. Keyed only on
+  // `connectingPeerId` so a routine snapshot poll doesn't keep resetting the timer.
+  useEffect(() => {
+    if (connectingPeerId === null) return;
+    const peerId = connectingPeerId;
+    const timer = setTimeout(() => {
+      setConnectFailure({
+        peerId,
+        message:
+          "Timed out — the device didn't answer. It may be offline, still starting up, " +
+          "or its address changed. Make sure it's running and try again.",
+      });
+      setConnectingPeerId(null);
+    }, CONNECT_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [connectingPeerId]);
+
+  const dismissConnectFailure = useCallback(() => setConnectFailure(null), []);
 
   const disconnectPeer = useCallback(async (): Promise<void> => {
     const invoke = await tauriInvoke();
@@ -407,6 +490,9 @@ export function useWorkspace(): Workspace {
     pairing,
     loading,
     connectPeer,
+    connectingPeerId,
+    connectFailure,
+    dismissConnectFailure,
     disconnectPeer,
     trustPeer,
     approvePairing,

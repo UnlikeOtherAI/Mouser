@@ -1,5 +1,9 @@
 import { useState } from "react";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
+import {
+  faSpinner,
+  faTriangleExclamation,
+} from "@fortawesome/free-solid-svg-icons";
 import { useWorkspace } from "../lib/use-workspace";
 import { osIcon, osLabel, stateMeta } from "../lib/os-meta";
 import { cx } from "../lib/cx";
@@ -19,6 +23,9 @@ export function DevicesSection(): React.JSX.Element {
     pairing,
     loading,
     connectPeer,
+    connectingPeerId,
+    connectFailure,
+    dismissConnectFailure,
     disconnectPeer,
     trustPeer,
     approvePairing,
@@ -46,11 +53,10 @@ export function DevicesSection(): React.JSX.Element {
     }
   };
 
-  // A failed connection attempt reported asynchronously by the daemon (e.g. the
-  // peer hasn't paired back, or is unreachable) — the dial outcome the connect
-  // command itself can't return synchronously.
-  const connectionError =
-    connection.state === "idle" ? connection.error : null;
+  // The display name for the failed peer, resolved for the pop-up message.
+  const failedPeerName = connectFailure
+    ? (peers.find((p) => p.id === connectFailure.peerId)?.name ?? "the device")
+    : null;
 
   return (
     <div className="space-y-3">
@@ -113,8 +119,9 @@ export function DevicesSection(): React.JSX.Element {
               connection.peerId === peer.id
             }
             connecting={
-              connection.state === "connecting" &&
-              connection.peerId === peer.id
+              connectingPeerId === peer.id ||
+              (connection.state === "connecting" &&
+                connection.peerId === peer.id)
             }
             busy={busyPeerId === peer.id}
             onConnect={() => void runAction(peer.id, () => connectPeer(peer.id))}
@@ -129,10 +136,17 @@ export function DevicesSection(): React.JSX.Element {
           {actionError}
         </p>
       ) : null}
-      {connectionError ? (
-        <p className="rounded-xl border border-rose-500/40 bg-rose-500/5 px-4 py-3 text-xs text-rose-300">
-          Connection failed: {connectionError}
-        </p>
+      {connectFailure ? (
+        <ConnectFailureModal
+          name={failedPeerName ?? "the device"}
+          message={connectFailure.message}
+          onRetry={() => {
+            const peerId = connectFailure.peerId;
+            dismissConnectFailure();
+            void connectPeer(peerId);
+          }}
+          onDismiss={dismissConnectFailure}
+        />
       ) : null}
       {!engineRunning ? (
         <p className="rounded-xl border border-dashed border-amber-500/40 px-4 py-3 text-xs text-amber-300">
@@ -226,9 +240,20 @@ function PeerRow({
                 type="button"
                 disabled={busy || connecting}
                 onClick={onConnect}
-                className="rounded-lg border border-sky-500/50 px-3 py-1 text-xs font-medium text-sky-200 hover:bg-sky-500/10 disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/50 px-3 py-1 text-xs font-medium text-sky-200 hover:bg-sky-500/10 disabled:opacity-60"
               >
-                {connecting ? "Connecting…" : "Connect"}
+                {connecting ? (
+                  <>
+                    <FontAwesomeIcon
+                      icon={faSpinner}
+                      spin
+                      aria-hidden="true"
+                    />
+                    Connecting…
+                  </>
+                ) : (
+                  "Connect"
+                )}
               </button>
             ) : (
               <span className="text-xs font-medium text-muted">Controller</span>
@@ -262,6 +287,71 @@ function PeerRow({
         </div>
       ) : null}
     </li>
+  );
+}
+
+interface ConnectFailureModalProps {
+  name: string;
+  message: string;
+  onRetry: () => void;
+  onDismiss: () => void;
+}
+
+/** Modal pop-up explaining why a connection attempt failed, instead of the button
+ *  silently flicking back to "Connect". Click the backdrop or Dismiss to close. */
+function ConnectFailureModal({
+  name,
+  message,
+  onRetry,
+  onDismiss,
+}: ConnectFailureModalProps): React.JSX.Element {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="connect-failure-title"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+    >
+      {/* Backdrop is a real button so it's keyboard-accessible (click/Enter to close). */}
+      <button
+        type="button"
+        aria-label="Dismiss"
+        onClick={onDismiss}
+        className="absolute inset-0 bg-black/50"
+      />
+      <div className="relative w-full max-w-sm rounded-2xl border border-rose-500/40 bg-ink-card p-5 shadow-xl">
+        <div className="flex items-center gap-2">
+          <FontAwesomeIcon
+            icon={faTriangleExclamation}
+            aria-hidden="true"
+            className="text-rose-300"
+          />
+          <h2
+            id="connect-failure-title"
+            className="text-sm font-semibold text-fg"
+          >
+            Couldn&apos;t connect to {name}
+          </h2>
+        </div>
+        <p className="mt-2 text-xs leading-relaxed text-muted">{message}</p>
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-fg hover:bg-ink-line"
+          >
+            Dismiss
+          </button>
+          <button
+            type="button"
+            onClick={onRetry}
+            className="rounded-lg border border-sky-500/50 bg-sky-500/20 px-3 py-1 text-xs font-medium text-sky-100 hover:bg-sky-500/30"
+          >
+            Try again
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
