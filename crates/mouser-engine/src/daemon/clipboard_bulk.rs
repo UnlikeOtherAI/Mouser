@@ -13,6 +13,16 @@ use crate::discovery::{self, PeerRegistry};
 
 use super::file_transfer::BULK_SESSION_ID;
 
+/// Upper bound on a single inbound clipboard transfer's reassembled size. Each chunk is
+/// already capped at [`MAX_DATA_CHUNK`] (1 MiB), but the receive loop runs `while !last`
+/// with no total bound — a (cert-pinned, active) peer that never sets `last` could stream
+/// forever and exhaust memory. 256 MiB comfortably covers a large clipboard image while
+/// bounding the blast radius.
+const MAX_CLIPBOARD_BULK_TOTAL: u64 = 256 * 1024 * 1024;
+/// Upper bound on chunk count for one transfer — guards the byte cap against a flood of
+/// zero-/tiny-byte chunks (which would never trip a pure byte limit).
+const MAX_CLIPBOARD_BULK_CHUNKS: u64 = 64 * 1024;
+
 #[derive(Clone, Debug)]
 pub(super) struct InboundClipboardData {
     pub peer_id: DeviceId,
@@ -59,13 +69,14 @@ impl BulkClipboardSender {
                 crate::daemon_store::format_device_id(&self.peer)
             )
         })?;
-        let addr = discovery::peer_bulk_socket_addr(&advert).ok_or_else(|| {
-            format!(
+        let addrs = discovery::peer_bulk_socket_addrs(&advert);
+        if addrs.is_empty() {
+            return Err(format!(
                 "peer {} did not advertise a dialable bulk endpoint",
                 advert.instance_name()
-            )
-        })?;
-        let conn = self.connection_for(addr).await?;
+            ));
+        }
+        let conn = self.connection_for(&addrs).await?;
         if let Err(e) = send_chunks_on_connection(conn.as_ref(), chunks).await {
             self.clear_connection().await;
             return Err(e);
@@ -73,15 +84,15 @@ impl BulkClipboardSender {
         Ok(())
     }
 
-    async fn connection_for(&self, addr: SocketAddr) -> Result<Arc<BulkConnection>, String> {
+    async fn connection_for(&self, addrs: &[SocketAddr]) -> Result<Arc<BulkConnection>, String> {
         if let Some(conn) = self.connection.lock().await.as_ref().cloned() {
             return Ok(conn);
         }
         let conn = Arc::new(
             self.endpoint
-                .connect_bulk(
+                .connect_bulk_any(
                     self.identity.as_ref(),
-                    addr,
+                    addrs,
                     PinPolicy::Pinned(self.peer),
                     BULK_SESSION_ID,
                 )
@@ -162,6 +173,8 @@ pub(super) async fn receive_clipboard_stream(
     let hash = first.hash.clone();
     let format = first.format;
     let mut last = first.last;
+    let mut total: u64 = first.data.len() as u64;
+    let mut chunks: u64 = 1;
     publish_chunk(&tx, peer_id, first);
 
     while !last {
@@ -171,6 +184,14 @@ pub(super) async fn receive_clipboard_stream(
         }
         let chunk: ClipboardData = from_cbor(&payload).map_err(|e| e.to_string())?;
         validate_chunk(&chunk, &hash, format)?;
+        total = total.saturating_add(chunk.data.len() as u64);
+        chunks = chunks.saturating_add(1);
+        if total > MAX_CLIPBOARD_BULK_TOTAL {
+            return Err("clipboard bulk transfer exceeded 256 MiB".to_string());
+        }
+        if chunks > MAX_CLIPBOARD_BULK_CHUNKS {
+            return Err("clipboard bulk transfer exceeded chunk limit".to_string());
+        }
         last = chunk.last;
         publish_chunk(&tx, peer_id, chunk);
     }

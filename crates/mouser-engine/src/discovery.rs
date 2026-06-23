@@ -91,6 +91,21 @@ pub fn peer_socket_addrs(advert: &PeerAdvert) -> Vec<SocketAddr> {
         .collect()
 }
 
+/// ALL dialable socket addresses for a peer's **bulk** endpoint, ordered most-reachable-
+/// first — the bulk-plane analogue of [`peer_socket_addrs`]. Feeds
+/// [`mouser_net::BulkEndpoint::connect_bulk_any`] so a wrong-family mDNS resolution doesn't
+/// hang the clipboard/file dial on the idle timeout. Empty if the peer has no bulk port or
+/// no usable address.
+pub fn peer_bulk_socket_addrs(advert: &PeerAdvert) -> Vec<SocketAddr> {
+    if advert.bport == 0 {
+        return Vec::new();
+    }
+    ordered_dialable_ips(&advert.addrs)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, advert.bport))
+        .collect()
+}
+
 /// `addrs` ordered for dialing: routable IPv4 first (most reliable on a LAN), then
 /// routable IPv6; loopback / unspecified / bare link-local IPv6 are dropped.
 fn ordered_dialable_ips(addrs: &[IpAddr]) -> Vec<IpAddr> {
