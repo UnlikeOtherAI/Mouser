@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ClipboardProgress } from "./components/clipboard-progress";
 import { SideNav } from "./components/side-nav";
 import { DIAGNOSTICS_NAV_ITEM, NAV_ITEMS } from "./lib/mock-data";
@@ -6,6 +6,10 @@ import {
   readDiagnosticsPreference,
   writeDiagnosticsPreference,
 } from "./lib/diagnostics-preference";
+import {
+  readSectionPreference,
+  writeSectionPreference,
+} from "./lib/section-preference";
 import { useApplySettings } from "./lib/use-apply-settings";
 import { useWorkspace } from "./lib/use-workspace";
 import type { ClipboardTransfer, SectionId } from "./lib/types";
@@ -64,10 +68,20 @@ function renderSection(
 
 /** Top-level settings/layout shell: left nav + active section panel. */
 export function App(): React.JSX.Element {
-  const [active, setActive] = useState<SectionId>("layout");
+  const [active, setActive] = useState<SectionId>(() => {
+    const saved = readSectionPreference();
+    // Don't restore the Diagnostics tab when it's disabled — it has no nav entry.
+    if (saved === "diagnostics" && !readDiagnosticsPreference()) return "layout";
+    return saved;
+  });
   const [showDiagnostics, setShowDiagnostics] = useState(
     readDiagnosticsPreference,
   );
+
+  // Remember the active section across restarts, so the next launch lands back on it.
+  useEffect(() => {
+    writeSectionPreference(active);
+  }, [active]);
 
   // General prefs (tray icon, launch-at-login, theme, auto-update) are
   // daemon-owned. Apply the daemon's persisted values to this machine whenever
