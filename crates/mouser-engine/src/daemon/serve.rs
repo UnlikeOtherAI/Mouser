@@ -13,27 +13,15 @@ use mouser_net::{
 };
 
 use crate::daemon_store::{format_device_id, DaemonStore};
+use crate::discovery;
 use crate::discovery::PeerRegistry;
-use crate::{discovery, EngineCore, RuntimeHandle};
 
-use super::clipboard::{self as clipboard_driver, SettingsProvider};
 use super::file_transfer;
 use super::ipc_bridge::{ConnectRequest, IpcBridge};
 use super::pairing;
 use super::reconnect::{redial_until_reconnected, ReconnectEnd};
-use super::{hostname, source_layout, windows_firewall_hint};
-
-struct SessionContext<'a> {
-    store: &'a DaemonStore,
-    registry: &'a PeerRegistry,
-    bridge: Option<&'a IpcBridge>,
-}
-
-struct SessionAdapters {
-    injector: Arc<dyn InputInjection>,
-    capture: Arc<dyn InputCapture>,
-    clipboard: Arc<dyn Clipboard>,
-}
+use super::serve_session::{run_session, SessionAdapters, SessionContext, SessionEnd};
+use super::{hostname, windows_firewall_hint};
 
 /// A serve role (`auto`/`source`/`target`): advertise + discover over mDNS, run the
 /// [`IpcBridge`] so the desktop UI reflects/drives the engine, then form one peer
@@ -48,6 +36,7 @@ pub(super) async fn serve(
     clipboard: Arc<dyn Clipboard>,
 ) -> Result<(), String> {
     let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
+    let me = Arc::new(me);
     let my_id = me.device_id();
     let my_b32 = me.device_id_base32();
     eprintln!("mouserd: device_id {my_b32}");
@@ -70,10 +59,12 @@ pub(super) async fn serve(
         .map_err(|e| e.to_string())?
         .port();
     let (bulk_peer_tx, bulk_peer_rx) = tokio::sync::watch::channel(None);
+    let (clipboard_bulk_tx, clipboard_bulk_rx) = super::clipboard_bulk::channel();
     let bulk_task = tokio::spawn(file_transfer::run_bulk_acceptor(
         Arc::clone(&bulk_endpoint),
         bulk_peer_rx,
         file_transfer::quarantine_dir(store),
+        clipboard_bulk_tx.clone(),
     ));
 
     // One shared mDNS endpoint advertises this host (§4) and feeds a single browse into
@@ -161,6 +152,9 @@ pub(super) async fn serve(
                 store,
                 registry: &registry,
                 bridge: bridge.as_ref(),
+                identity: Arc::clone(&me),
+                bulk_endpoint: Arc::clone(&bulk_endpoint),
+                clipboard_bulk_rx: Arc::clone(&clipboard_bulk_rx),
             },
             SessionAdapters {
                 injector: Arc::clone(&injector),
@@ -327,81 +321,6 @@ async fn registry_addr_for(registry: &PeerRegistry, peer_id: &DeviceId) -> Optio
         {
             return None; // timed out before the peer became discoverable
         }
-    }
-}
-
-async fn run_session(
-    my_id: DeviceId,
-    peer: DeviceId,
-    can_control: bool,
-    conn: InteractiveConnection,
-    context: SessionContext<'_>,
-    adapters: SessionAdapters,
-) -> SessionEnd {
-    let core = if can_control {
-        EngineCore::new_source(my_id, peer, source_layout())
-    } else {
-        EngineCore::new_target(my_id, peer)
-    };
-    let mut runtime =
-        RuntimeHandle::start(core, Arc::new(conn), adapters.injector, adapters.capture);
-    let peer_os = context
-        .registry
-        .find(&peer)
-        .map(|advert| clipboard_driver::os_from_str(&advert.os))
-        .unwrap_or(mouser_protocol::Os::Unknown);
-    let settings = context
-        .bridge
-        .map(|bridge| SettingsProvider::Bridge(bridge.settings_source()))
-        .unwrap_or_else(|| SettingsProvider::Fixed(context.store.load_settings()));
-    let clipboard_task = runtime.take_control_lane().map(|lane| {
-        tokio::spawn(clipboard_driver::run_driver(
-            lane,
-            adapters.clipboard,
-            my_id,
-            peer,
-            peer_os,
-            settings,
-        ))
-    });
-
-    if can_control {
-        eprintln!(
-            "mouserd: passive edge sensing active - local keyboard/mouse stay native; \
-             suppressing capture installs only while controlling the peer"
-        );
-    } else {
-        eprintln!("mouserd: target ready - injecting input received from the source");
-    }
-
-    // End the session on ctrl-c or an IPC Disconnect.
-    let end = tokio::select! {
-        _ = tokio::signal::ctrl_c() => SessionEnd::Shutdown,
-        _ = wait_for_disconnect(context.bridge) => {
-            eprintln!("mouserd: disconnect requested over IPC");
-            SessionEnd::Disconnected
-        }
-        _ = runtime.wait_dead() => SessionEnd::ConnectionLost,
-    };
-    // Tear down the runtime tasks and the capture adapter (drops any hooks/poll).
-    if let Some(task) = clipboard_task {
-        task.abort();
-    }
-    runtime.shutdown();
-    end
-}
-
-enum SessionEnd {
-    Shutdown,
-    Disconnected,
-    ConnectionLost,
-}
-
-/// Resolve when an IPC `Disconnect` command arrives (inert in headless mode).
-async fn wait_for_disconnect(bridge: Option<&IpcBridge>) {
-    match bridge {
-        Some(bridge) => bridge.next_disconnect_request().await,
-        None => std::future::pending().await,
     }
 }
 

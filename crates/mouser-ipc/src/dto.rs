@@ -328,6 +328,12 @@ pub enum Command {
         /// Base32 device id of the peer to deny.
         peer_id: String,
     },
+    /// Send local files to the currently connected peer over the daemon-owned bulk
+    /// plane. Paths are interpreted on the daemon host.
+    SendFiles {
+        /// Local filesystem paths to send.
+        paths: Vec<String>,
+    },
     /// Replace the daemon's persisted settings (full struct). The daemon saves them
     /// and republishes a fresh snapshot so every connected surface (UI + MCP) reflects
     /// the change. Callers read the current settings from the snapshot, modify, send.

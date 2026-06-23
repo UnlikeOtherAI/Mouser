@@ -1,5 +1,6 @@
-//! Daemon clipboard driver over the interactive control stream.
+//! Daemon clipboard driver over the interactive control stream and bulk plane.
 
+use std::future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use mouser_protocol::{
 
 use crate::runtime::RuntimeControlLane;
 
+use super::clipboard_bulk::{BulkClipboardSender, ClipboardBulkRx, InboundClipboardData};
 use super::ipc_bridge::SettingsSource;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -45,16 +47,31 @@ impl SettingsProvider {
     }
 }
 
+pub(super) struct DriverConfig {
+    pub my_id: DeviceId,
+    pub peer_id: DeviceId,
+    pub peer_os: Os,
+    pub settings: SettingsProvider,
+    pub bulk_sender: Option<BulkClipboardSender>,
+    pub bulk_rx: Option<ClipboardBulkRx>,
+}
+
 pub(super) async fn run_driver(
     lane: RuntimeControlLane,
     clipboard: Arc<dyn Clipboard>,
-    my_id: DeviceId,
-    peer_id: DeviceId,
-    peer_os: Os,
-    settings: SettingsProvider,
+    config: DriverConfig,
 ) {
     let mut lane = lane;
-    let mut session = ClipboardSession::new(my_id, peer_id, local_os(), peer_os);
+    let DriverConfig {
+        my_id,
+        peer_id,
+        peer_os,
+        settings,
+        bulk_sender,
+        mut bulk_rx,
+    } = config;
+    let bulk_enabled = bulk_sender.is_some() && bulk_rx.is_some();
+    let mut session = ClipboardSession::new(my_id, peer_id, local_os(), peer_os, bulk_enabled);
     let mut last_token = clipboard.change_token().ok();
     let mut tick = 0u64;
     let mut interval = tokio::time::interval(POLL_INTERVAL);
@@ -82,17 +99,57 @@ pub(super) async fn run_driver(
             msg = lane.recv() => {
                 let Some(msg) = msg else { break };
                 session.set_settings(settings.current());
-                for frame in session.on_control(msg.ty, &msg.payload, clipboard.as_ref()) {
-                    send_frame(&lane, frame);
+                for output in session.on_control(msg.ty, &msg.payload, clipboard.as_ref()) {
+                    handle_output(&lane, &bulk_sender, output);
                 }
+            }
+            bulk = recv_bulk_data(&bulk_rx) => {
+                let Some(inbound) = bulk else {
+                    bulk_rx = None;
+                    continue;
+                };
+                if inbound.peer_id != peer_id {
+                    continue;
+                }
+                session.set_settings(settings.current());
+                session.on_bulk_data(inbound.data, clipboard.as_ref());
             }
         }
     }
 }
 
+async fn recv_bulk_data(rx: &Option<ClipboardBulkRx>) -> Option<InboundClipboardData> {
+    let Some(rx) = rx else {
+        return future::pending().await;
+    };
+    let mut guard = rx.lock().await;
+    guard.recv().await
+}
+
 fn send_frame(lane: &RuntimeControlLane, frame: ControlFrame) {
     if !lane.send(frame.ty, frame.payload) {
         eprintln!("mouserd: clipboard control lane is closed");
+    }
+}
+
+fn handle_output(
+    lane: &RuntimeControlLane,
+    bulk_sender: &Option<BulkClipboardSender>,
+    output: ClipboardOutput,
+) {
+    match output {
+        ClipboardOutput::Control(frame) => send_frame(lane, frame),
+        ClipboardOutput::Bulk(chunks) => {
+            let Some(sender) = bulk_sender.clone() else {
+                eprintln!("mouserd: cannot send bulk clipboard data without a bulk endpoint");
+                return;
+            };
+            tokio::spawn(async move {
+                if let Err(e) = sender.send_chunks(chunks).await {
+                    eprintln!("mouserd: bulk clipboard send failed: {e}");
+                }
+            });
+        }
     }
 }
 
@@ -114,20 +171,34 @@ impl ControlFrame {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardOutput {
+    Control(ControlFrame),
+    Bulk(Vec<ClipboardData>),
+}
+
 struct ClipboardSession {
     engine: ClipboardEngine,
     source: MemContentSource,
     peer_id: DeviceId,
     peer_os: Os,
+    bulk_enabled: bool,
 }
 
 impl ClipboardSession {
-    fn new(my_id: DeviceId, peer_id: DeviceId, local_os: Os, peer_os: Os) -> Self {
+    fn new(
+        my_id: DeviceId,
+        peer_id: DeviceId,
+        local_os: Os,
+        peer_os: Os,
+        bulk_enabled: bool,
+    ) -> Self {
         Self {
             engine: ClipboardEngine::new(my_id, local_os, ClipboardSettings::default()),
             source: MemContentSource::new(),
             peer_id,
             peer_os,
+            bulk_enabled,
         }
     }
 
@@ -140,7 +211,7 @@ impl ClipboardSession {
         let (reps, source) = snapshot_local(clipboard, &settings);
         self.source = source;
         let offer = self.engine.on_local_change(&reps)?;
-        let offer = control_only_offer(offer)?;
+        let offer = supported_offer(offer, self.bulk_enabled)?;
         ControlFrame::encode(TYPE_CLIPBOARD_OFFER, &offer)
     }
 
@@ -149,7 +220,7 @@ impl ClipboardSession {
         ty: u16,
         payload: &[u8],
         clipboard: &dyn Clipboard,
-    ) -> Vec<ControlFrame> {
+    ) -> Vec<ClipboardOutput> {
         match ty {
             TYPE_CLIPBOARD_OFFER => self.on_offer(payload),
             TYPE_CLIPBOARD_PULL => self.on_pull(payload),
@@ -158,15 +229,16 @@ impl ClipboardSession {
         }
     }
 
-    fn on_offer(&mut self, payload: &[u8]) -> Vec<ControlFrame> {
+    fn on_offer(&mut self, payload: &[u8]) -> Vec<ClipboardOutput> {
         let Ok(offer) = from_cbor::<ClipboardOffer>(payload) else {
             return Vec::new();
         };
-        let Some(offer) = control_only_offer(offer) else {
+        let Some(offer) = supported_offer(offer, self.bulk_enabled) else {
             return Vec::new();
         };
         match self.engine.on_offer(&offer, self.peer_os) {
             Ok(Some(pull)) => ControlFrame::encode(TYPE_CLIPBOARD_PULL, &pull)
+                .map(ClipboardOutput::Control)
                 .into_iter()
                 .collect(),
             Ok(None) => Vec::new(),
@@ -177,16 +249,12 @@ impl ClipboardSession {
         }
     }
 
-    fn on_pull(&mut self, payload: &[u8]) -> Vec<ControlFrame> {
+    fn on_pull(&mut self, payload: &[u8]) -> Vec<ClipboardOutput> {
         let Ok(pull) = from_cbor::<ClipboardPull>(payload) else {
             return Vec::new();
         };
         match self.engine.on_pull(&pull, &self.source) {
-            Ok(data) => data
-                .into_iter()
-                .filter(is_control_data)
-                .filter_map(|data| ControlFrame::encode(TYPE_CLIPBOARD_DATA, &data))
-                .collect(),
+            Ok(data) => route_clipboard_data(data, self.bulk_enabled),
             Err(e) => {
                 eprintln!("mouserd: ignored clipboard pull: {e}");
                 Vec::new()
@@ -194,11 +262,23 @@ impl ClipboardSession {
         }
     }
 
-    fn on_data(&mut self, payload: &[u8], clipboard: &dyn Clipboard) -> Vec<ControlFrame> {
+    fn on_data(&mut self, payload: &[u8], clipboard: &dyn Clipboard) -> Vec<ClipboardOutput> {
         let Ok(data) = from_cbor::<ClipboardData>(payload) else {
             return Vec::new();
         };
-        match self.engine.on_data_from(self.peer_id, &data) {
+        if !is_control_data(&data) {
+            return Vec::new();
+        }
+        self.apply_data(&data, clipboard);
+        Vec::new()
+    }
+
+    fn on_bulk_data(&mut self, data: ClipboardData, clipboard: &dyn Clipboard) {
+        self.apply_data(&data, clipboard);
+    }
+
+    fn apply_data(&mut self, data: &ClipboardData, clipboard: &dyn Clipboard) {
+        match self.engine.on_data_from(self.peer_id, data) {
             Ok(Some(applied)) => {
                 if let Some(format) = to_platform(applied.format) {
                     if let Err(e) = clipboard.write(format, &applied.bytes) {
@@ -209,8 +289,25 @@ impl ClipboardSession {
             Ok(None) => {}
             Err(e) => eprintln!("mouserd: ignored clipboard data: {e}"),
         }
-        Vec::new()
     }
+}
+
+fn route_clipboard_data(data: Vec<ClipboardData>, bulk_enabled: bool) -> Vec<ClipboardOutput> {
+    let mut outputs = Vec::new();
+    let mut bulk = Vec::new();
+    for chunk in data {
+        if is_control_data(&chunk) {
+            if let Some(frame) = ControlFrame::encode(TYPE_CLIPBOARD_DATA, &chunk) {
+                outputs.push(ClipboardOutput::Control(frame));
+            }
+        } else if bulk_enabled {
+            bulk.push(chunk);
+        }
+    }
+    if !bulk.is_empty() {
+        outputs.push(ClipboardOutput::Bulk(bulk));
+    }
+    outputs
 }
 
 fn snapshot_local(
@@ -231,9 +328,6 @@ fn snapshot_local(
             continue;
         };
         let canonical = canonical(wire, &bytes);
-        if transport_for(wire, canonical.len()) != Transport::Control {
-            continue;
-        }
         let hash = content_hash(wire, &bytes);
         source.insert(wire, hash, canonical);
         reps.push(LocalRepr::new(wire, bytes));
@@ -241,16 +335,20 @@ fn snapshot_local(
     (reps, source)
 }
 
-fn control_only_offer(offer: ClipboardOffer) -> Option<ClipboardOffer> {
+fn supported_offer(offer: ClipboardOffer, bulk_enabled: bool) -> Option<ClipboardOffer> {
     let entries = offer
         .entries
         .into_iter()
-        .filter(control_entry)
+        .filter(|entry| supported_entry(entry, bulk_enabled))
         .collect::<Vec<_>>();
     (!entries.is_empty()).then_some(ClipboardOffer {
         entries,
         origin: offer.origin,
     })
+}
+
+fn supported_entry(entry: &ClipboardEntry, bulk_enabled: bool) -> bool {
+    bulk_enabled || control_entry(entry)
 }
 
 fn control_entry(entry: &ClipboardEntry) -> bool {
@@ -316,114 +414,5 @@ pub(super) fn os_from_str(value: &str) -> Os {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{Mutex, PoisonError};
-
-    use super::*;
-    use mouser_core::platform::PlatformResult;
-
-    #[derive(Default)]
-    struct FakeClipboard {
-        token: Mutex<u64>,
-        data: Mutex<Vec<(PlatformFormat, Vec<u8>)>>,
-    }
-
-    impl FakeClipboard {
-        fn set(&self, format: PlatformFormat, bytes: &[u8]) {
-            let mut data = self.data.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some((_, existing)) = data.iter_mut().find(|(stored, _)| *stored == format) {
-                *existing = bytes.to_vec();
-            } else {
-                data.push((format, bytes.to_vec()));
-            }
-            let mut token = self.token.lock().unwrap_or_else(PoisonError::into_inner);
-            *token = token.saturating_add(1);
-        }
-
-        fn get(&self, format: PlatformFormat) -> Option<Vec<u8>> {
-            self.data
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .find(|(stored, _)| *stored == format)
-                .map(|(_, bytes)| bytes.clone())
-        }
-    }
-
-    impl Clipboard for FakeClipboard {
-        fn change_token(&self) -> PlatformResult<u64> {
-            Ok(*self.token.lock().unwrap_or_else(PoisonError::into_inner))
-        }
-
-        fn read(&self, format: PlatformFormat) -> PlatformResult<Option<Vec<u8>>> {
-            Ok(self.get(format))
-        }
-
-        fn write(&self, format: PlatformFormat, data: &[u8]) -> PlatformResult<()> {
-            self.set(format, data);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn text_offer_pull_data_applies_to_peer_clipboard() {
-        let a_id = [1u8; 32];
-        let b_id = [2u8; 32];
-        let a_clip = FakeClipboard::default();
-        let b_clip = FakeClipboard::default();
-        a_clip.set(PlatformFormat::Utf8Text, b"hello from a");
-
-        let mut a = ClipboardSession::new(a_id, b_id, Os::Linux, Os::Linux);
-        let mut b = ClipboardSession::new(b_id, a_id, Os::Linux, Os::Linux);
-        a.set_settings(ClipboardSettings::default());
-        b.set_settings(ClipboardSettings::default());
-
-        let offer = a.local_offer(&a_clip).expect("local offer");
-        assert_eq!(offer.ty, TYPE_CLIPBOARD_OFFER);
-        let pulls = b.on_control(offer.ty, &offer.payload, &b_clip);
-        assert_eq!(pulls.len(), 1);
-        assert_eq!(pulls[0].ty, TYPE_CLIPBOARD_PULL);
-
-        let data = a.on_control(pulls[0].ty, &pulls[0].payload, &a_clip);
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].ty, TYPE_CLIPBOARD_DATA);
-        let replies = b.on_control(data[0].ty, &data[0].payload, &b_clip);
-        assert!(replies.is_empty());
-        assert_eq!(
-            b_clip.get(PlatformFormat::Utf8Text),
-            Some(b"hello from a".to_vec())
-        );
-    }
-
-    #[test]
-    fn prefer_native_apple_suppresses_pull() {
-        let a_id = [1u8; 32];
-        let b_id = [2u8; 32];
-        let a_clip = FakeClipboard::default();
-        let b_clip = FakeClipboard::default();
-        a_clip.set(PlatformFormat::Utf8Text, b"hello");
-
-        let mut a = ClipboardSession::new(a_id, b_id, Os::Macos, Os::Macos);
-        let mut b = ClipboardSession::new(b_id, a_id, Os::Macos, Os::Macos);
-        let settings = ClipboardSettings::default();
-        a.set_settings(settings);
-        b.set_settings(settings);
-
-        let offer = a.local_offer(&a_clip).expect("local offer");
-        assert!(b.on_control(offer.ty, &offer.payload, &b_clip).is_empty());
-    }
-
-    #[test]
-    fn settings_direction_disables_send_or_receive() {
-        let mut dto = SettingsDto {
-            clipboard_direction: "send_only".to_string(),
-            ..SettingsDto::default()
-        };
-        assert_eq!(settings_from_dto(&dto).direction, SyncDirection::SendOnly);
-        dto.clipboard_direction = "receive_only".to_string();
-        assert_eq!(
-            settings_from_dto(&dto).direction,
-            SyncDirection::ReceiveOnly
-        );
-    }
-}
+#[path = "clipboard_tests.rs"]
+mod tests;

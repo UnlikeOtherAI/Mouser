@@ -4,13 +4,14 @@
 //! `Connect`/`Disconnect` commands and to report connection state.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use mouser_core::DeviceId;
 use mouser_ipc::{
-    Command, ConnectionDto, ConnectionStateDto, DeviceDto, HealthItemDto, HealthSeverity,
-    PairingDto, PeerDto, Publisher, Server, SettingsDto, Snapshot,
+    Command, ConnectionDto, ConnectionStateDto, DeviceDto, PairingDto, PeerDto, Publisher, Server,
+    SettingsDto, Snapshot,
 };
 use tokio::sync::mpsc;
 
@@ -32,6 +33,12 @@ const OS_KIND: &str = if cfg!(target_os = "macos") {
 pub(super) struct ConnectRequest {
     pub peer_id: DeviceId,
     pub addr: Option<SocketAddr>,
+}
+
+/// A UI `SendFiles` request resolved to the currently active peer.
+pub(super) struct FileSendRequest {
+    pub peer_id: DeviceId,
+    pub paths: Vec<PathBuf>,
 }
 
 /// Shared, mutable engine state the snapshot is built from.
@@ -64,6 +71,7 @@ pub struct IpcBridge {
     // guard across the `recv().await` without breaking `Send`.
     connect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<ConnectRequest>>,
     disconnect_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
+    file_send_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<FileSendRequest>>,
     /// Approve/Deny decisions for pending pairings: `(peer_id base32, approved)`.
     decision_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, bool)>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -115,6 +123,7 @@ impl IpcBridge {
 
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
+        let (file_send_tx, file_send_rx) = mpsc::unbounded_channel();
         let (decision_tx, decision_rx) = mpsc::unbounded_channel();
 
         // The command loop owns the `Server` (it awaits `recv_command`); the bridge
@@ -128,6 +137,7 @@ impl IpcBridge {
                 publisher.clone(),
                 connect_tx,
                 disconnect_tx,
+                file_send_tx,
                 decision_tx,
             )),
         ];
@@ -137,6 +147,7 @@ impl IpcBridge {
             publisher,
             connect_rx: tokio::sync::Mutex::new(connect_rx),
             disconnect_rx: tokio::sync::Mutex::new(disconnect_rx),
+            file_send_rx: tokio::sync::Mutex::new(file_send_rx),
             decision_rx: tokio::sync::Mutex::new(decision_rx),
             tasks,
         })
@@ -153,6 +164,12 @@ impl IpcBridge {
     pub async fn next_disconnect_request(&self) {
         let mut guard = self.disconnect_rx.lock().await;
         let _ = guard.recv().await;
+    }
+
+    /// Await the next UI file-send request for the active peer.
+    pub async fn next_file_send_request(&self) -> Option<FileSendRequest> {
+        let mut guard = self.file_send_rx.lock().await;
+        guard.recv().await
     }
 
     /// Cloneable settings source for session tasks.
@@ -269,7 +286,7 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
         })
         .collect();
     peers.sort_by(|a, b| a.id.cmp(&b.id));
-    let diagnostics = build_diagnostics(shared, &peers);
+    let diagnostics = super::ipc_health::build_diagnostics(shared.started, &peers);
     Snapshot {
         local: shared.local.clone(),
         peers,
@@ -278,56 +295,6 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
         settings: lock(&shared.settings).clone(),
         diagnostics,
     }
-}
-
-/// How long discovery may find nothing before surfacing the "advertising but no peers"
-/// hint — long enough not to flap during the normal startup browse.
-const ZERO_PEERS_GRACE: Duration = Duration::from_secs(12);
-
-/// Derive connectivity health items (spec §9) from the current engine state. These are
-/// the platform-agnostic checks; richer per-OS probes (firewall rule present, OS
-/// permissions, dead-adapter egress) will append further items via the platform layer.
-/// `peers` is the already-built, self-filtered peer list.
-fn build_diagnostics(shared: &Shared, peers: &[PeerDto]) -> Vec<HealthItemDto> {
-    let mut items = Vec::new();
-
-    // Is there a usable local network address? `local_ipv4()` returns the source address
-    // of the default route; `None`, an unspecified, or a link-local 169.254.x value means
-    // the host has no real network (DHCP failed / link down), so it can neither reach the
-    // LAN nor be reached. This is the most fundamental discovery blocker.
-    let local_ok = match discovery::local_ipv4() {
-        Some(IpAddr::V4(v4)) => !v4.is_link_local() && !v4.is_unspecified(),
-        Some(IpAddr::V6(_)) => true,
-        None => false,
-    };
-    if !local_ok {
-        items.push(HealthItemDto {
-            code: "no_network_address".to_string(),
-            severity: HealthSeverity::Error,
-            title: "No network connection".to_string(),
-            detail: "This computer doesn't have a usable network address — it isn't \
-                getting an IP from the router. Connect to Wi-Fi or Ethernet so Mouser can \
-                find your other devices."
-                .to_string(),
-            remediation: Some("open_network_settings".to_string()),
-        });
-    } else if peers.is_empty() && shared.started.elapsed() > ZERO_PEERS_GRACE {
-        // On a network, but discovery has turned up nothing for a while — usually a
-        // firewall blocking inbound, or no other device is advertising. Replaces the
-        // silent "no devices found" with an actionable hint.
-        items.push(HealthItemDto {
-            code: "advertising_zero_peers".to_string(),
-            severity: HealthSeverity::Warning,
-            title: "No other devices found".to_string(),
-            detail: "Mouser is advertising on this network but hasn't discovered any \
-                other devices. Make sure another device is running Mouser on the same \
-                network, and that a firewall isn't blocking it."
-                .to_string(),
-            remediation: Some("check_firewall".to_string()),
-        });
-    }
-
-    items
 }
 
 /// Republish a fresh snapshot whenever the shared discovery registry changes, so
@@ -354,6 +321,7 @@ async fn command_loop(
     publisher: Publisher,
     connect_tx: mpsc::UnboundedSender<ConnectRequest>,
     disconnect_tx: mpsc::UnboundedSender<()>,
+    file_send_tx: mpsc::UnboundedSender<FileSendRequest>,
     decision_tx: mpsc::UnboundedSender<(String, bool)>,
 ) {
     loop {
@@ -395,6 +363,12 @@ async fn command_loop(
             Some(Command::DenyPairing { peer_id }) => {
                 let _ = decision_tx.send((peer_id, false));
             }
+            Some(Command::SendFiles { paths }) => match file_send_request(&shared, paths) {
+                Ok(request) => {
+                    let _ = file_send_tx.send(request);
+                }
+                Err(reason) => eprintln!("mouserd: IPC SendFiles rejected: {reason}"),
+            },
             Some(Command::UpdateSettings { settings }) => {
                 if let Err(e) = shared.store.save_settings(&settings) {
                     eprintln!("mouserd: failed to persist settings: {e}");
@@ -408,6 +382,23 @@ async fn command_loop(
             None => return, // server dropped
         }
     }
+}
+
+fn file_send_request(shared: &Shared, paths: Vec<String>) -> Result<FileSendRequest, String> {
+    let connection = lock(&shared.connection);
+    if connection.state != ConnectionStateDto::Connected {
+        return Err("no active peer connection".to_string());
+    }
+    let peer_text = connection
+        .peer_id
+        .as_ref()
+        .ok_or_else(|| "connected state has no peer id".to_string())?;
+    let peer_id = discovery::decode_device_id(peer_text)
+        .ok_or_else(|| "active peer id is malformed".to_string())?;
+    Ok(FileSendRequest {
+        peer_id,
+        paths: paths.into_iter().map(PathBuf::from).collect(),
+    })
 }
 
 /// Pair an optional desktop-supplied host + port into a dialable [`SocketAddr`]. Returns
@@ -459,3 +450,7 @@ fn publish_connect_error(shared: &Shared, publisher: &Publisher, reason: &str) {
     };
     publisher.publish(build_snapshot(shared));
 }
+
+#[cfg(test)]
+#[path = "ipc_bridge_tests.rs"]
+mod tests;
