@@ -16,7 +16,7 @@ use quinn::Connection;
 use rand_core::{OsRng, RngCore};
 
 use crate::control::ControlStream;
-use crate::identity::{device_id_from_cert, verifying_key_from_cert};
+use crate::identity::{device_id_from_cert, peer_leaf_cert, verifying_key_from_cert};
 use crate::NetError;
 
 /// TLS exporter label for the interactive channel proof (§5 step 4).
@@ -186,21 +186,6 @@ fn verify_hello(hello: &Hello, connection: &Connection) -> Result<DeviceId, NetE
         NetError::Connect("interactive channel_sig verification failed".to_string())
     })?;
     Ok(pinned_id)
-}
-
-fn peer_leaf_cert(
-    connection: &Connection,
-) -> Result<rustls_pki_types::CertificateDer<'static>, NetError> {
-    let identity = connection
-        .peer_identity()
-        .ok_or_else(|| NetError::Connect("peer presented no certificate".to_string()))?;
-    let certs = identity
-        .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
-        .map_err(|_| NetError::Connect("unexpected peer identity type".to_string()))?;
-    certs
-        .first()
-        .cloned()
-        .ok_or_else(|| NetError::Connect("empty peer certificate chain".to_string()))
 }
 
 fn non_empty(value: String) -> Option<String> {

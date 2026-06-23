@@ -8,7 +8,7 @@
 //! (and, in the future, §5 SAS pairing) — never from the TXT record.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use data_encoding::BASE32_NOPAD;
@@ -103,7 +103,7 @@ fn ordered_dialable_ips(addrs: &[IpAddr]) -> Vec<IpAddr> {
         addrs
             .iter()
             .copied()
-            .filter(|ip| matches!(ip, IpAddr::V6(v6) if !v6.is_loopback() && !is_ipv6_link_local(v6) && !v6.is_unspecified())),
+            .filter(|ip| matches!(ip, IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unicast_link_local() && !v6.is_unspecified())),
     );
     ordered
 }
@@ -124,19 +124,13 @@ fn best_dialable_ip(addrs: &[IpAddr]) -> Option<IpAddr> {
         return Some(*ip);
     }
     let routable_v6 = addrs.iter().find(|ip| match ip {
-        IpAddr::V6(v6) => !v6.is_loopback() && !is_ipv6_link_local(v6) && !v6.is_unspecified(),
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unicast_link_local() && !v6.is_unspecified(),
         IpAddr::V4(_) => false,
     });
     if let Some(ip) = routable_v6 {
         return Some(*ip);
     }
     addrs.first().copied()
-}
-
-/// Whether an IPv6 address is link-local (`fe80::/10`) — unreachable from another host
-/// without an interface scope id, so never the preferred dial target.
-fn is_ipv6_link_local(v6: &Ipv6Addr) -> bool {
-    (v6.segments().first().copied().unwrap_or(0) & 0xffc0) == 0xfe80
 }
 
 /// Best-effort primary outbound IPv4 of this host, to advertise an A record on the
@@ -259,7 +253,7 @@ pub async fn run_registry(browser: Browser, registry: PeerRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn device_id_base32_round_trips_through_decode() {

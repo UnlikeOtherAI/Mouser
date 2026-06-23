@@ -15,10 +15,28 @@
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::SigningKey;
 use mouser_core::{device_id_from_public_key_bytes, DeviceId, DeviceIdentity};
+use quinn::Connection;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::NetError;
+
+/// The peer's presented leaf certificate (§3), extracted from a live [`Connection`]'s
+/// rustls peer-identity. Shared by the interactive ([`crate::handshake`]) and bulk
+/// ([`crate::bulk`]) channel-proof paths so there is one cert-extraction path, not a copy
+/// per plane.
+pub(crate) fn peer_leaf_cert(connection: &Connection) -> Result<CertificateDer<'static>, NetError> {
+    let identity = connection
+        .peer_identity()
+        .ok_or_else(|| NetError::Connect("peer presented no certificate".to_string()))?;
+    let certs = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| NetError::Connect("unexpected peer identity type".to_string()))?;
+    certs
+        .first()
+        .cloned()
+        .ok_or_else(|| NetError::Connect("empty peer certificate chain".to_string()))
+}
 
 /// A self-signed TLS leaf certificate + its private key, both DER-encoded.
 pub struct TlsCertificate {

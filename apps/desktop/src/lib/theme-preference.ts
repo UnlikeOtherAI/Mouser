@@ -1,8 +1,9 @@
 /**
- * Theme preference persistence + application, mirroring the style of
- * `tray-preference.ts`.
+ * Theme application. The user's *choice* ("system" | "light" | "dark") is owned
+ * by the engine (General settings, persisted daemon-side and applied via
+ * `use-apply-settings.ts`); this module only resolves a choice to a concrete
+ * theme and reflects it into the document + native window.
  *
- * The persisted value is the user's *choice* ("system" | "light" | "dark").
  * "system" follows the OS via `prefers-color-scheme`. The effective theme is
  * applied by toggling a class on `<html>` (the `.theme-light` / `.theme-dark`
  * classes that drive the CSS-variable palette in `styles/global.css`) and by
@@ -13,26 +14,6 @@
 
 export type ThemeChoice = "system" | "light" | "dark";
 export type EffectiveTheme = "light" | "dark";
-
-const STORAGE_KEY = "mouser.theme";
-const CHOICES: readonly ThemeChoice[] = ["system", "light", "dark"];
-
-function isThemeChoice(value: string | null): value is ThemeChoice {
-  return value !== null && (CHOICES as readonly string[]).includes(value);
-}
-
-/** Read the persisted theme choice; defaults to "system". */
-export function readThemePreference(): ThemeChoice {
-  if (typeof window === "undefined") return "system";
-  const stored = window.localStorage.getItem(STORAGE_KEY);
-  return isThemeChoice(stored) ? stored : "system";
-}
-
-/** Persist the theme choice. */
-export function writeThemePreference(choice: ThemeChoice): void {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(STORAGE_KEY, choice);
-}
 
 /** Whether the OS currently prefers a dark color scheme. */
 export function systemPrefersDark(): boolean {
