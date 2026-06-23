@@ -22,7 +22,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use mouser_core::{DeviceId, DeviceIdentity};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
+use quinn::{
+    ClientConfig, Connection, Endpoint, IdleTimeout, Incoming, ServerConfig, TransportConfig,
+};
 
 use crate::control::{self, ControlStream};
 use crate::identity::{build_tls_certificate, device_id_from_cert, TlsCertificate};
@@ -168,14 +170,7 @@ impl InteractiveEndpoint {
     /// Accept the next inbound interactive connection (§6.1). The control stream is
     /// accepted and the priming frame consumed before returning (A2).
     pub async fn accept_interactive(&self) -> Result<InteractiveConnection, NetError> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| NetError::Connect("endpoint closed".to_string()))?;
-        let connection = incoming
-            .await
-            .map_err(|e| NetError::Connect(e.to_string()))?;
+        let connection = accept_after_retry(&self.endpoint).await?;
         // A server endpoint always carries its own `device_id` (set at `bind_server`); a
         // client-only endpoint cannot accept, so this is `Some` on every real accept path.
         let my_device_id = self
@@ -194,6 +189,30 @@ impl InteractiveEndpoint {
     /// Close the endpoint immediately, terminating all connections without draining.
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"shutdown");
+    }
+}
+
+async fn accept_after_retry(endpoint: &Endpoint) -> Result<Connection, NetError> {
+    loop {
+        let incoming = endpoint
+            .accept()
+            .await
+            .ok_or_else(|| NetError::Connect("endpoint closed".to_string()))?;
+        let incoming = retry_unvalidated(incoming);
+        let Some(incoming) = incoming else {
+            continue;
+        };
+        return incoming.await.map_err(|e| NetError::Connect(e.to_string()));
+    }
+}
+
+fn retry_unvalidated(incoming: Incoming) -> Option<Incoming> {
+    if incoming.remote_address_validated() {
+        return Some(incoming);
+    }
+    match incoming.retry() {
+        Ok(()) => None,
+        Err(e) => Some(e.into_incoming()),
     }
 }
 

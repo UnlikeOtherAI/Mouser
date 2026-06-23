@@ -17,158 +17,23 @@
 //! - [`Role::Target`] injects input it receives while it is the owner; it does not
 //!   capture. (Both roles run [`EngineCore::on_control`]/[`on_motion`]/[`on_tick`].)
 
-use mouser_core::platform::{CaptureMode, LocalInputEvent, ScrollUnit as CoreScrollUnit};
-use mouser_core::{
-    ownership::{Ownership, OwnershipUpdate},
-    DeviceId,
-};
+mod types;
+mod wire;
+
+use mouser_core::platform::{CaptureMode, LocalInputEvent};
+use mouser_core::{ownership::Ownership, DeviceId};
 use mouser_protocol::{
-    from_cbor, to_cbor, Datagram, FocusKind, Goodbye, GoodbyeReason, Heartbeat, KeyEvent,
-    OwnershipAck, OwnershipTransfer, Ping, PointerButton, PointerMotion, Pong, Scroll, ScrollUnit,
-    TransferReason, TYPE_GOODBYE, TYPE_HEARTBEAT, TYPE_KEY_EVENT, TYPE_OWNERSHIP_ACK,
-    TYPE_OWNERSHIP_TRANSFER, TYPE_PING, TYPE_POINTER_BUTTON, TYPE_PONG, TYPE_SCROLL,
+    to_cbor, FocusKind, Goodbye, GoodbyeReason, Heartbeat, KeyEvent, OwnershipTransfer,
+    PointerButton, PointerMotion, Scroll, ScrollUnit, TransferReason, TYPE_GOODBYE, TYPE_HEARTBEAT,
+    TYPE_KEY_EVENT, TYPE_OWNERSHIP_TRANSFER, TYPE_POINTER_BUTTON, TYPE_SCROLL,
 };
+
+pub use types::{Action, CaptureDecision, Edge, EdgeLayout, Inject, Role};
+use types::{InputAuth, InputRate, PendingAck, ReplayGuard};
 
 /// Heartbeat misses before the source declares the peer gone and reclaims (spec §7;
 /// 1 s tick × 3 = 3 s timeout).
 const HEARTBEAT_MISS_LIMIT: u32 = 3;
-
-/// Which side of this machine the peer's screen sits on (the crossing edge).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Edge {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-/// This node's role in the v1 single-peer topology.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    /// Has the physical input; captures and forwards across the edge.
-    Source,
-    /// Injects received input while it is the owner; does not capture.
-    Target,
-}
-
-/// Source-side screen geometry: this machine's logical-pixel size, the peer's size,
-/// and the edge the peer sits on. Used for edge-crossing and to seed the peer cursor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EdgeLayout {
-    pub width: i32,
-    pub height: i32,
-    pub peer_width: i32,
-    pub peer_height: i32,
-    pub edge: Edge,
-}
-
-impl EdgeLayout {
-    /// A symmetric side-by-side layout with the peer on the right.
-    pub fn side_by_side(width: i32, height: i32, peer_width: i32, peer_height: i32) -> Self {
-        Self {
-            width,
-            height,
-            peer_width,
-            peer_height,
-            edge: Edge::Right,
-        }
-    }
-}
-
-/// A concrete injection the runtime applies via [`mouser_core::platform::InputInjection`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Inject {
-    MoveCursor {
-        display_id: u32,
-        x: i32,
-        y: i32,
-    },
-    Button {
-        button: u8,
-        down: bool,
-    },
-    Key {
-        usage: u16,
-        down: bool,
-        mods: u16,
-    },
-    Scroll {
-        dx: i32,
-        dy: i32,
-        unit: CoreScrollUnit,
-    },
-}
-
-/// What the capture adapter should do with the local event just processed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaptureDecision {
-    PassThrough,
-    Suppress,
-}
-
-/// An instruction the runtime must carry out.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// Send a framed control message: `(type, CBOR payload)`.
-    SendControl(u16, Vec<u8>),
-    /// Send a lossy pointer-motion datagram.
-    SendMotion(PointerMotion),
-    /// Inject synthetic input locally.
-    Inject(Inject),
-    /// Tell the capture adapter to pass through or swallow the local event.
-    Capture(CaptureDecision),
-    /// Transition the capture adapter's mode (the "edge sensing is not input
-    /// forwarding" lever). Emitted whenever ownership changes so the runtime
-    /// installs heavyweight forwarding hooks **only** while actively controlling a
-    /// remote peer and otherwise sits in passive, non-suppressing edge sensing.
-    SetCaptureMode(CaptureMode),
-    /// Ownership/owner changed — for the tray/UI and logging.
-    OwnerChanged { owner: DeviceId, epoch: u64 },
-}
-
-/// Per-direction anti-replay state for the current epoch (spec §7.5/§7.6).
-#[derive(Clone, Copy, Debug, Default)]
-struct ReplayGuard {
-    epoch: u64,
-    last_ctr: Option<u64>,
-    last_seq: Option<u32>,
-}
-
-impl ReplayGuard {
-    /// Accept a control event iff its epoch is current and `ctr` strictly increases.
-    fn accept_ctr(&mut self, epoch: u64, ctr: u64, current_epoch: u64) -> bool {
-        if epoch != current_epoch {
-            return false;
-        }
-        if self.epoch != epoch {
-            self.epoch = epoch;
-            self.last_ctr = None;
-            self.last_seq = None;
-        }
-        if self.last_ctr.is_some_and(|prev| ctr <= prev) {
-            return false;
-        }
-        self.last_ctr = Some(ctr);
-        true
-    }
-
-    /// Accept a motion datagram iff its epoch is current and `seq` strictly increases.
-    fn accept_seq(&mut self, epoch: u64, seq: u32, current_epoch: u64) -> bool {
-        if epoch != current_epoch {
-            return false;
-        }
-        if self.epoch != epoch {
-            self.epoch = epoch;
-            self.last_ctr = None;
-            self.last_seq = None;
-        }
-        if self.last_seq.is_some_and(|prev| seq <= prev) {
-            return false;
-        }
-        self.last_seq = Some(seq);
-        true
-    }
-}
 
 /// The pure engine state machine.
 pub struct EngineCore {
@@ -181,6 +46,12 @@ pub struct EngineCore {
     out_seq: u32,
     /// Incoming anti-replay guard (peer → us).
     guard: ReplayGuard,
+    /// Peer-originated input is allowed only after a trusted current-epoch grant.
+    input_auth: InputAuth,
+    /// Per-peer input burst/rate cap.
+    input_rate: InputRate,
+    /// Outbound grant awaiting a positive OwnershipAck.
+    pending_ack: Option<PendingAck>,
     /// Virtual peer cursor while we own the peer (absolute, peer display space).
     peer_x: i32,
     peer_y: i32,
@@ -212,6 +83,9 @@ impl EngineCore {
             out_ctr: 0,
             out_seq: 0,
             guard: ReplayGuard::default(),
+            input_auth: InputAuth::new_trusted(),
+            input_rate: InputRate::full(),
+            pending_ack: None,
             peer_x: 0,
             peer_y: 0,
             last_local: None,
@@ -233,6 +107,18 @@ impl EngineCore {
     /// Whether this node currently owns input.
     pub fn is_owner(&self) -> bool {
         self.ownership.is_owner()
+    }
+
+    /// Update whether the connected peer is trusted for input. The daemon starts
+    /// runtimes only for trusted peers; this hook keeps the pure core's injection gate
+    /// explicit and testable.
+    pub fn set_peer_trusted(&mut self, trusted: bool) {
+        self.input_auth.set_peer_trusted(trusted);
+    }
+
+    /// Update whether local capability/permission allows injected peer input.
+    pub fn set_input_allowed(&mut self, allowed: bool) {
+        self.input_auth.set_input_allowed(allowed);
     }
 
     /// The capture mode this node should be in **right now**, derived purely from
@@ -412,6 +298,8 @@ impl EngineCore {
         };
         self.reset_out();
         self.guard = ReplayGuard::default();
+        self.input_auth.revoke_epoch();
+        self.pending_ack = Some(PendingAck::new(epoch));
         // Seed the peer cursor at the entry edge.
         self.peer_x = match self.layout.edge {
             Edge::Right => 0,
@@ -429,20 +317,11 @@ impl EngineCore {
             layout_rev: 0,
             reason: TransferReason::EdgeCross,
         });
-        let seq = self.next_seq();
-        let motion = PointerMotion {
-            owner_epoch: epoch,
-            seq,
-            display_id: 0,
-            x: self.peer_x,
-            y: self.peer_y,
-        };
         // SetCaptureMode goes first: the runtime escalates to ActiveForward (installs
         // suppressing hooks) before we start suppressing/forwarding this crossing.
         vec![
             Action::SetCaptureMode(CaptureMode::ActiveForward),
             Action::SendControl(TYPE_OWNERSHIP_TRANSFER, transfer),
-            Action::SendMotion(motion),
             Action::OwnerChanged {
                 owner: self.peer,
                 epoch,
@@ -455,6 +334,8 @@ impl EngineCore {
         let epoch = self.ownership.reclaim();
         self.reset_out();
         self.guard = ReplayGuard::default();
+        self.input_auth.revoke_epoch();
+        self.pending_ack = None;
         let me = self.me();
         let transfer = encode(&OwnershipTransfer {
             to: me.to_vec(),
@@ -472,148 +353,6 @@ impl EngineCore {
         ]
     }
 
-    /// Process a decoded control frame from the peer.
-    pub fn on_control(&mut self, msg_type: u16, payload: &[u8]) -> Vec<Action> {
-        match msg_type {
-            TYPE_OWNERSHIP_TRANSFER => self.on_transfer(payload),
-            TYPE_OWNERSHIP_ACK => Vec::new(), // ack tracking is best-effort in v1
-            TYPE_KEY_EVENT => self.on_key(payload),
-            TYPE_POINTER_BUTTON => self.on_button(payload),
-            TYPE_SCROLL => self.on_scroll(payload),
-            TYPE_PING => self.on_ping(payload),
-            TYPE_PONG | TYPE_HEARTBEAT => {
-                self.misses = 0;
-                Vec::new()
-            }
-            TYPE_GOODBYE => self.on_goodbye(payload),
-            _ => Vec::new(), // unknown type: skippable (§2 forward-compat)
-        }
-    }
-
-    fn on_transfer(&mut self, payload: &[u8]) -> Vec<Action> {
-        let Ok(t) = from_cbor::<OwnershipTransfer>(payload) else {
-            return Vec::new();
-        };
-        let Some(owner) = to_id(&t.to) else {
-            return Vec::new();
-        };
-        match self
-            .ownership
-            .observe_with_reason(owner, t.owner_epoch, t.reason)
-        {
-            OwnershipUpdate::Accepted { owner, epoch } => {
-                self.guard = ReplayGuard::default();
-                self.reset_out();
-                self.misses = 0;
-                let ack = encode(&OwnershipAck {
-                    owner_epoch: epoch,
-                    accepted: true,
-                    reason: None,
-                });
-                let mut actions = vec![
-                    Action::SendControl(TYPE_OWNERSHIP_ACK, ack),
-                    Action::OwnerChanged { owner, epoch },
-                ];
-                // An inbound transfer can flip a Source between owning (passive edge
-                // sensing) and forwarding (active capture) — e.g. a peer reclaiming
-                // on its side. Re-sync the capture mode to the new ownership so a
-                // Source that just lost the input stops its suppressing hooks (and
-                // one that regained it drops back to passive). Idempotent in the
-                // adapter, so a no-op when the mode is unchanged. A Target never
-                // captures, so it emits nothing here.
-                if self.role == Role::Source {
-                    actions.push(Action::SetCaptureMode(self.capture_mode()));
-                }
-                actions
-            }
-            OwnershipUpdate::Rejected(_) => {
-                let ack = encode(&OwnershipAck {
-                    owner_epoch: t.owner_epoch,
-                    accepted: false,
-                    reason: Some("stale epoch".to_string()),
-                });
-                vec![Action::SendControl(TYPE_OWNERSHIP_ACK, ack)]
-            }
-        }
-    }
-
-    fn on_key(&mut self, payload: &[u8]) -> Vec<Action> {
-        let Ok(k) = from_cbor::<KeyEvent>(payload) else {
-            return Vec::new();
-        };
-        if !self.is_owner() || !self.guard.accept_ctr(k.owner_epoch, k.ctr, self.epoch()) {
-            return Vec::new();
-        }
-        vec![Action::Inject(Inject::Key {
-            usage: k.usage,
-            down: k.down,
-            mods: k.mods,
-        })]
-    }
-
-    fn on_button(&mut self, payload: &[u8]) -> Vec<Action> {
-        let Ok(b) = from_cbor::<PointerButton>(payload) else {
-            return Vec::new();
-        };
-        if !self.is_owner() || !self.guard.accept_ctr(b.owner_epoch, b.ctr, self.epoch()) {
-            return Vec::new();
-        }
-        vec![Action::Inject(Inject::Button {
-            button: b.button,
-            down: b.down,
-        })]
-    }
-
-    fn on_scroll(&mut self, payload: &[u8]) -> Vec<Action> {
-        let Ok(s) = from_cbor::<Scroll>(payload) else {
-            return Vec::new();
-        };
-        if !self.is_owner() || !self.guard.accept_ctr(s.owner_epoch, s.ctr, self.epoch()) {
-            return Vec::new();
-        }
-        let unit = match s.unit {
-            ScrollUnit::Detent120 => CoreScrollUnit::Detent120,
-            _ => CoreScrollUnit::LogicalPixel,
-        };
-        vec![Action::Inject(Inject::Scroll {
-            dx: s.dx,
-            dy: s.dy,
-            unit,
-        })]
-    }
-
-    fn on_ping(&mut self, payload: &[u8]) -> Vec<Action> {
-        self.misses = 0;
-        let Ok(p) = from_cbor::<Ping>(payload) else {
-            return Vec::new();
-        };
-        vec![Action::SendControl(TYPE_PONG, encode(&Pong { id: p.id }))]
-    }
-
-    fn on_goodbye(&mut self, payload: &[u8]) -> Vec<Action> {
-        let _ = from_cbor::<Goodbye>(payload);
-        // Treat a peer Goodbye like a disconnect: the source reclaims its input.
-        if self.role == Role::Source && !self.is_owner() {
-            return self.reclaim_local();
-        }
-        Vec::new()
-    }
-
-    /// Process a pointer-motion datagram from the peer.
-    pub fn on_motion(&mut self, datagram: Datagram) -> Vec<Action> {
-        let Datagram::Motion(m) = datagram else {
-            return Vec::new();
-        };
-        if !self.is_owner() || !self.guard.accept_seq(m.owner_epoch, m.seq, self.epoch()) {
-            return Vec::new();
-        }
-        vec![Action::Inject(Inject::MoveCursor {
-            display_id: m.display_id,
-            x: m.x,
-            y: m.y,
-        })]
-    }
-
     /// Advance time one heartbeat interval (~1 s). Emits our heartbeat and, on the
     /// source, reclaims input if the peer has gone silent past the miss limit.
     pub fn on_tick(&mut self) -> Vec<Action> {
@@ -623,6 +362,15 @@ impl EngineCore {
             TYPE_HEARTBEAT,
             encode(&Heartbeat { seq: self.hb_seq }),
         ));
+        self.input_rate.refill();
+        if let Some(mut pending) = self.pending_ack {
+            if pending.ticks_left == 0 {
+                actions.extend(self.reclaim_local());
+                return actions;
+            }
+            pending.ticks_left = pending.ticks_left.saturating_sub(1);
+            self.pending_ack = Some(pending);
+        }
         self.misses = self.misses.saturating_add(1);
         if self.role == Role::Source && !self.is_owner() && self.misses >= HEARTBEAT_MISS_LIMIT {
             actions.extend(self.reclaim_local());
@@ -645,11 +393,6 @@ impl EngineCore {
 /// fixed-shape struct, fall back to empty bytes rather than panic (panic-free core).
 fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
     to_cbor(value).unwrap_or_default()
-}
-
-/// Parse a wire `bytes32` device id; `None` if it is not exactly 32 bytes.
-fn to_id(bytes: &[u8]) -> Option<DeviceId> {
-    <[u8; 32]>::try_from(bytes).ok()
 }
 
 fn clamp(v: i32, lo: i32, hi: i32) -> i32 {

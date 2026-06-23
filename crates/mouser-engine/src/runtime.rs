@@ -30,6 +30,7 @@
 //! the runtime's [`Shared`] state, so the adapter storing the sink never forms a
 //! strong reference cycle with the runtime.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -37,9 +38,17 @@ use mouser_core::platform::{
     CaptureDecision as CoreDecision, CaptureMode, InputCapture, InputInjection, InputSink,
     LocalInputEvent,
 };
-use mouser_net::InteractiveConnection;
+use mouser_net::{InteractiveConnection, MotionPlane};
+use mouser_protocol::{from_cbor, to_cbor, Datagram, PointerMotion};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::{Action, CaptureDecision, EngineCore, Inject};
+
+/// Engine-private control-stream fallback for absolute pointer motion when QUIC
+/// DATAGRAM is unavailable. Kept out of `mouser-protocol` until the wire registry is
+/// formalized; unknown peers skip it as a forward-compatible control type.
+const TYPE_POINTER_MOTION_FALLBACK: u16 = 0x0043;
 
 /// One queued outbound message for the sender task.
 enum Outgoing {
@@ -59,6 +68,13 @@ struct Shared {
     /// `Action::SetCaptureMode` is forwarded here and applied off the capture
     /// threads by the mode task (see module docs).
     mode_tx: tokio::sync::mpsc::UnboundedSender<CaptureMode>,
+}
+
+/// Runtime liveness surfaced to embedders and tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeState {
+    Running,
+    Dead,
 }
 
 /// Lock the core, recovering the inner value if a task panicked while holding it
@@ -82,7 +98,15 @@ impl Shared {
                 Action::SendMotion(motion) => {
                     let _ = self.out_tx.send(Outgoing::Motion(motion));
                 }
-                Action::Inject(inject) => apply_inject(&self.injector, inject),
+                Action::Inject(inject) => {
+                    if let Err(e) = apply_inject(&self.injector, inject) {
+                        eprintln!(
+                            "mouserd: input injection failed; blocking remote input and returning ownership: {e}"
+                        );
+                        let actions = lock(&self.core).on_injection_failed();
+                        self.dispatch(actions);
+                    }
+                }
                 Action::Capture(d) => decision = Some(d),
                 // Decoupled: applied by the mode task, never inline (see module docs).
                 Action::SetCaptureMode(mode) => {
@@ -133,18 +157,40 @@ impl InputSink for CaptureSink {
 pub struct RuntimeHandle {
     shared: Arc<Shared>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    cancel: CancellationToken,
+    dead: Arc<AtomicBool>,
+    dead_notify: Arc<Notify>,
 }
 
-fn apply_inject(injector: &Arc<dyn InputInjection>, inject: Inject) {
-    let result = match inject {
+fn apply_inject(
+    injector: &Arc<dyn InputInjection>,
+    inject: Inject,
+) -> mouser_core::platform::PlatformResult<()> {
+    match inject {
         Inject::MoveCursor { display_id, x, y } => injector.move_cursor(display_id, x, y),
         Inject::Button { button, down } => injector.button(button, down),
         Inject::Key { usage, down, mods } => injector.key(usage, down, mods),
         Inject::Scroll { dx, dy, unit } => injector.scroll(dx, dy, unit),
-    };
-    // Injection failures (transient OS error, lost permission) are non-fatal here;
-    // capability changes are surfaced separately via CapabilityState (future work).
-    let _ = result;
+    }
+}
+
+fn mark_dead(
+    dead: &Arc<AtomicBool>,
+    dead_notify: &Arc<Notify>,
+    cancel: &CancellationToken,
+    conn: &Arc<InteractiveConnection>,
+) {
+    if !dead.swap(true, Ordering::SeqCst) {
+        conn.close();
+        cancel.cancel();
+        dead_notify.notify_waiters();
+    }
+}
+
+fn fallback_motion(payload: &[u8]) -> Option<Datagram> {
+    from_cbor::<PointerMotion>(payload)
+        .ok()
+        .map(Datagram::Motion)
 }
 
 impl RuntimeHandle {
@@ -170,6 +216,9 @@ impl RuntimeHandle {
     ) -> Self {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outgoing>();
         let (mode_tx, mut mode_rx) = tokio::sync::mpsc::unbounded_channel::<CaptureMode>();
+        let cancel = CancellationToken::new();
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_notify = Arc::new(Notify::new());
         let shared = Arc::new(Shared {
             core: Mutex::new(core),
             out_tx,
@@ -182,16 +231,49 @@ impl RuntimeHandle {
         // Sender: serialize all outbound control/motion onto the connection.
         {
             let conn = Arc::clone(&conn);
+            let cancel = cancel.clone();
+            let dead = Arc::clone(&dead);
+            let dead_notify = Arc::clone(&dead_notify);
+            let motion_plane = conn.motion_plane();
             tasks.push(tokio::spawn(async move {
-                while let Some(msg) = out_rx.recv().await {
-                    match msg {
-                        Outgoing::Control(ty, payload) => {
-                            if conn.send_control(ty, &payload).await.is_err() {
+                let motion_plane = motion_plane;
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        msg = out_rx.recv() => {
+                            let Some(msg) = msg else {
+                                mark_dead(&dead, &dead_notify, &cancel, &conn);
                                 break;
+                            };
+                            match msg {
+                                Outgoing::Control(ty, payload) => {
+                                    if conn.send_control(ty, &payload).await.is_err() {
+                                        mark_dead(&dead, &dead_notify, &cancel, &conn);
+                                        break;
+                                    }
+                                }
+                                Outgoing::Motion(motion) => {
+                                    let send = if *motion_plane.borrow() == MotionPlane::ControlFallback {
+                                        match to_cbor(&motion) {
+                                            Ok(payload) => conn
+                                                .send_control(TYPE_POINTER_MOTION_FALLBACK, &payload)
+                                                .await,
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "mouserd: failed to encode fallback pointer motion: {e}"
+                                                );
+                                                Ok(())
+                                            }
+                                        }
+                                    } else {
+                                        conn.send_motion(&motion)
+                                    };
+                                    if send.is_err() {
+                                        mark_dead(&dead, &dead_notify, &cancel, &conn);
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        Outgoing::Motion(motion) => {
-                            let _ = conn.send_motion(&motion);
                         }
                     }
                 }
@@ -202,10 +284,30 @@ impl RuntimeHandle {
         {
             let conn = Arc::clone(&conn);
             let shared = Arc::clone(&shared);
+            let cancel = cancel.clone();
+            let dead = Arc::clone(&dead);
+            let dead_notify = Arc::clone(&dead_notify);
             tasks.push(tokio::spawn(async move {
-                while let Ok((ty, payload)) = conn.recv_control().await {
-                    let actions = lock(&shared.core).on_control(ty, &payload);
-                    shared.dispatch(actions);
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        msg = conn.recv_control() => match msg {
+                            Ok((TYPE_POINTER_MOTION_FALLBACK, payload)) => {
+                                if let Some(datagram) = fallback_motion(&payload) {
+                                    let actions = lock(&shared.core).on_motion(datagram);
+                                    shared.dispatch(actions);
+                                }
+                            }
+                            Ok((ty, payload)) => {
+                                let actions = lock(&shared.core).on_control(ty, &payload);
+                                shared.dispatch(actions);
+                            }
+                            Err(_) => {
+                                mark_dead(&dead, &dead_notify, &cancel, &conn);
+                                break;
+                            }
+                        }
+                    }
                 }
             }));
         }
@@ -214,10 +316,24 @@ impl RuntimeHandle {
         {
             let conn = Arc::clone(&conn);
             let shared = Arc::clone(&shared);
+            let cancel = cancel.clone();
+            let dead = Arc::clone(&dead);
+            let dead_notify = Arc::clone(&dead_notify);
             tasks.push(tokio::spawn(async move {
-                while let Ok(datagram) = conn.recv_motion().await {
-                    let actions = lock(&shared.core).on_motion(datagram);
-                    shared.dispatch(actions);
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        datagram = conn.recv_motion() => match datagram {
+                            Ok(datagram) => {
+                                let actions = lock(&shared.core).on_motion(datagram);
+                                shared.dispatch(actions);
+                            }
+                            Err(_) => {
+                                mark_dead(&dead, &dead_notify, &cancel, &conn);
+                                break;
+                            }
+                        }
+                    }
                 }
             }));
         }
@@ -225,13 +341,18 @@ impl RuntimeHandle {
         // Heartbeat ticker.
         {
             let shared = Arc::clone(&shared);
+            let cancel = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(tick);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    interval.tick().await;
-                    let actions = lock(&shared.core).on_tick();
-                    shared.dispatch(actions);
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            let actions = lock(&shared.core).on_tick();
+                            shared.dispatch(actions);
+                        }
+                    }
                 }
             }));
         }
@@ -241,11 +362,28 @@ impl RuntimeHandle {
         // own poll/hook thread (see module docs).
         {
             let shared = Arc::clone(&shared);
+            let cancel = cancel.clone();
             tasks.push(tokio::spawn(async move {
                 let sink = shared.make_sink();
-                while let Some(mode) = mode_rx.recv().await {
-                    if let Err(e) = shared.capture.set_mode(mode, &sink) {
-                        eprintln!("mouserd: capture set_mode({mode:?}) failed: {e}");
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        mode = mode_rx.recv() => {
+                            let Some(mode) = mode else { break };
+                            match shared.capture.set_mode(mode, &sink) {
+                                Ok(()) if mode == CaptureMode::ActiveForward
+                                    && !shared.capture.can_suppress() =>
+                                {
+                                    eprintln!(
+                                        "mouserd: capture downgrade: ActiveForward cannot suppress local input; local and remote may both receive events"
+                                    );
+                                }
+                                Ok(()) => {}
+                                Err(e) => {
+                                    eprintln!("mouserd: capture set_mode({mode:?}) failed: {e}");
+                                }
+                            }
+                        }
                     }
                 }
             }));
@@ -256,7 +394,13 @@ impl RuntimeHandle {
         let initial = lock(&shared.core).initial_actions();
         shared.dispatch(initial);
 
-        Self { shared, tasks }
+        Self {
+            shared,
+            tasks,
+            cancel,
+            dead,
+            dead_notify,
+        }
     }
 
     /// Feed one captured local event through the core (the `InputSink` seam used by
@@ -281,9 +425,39 @@ impl RuntimeHandle {
         self.shared.capture.current_mode()
     }
 
+    /// Runtime liveness: `Dead` means a network task observed connection loss or the
+    /// outbound sender ended, and the sibling tasks have been cancelled.
+    pub fn state(&self) -> RuntimeState {
+        if self.dead.load(Ordering::SeqCst) {
+            RuntimeState::Dead
+        } else {
+            RuntimeState::Running
+        }
+    }
+
+    /// Whether the runtime has reached a terminal connection-dead state.
+    pub fn is_dead(&self) -> bool {
+        self.state() == RuntimeState::Dead
+    }
+
+    /// Resolve when the runtime reaches the terminal connection-dead state.
+    pub async fn wait_dead(&self) {
+        if self.is_dead() {
+            return;
+        }
+        self.dead_notify.notified().await;
+    }
+
     /// Stop all background tasks and tear capture down.
     pub fn shutdown(self) {
-        let Self { shared, tasks } = self;
+        let Self {
+            shared,
+            tasks,
+            cancel,
+            dead: _,
+            dead_notify: _,
+        } = self;
+        cancel.cancel();
         for task in tasks {
             task.abort();
         }

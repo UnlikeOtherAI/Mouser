@@ -344,10 +344,15 @@ async fn command_loop(
                 host,
                 port,
             }) => match discovery::decode_device_id(&peer_id) {
-                Some(id) => {
-                    let addr = connect_addr(host, port);
-                    let _ = connect_tx.send(ConnectRequest { peer_id: id, addr });
-                }
+                Some(id) => match connect_request(&shared, id, host, port) {
+                    Ok(request) => {
+                        let _ = connect_tx.send(request);
+                    }
+                    Err(reason) => {
+                        eprintln!("mouserd: IPC Connect rejected for {peer_id}: {reason}");
+                        publish_connect_error(&shared, &publisher, &reason);
+                    }
+                },
                 None => eprintln!("mouserd: IPC Connect with invalid peer id: {peer_id}"),
             },
             Some(Command::Disconnect) => {
@@ -401,4 +406,37 @@ fn connect_addr(host: Option<String>, port: Option<u16>) -> Option<SocketAddr> {
         }
     };
     Some(SocketAddr::new(ip, port))
+}
+
+fn connect_request(
+    shared: &Shared,
+    peer_id: DeviceId,
+    host: Option<String>,
+    port: Option<u16>,
+) -> Result<ConnectRequest, String> {
+    let Some(advert) = shared.registry.find(&peer_id) else {
+        return Err("peer is not in the live discovery registry".to_string());
+    };
+    match shared.store.is_peer_trusted(&peer_id) {
+        Ok(true) => {}
+        Ok(false) => return Err("peer is not trusted".to_string()),
+        Err(e) => return Err(format!("trust check failed: {e}")),
+    }
+    let registry_addr = discovery::peer_socket_addr(&advert);
+    let supplied_addr = connect_addr(host, port).filter(|addr| Some(*addr) == registry_addr);
+    Ok(ConnectRequest {
+        peer_id,
+        addr: supplied_addr,
+    })
+}
+
+fn publish_connect_error(shared: &Shared, publisher: &Publisher, reason: &str) {
+    *lock(&shared.connection) = ConnectionDto {
+        state: ConnectionStateDto::Idle,
+        peer_id: None,
+        owner: None,
+        epoch: None,
+        error: Some(reason.to_string()),
+    };
+    publisher.publish(build_snapshot(shared));
 }

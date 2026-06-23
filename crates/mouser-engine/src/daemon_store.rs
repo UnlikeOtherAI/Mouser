@@ -267,15 +267,14 @@ fn decode_identity_seed(path: &Path, bytes: &[u8]) -> Result<[u8; 32], DaemonSto
 }
 
 fn write_new_identity_seed(path: &Path, identity: &DeviceIdentity) -> Result<(), DaemonStoreError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| DaemonStoreError::Io {
-            op: "create",
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    set_private_create_mode(&mut options);
+    let mut file = options.open(path).map_err(|source| DaemonStoreError::Io {
+        op: "create",
+        path: path.to_path_buf(),
+        source,
+    })?;
     let seed = identity.secret_seed();
     let mut encoded = BASE32_NOPAD.encode(&seed).to_lowercase();
     encoded.push('\n');
@@ -287,6 +286,16 @@ fn write_new_identity_seed(path: &Path, identity: &DeviceIdentity) -> Result<(),
         })?;
     set_private_permissions(path)
 }
+
+#[cfg(unix)]
+fn set_private_create_mode(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn set_private_create_mode(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<(), DaemonStoreError> {
@@ -364,6 +373,24 @@ mod tests {
         let second = store.load_or_create_identity().expect("load identity");
 
         assert_eq!(first.device_id(), second.device_id());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_seed_is_private_on_create() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("identity-private");
+        let store = DaemonStore::new(&dir);
+        let _identity = store.load_or_create_identity().expect("create identity");
+
+        let mode = fs::metadata(dir.join(IDENTITY_SEED_FILE))
+            .expect("identity metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = fs::remove_dir_all(dir);
     }
 
