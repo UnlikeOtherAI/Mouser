@@ -237,6 +237,8 @@ fn concurrent_layout_edits_resolve_by_lww_rule() {
     assert_eq!(a.layout_rev(), 1);
     assert_eq!(a.layout_editor_hex(), device_id_hex(&high_editor));
     assert_eq!(b.layout_editor_hex(), device_id_hex(&high_editor));
+    assert_eq!(a.layout(&target).expect("layout a"), vec![mon(9, 4000, 0)]);
+    assert_eq!(b.layout(&target).expect("layout b"), vec![mon(9, 4000, 0)]);
     assert_eq!(a.heads(), b.heads());
 }
 
@@ -265,6 +267,8 @@ fn higher_rev_wins_over_lower_rev() {
     assert_eq!(b.layout_rev(), 2);
     assert_eq!(a.layout_editor_hex(), device_id_hex(&dev(1)));
     assert_eq!(b.layout_editor_hex(), device_id_hex(&dev(1)));
+    assert_eq!(a.layout(&target).expect("layout a"), vec![mon(2, 0, 0)]);
+    assert_eq!(b.layout(&target).expect("layout b"), vec![mon(2, 0, 0)]);
     assert_eq!(a.heads(), b.heads());
 }
 
