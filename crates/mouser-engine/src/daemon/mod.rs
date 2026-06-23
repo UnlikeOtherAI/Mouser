@@ -116,6 +116,24 @@ pub fn run(
     });
 }
 
+/// Run the engine IN-PROCESS, for a host (the desktop app) that runs the engine itself
+/// instead of spawning a separate `mouserd` process. Same mDNS serve loop + IPC bridge as
+/// [`run`], but the CALLER owns the tokio runtime and lifecycle: spawn this as a task on
+/// the app's runtime, and on quit abort the task and call `capture.stop()` to release any
+/// input hooks (the serve loop's own `ctrl_c` arms never fire in a windowed app). Returns
+/// when the serve loop ends. `role` is `auto`/`source`/`target` (invalid falls back to
+/// `auto`). No CLI parsing, no `std::process::exit` — those stay in [`run`].
+pub async fn run_engine(
+    store: DaemonStore,
+    role: String,
+    injector: Arc<dyn InputInjection>,
+    capture: Arc<dyn InputCapture>,
+    clipboard: Arc<dyn Clipboard>,
+) -> Result<(), String> {
+    let role = role_from_arg(&role);
+    serve::serve(&store, &role, injector, capture, clipboard).await
+}
+
 /// Handle the side-effect-free local commands (`identity`/`trust`/`trusted`) that never
 /// open a socket. Returns `Ok(true)` if a command was handled (the daemon should exit).
 fn handle_local_command(
