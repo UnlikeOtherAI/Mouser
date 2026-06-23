@@ -232,32 +232,27 @@ async fn serve_client(
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-    // Push the snapshot the client sees on connect.
+    // Push the snapshot the client sees on connect — best-effort. A client that only
+    // sends a command and then immediately closes (the Connect/Disconnect/Trust path does
+    // exactly this) may already be gone by the time we write here; that write fails, but it
+    // must NOT make us return before draining the command it buffered on the read half
+    // below — otherwise the command is silently lost (the cause of "disconnect does
+    // nothing"). On a genuinely dead connection the read below errors and we return then.
     {
         let current = snapshot_rx.borrow_and_update().clone();
-        if write_message(&mut write_half, &ServerMessage::Snapshot(current))
-            .await
-            .is_err()
-        {
-            return;
-        }
+        let _ = write_message(&mut write_half, &ServerMessage::Snapshot(current)).await;
     }
 
     loop {
         tokio::select! {
-            // The daemon published a newer snapshot — forward it.
-            changed = snapshot_rx.changed() => {
-                if changed.is_err() {
-                    return; // server dropped
-                }
-                let snapshot = snapshot_rx.borrow_and_update().clone();
-                if write_message(&mut write_half, &ServerMessage::Snapshot(snapshot))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
+            // `biased`: always try to drain a pending client command BEFORE writing a
+            // snapshot. Otherwise a burst of snapshot publishes (the daemon republishes on
+            // every discovery change) keeps the snapshot branch ready, and for a client
+            // that sends a command then closes (Connect/Disconnect/Trust), the snapshot
+            // write to the now-closed client fails and this task returns *before ever
+            // reading the buffered command* — so the command is silently dropped. Reading
+            // first guarantees the command is forwarded before any write can preempt it.
+            biased;
             // The client sent a command — forward it to the daemon, replying to
             // GetSnapshot inline so the client need not wait for the next change.
             command = read_message::<_, Command>(&mut read_half) => {
@@ -278,6 +273,19 @@ async fn serve_client(
                     }
                     // Client closed or sent garbage — drop this connection.
                     Err(_) => return,
+                }
+            }
+            // The daemon published a newer snapshot — forward it.
+            changed = snapshot_rx.changed() => {
+                if changed.is_err() {
+                    return; // server dropped
+                }
+                let snapshot = snapshot_rx.borrow_and_update().clone();
+                if write_message(&mut write_half, &ServerMessage::Snapshot(snapshot))
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
         }
