@@ -2707,6 +2707,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "hkdf",
+ "if-addrs",
  "mdns-sd",
  "mouser-core",
  "mouser-files",

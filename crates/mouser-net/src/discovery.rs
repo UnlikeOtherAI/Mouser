@@ -4,7 +4,7 @@
 //! `iport`, `bport`, `caps`, `role`.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, PoisonError};
 
 use mdns_sd::{IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -25,12 +25,49 @@ fn new_daemon(loopback: bool) -> Result<ServiceDaemon, NetError> {
     daemon
         .disable_interface(IfKind::IPv6)
         .map_err(|e| NetError::Discovery(e.to_string()))?;
+    // The IPv4 analogue of the IPv6 problem above. Multi-interface hosts are now the
+    // norm (Wi-Fi + Ethernet, plus WSL/Docker/Hyper-V/VPN adapters), and an adapter
+    // stuck on an APIPA / link-local address (169.254.0.0/16) is one with no DHCP lease
+    // or a dead link — e.g. an unplugged NIC, or a virtual switch with no upstream.
+    // `mdns-sd` otherwise binds every interface, and such a dead adapter — frequently
+    // holding the *lowest* route metric, so the OS prefers it for multicast egress —
+    // silently swallows LAN discovery: queries leave on it and never reach real peers
+    // (observed: a disconnected NIC pinned on 169.254.x made every LAN peer invisible).
+    // Drop those interfaces from the set so discovery runs on the real LAN NIC(s), but
+    // only while at least one routable IPv4 interface remains, so a host that is *only*
+    // on APIPA still tries rather than going dark.
+    let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
+    let has_routable = ifaces.iter().any(|i| {
+        !i.is_loopback() && matches!(i.ip(), IpAddr::V4(v4) if !is_unusable_v4(v4))
+    });
+    if has_routable {
+        for iface in &ifaces {
+            if iface.is_loopback() {
+                continue; // loopback is governed by the `loopback` flag below
+            }
+            if let IpAddr::V4(v4) = iface.ip() {
+                if is_unusable_v4(v4) {
+                    daemon
+                        .disable_interface(IfKind::Addr(IpAddr::V4(v4)))
+                        .map_err(|e| NetError::Discovery(e.to_string()))?;
+                }
+            }
+        }
+    }
     if loopback {
         daemon
             .enable_interface(IfKind::LoopbackV4)
             .map_err(|e| NetError::Discovery(e.to_string()))?;
     }
     Ok(daemon)
+}
+
+/// Whether an IPv4 address marks an interface as unusable for LAN mDNS: APIPA /
+/// link-local (169.254.0.0/16 — assigned when DHCP fails or the link is down), the
+/// unspecified address (0.0.0.0), or loopback. Excluding these keeps a dead or
+/// low-metric adapter from swallowing discovery on a multi-interface host.
+fn is_unusable_v4(addr: Ipv4Addr) -> bool {
+    addr.is_link_local() || addr.is_unspecified() || addr.is_loopback()
 }
 
 /// The Mouser DNS-SD service type (§4).
@@ -337,5 +374,24 @@ impl Drop for Browser {
         if let Some(daemon) = &self.daemon {
             let _ = daemon.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unusable_v4_excludes_apipa_and_specials() {
+        // APIPA / link-local (the dead-adapter case) and the special addresses are out.
+        assert!(is_unusable_v4("169.254.1.1".parse().unwrap()));
+        assert!(is_unusable_v4("169.254.178.189".parse().unwrap()));
+        assert!(is_unusable_v4(Ipv4Addr::UNSPECIFIED));
+        assert!(is_unusable_v4(Ipv4Addr::LOCALHOST));
+        // Real routable addresses — including private virtual ranges (WSL/Docker) — stay:
+        // excluding a routable interface could hide a legitimate LAN path.
+        assert!(!is_unusable_v4("192.168.1.203".parse().unwrap()));
+        assert!(!is_unusable_v4("10.0.0.5".parse().unwrap()));
+        assert!(!is_unusable_v4("172.22.160.1".parse().unwrap()));
     }
 }
