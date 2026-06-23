@@ -5,8 +5,8 @@ use mouser_core::platform::{CaptureMode, LocalInputEvent};
 use mouser_engine::core::{Action, CaptureDecision, EngineCore, Inject};
 use mouser_engine::EdgeLayout;
 use mouser_protocol::{
-    from_cbor, to_cbor, Datagram, KeyEvent, OwnershipTransfer, PointerButton, PointerMotion,
-    TransferReason, TYPE_KEY_EVENT, TYPE_OWNERSHIP_ACK, TYPE_OWNERSHIP_TRANSFER,
+    from_cbor, to_cbor, Datagram, KeyEvent, OwnershipAck, OwnershipTransfer, PointerButton,
+    PointerMotion, TransferReason, TYPE_KEY_EVENT, TYPE_OWNERSHIP_ACK, TYPE_OWNERSHIP_TRANSFER,
     TYPE_POINTER_BUTTON,
 };
 
@@ -46,6 +46,15 @@ fn cursor(x: i32, y: i32) -> LocalInputEvent {
     }
 }
 
+fn ownership_ack(epoch: u64, accepted: bool) -> Vec<u8> {
+    to_cbor(&OwnershipAck {
+        owner_epoch: epoch,
+        accepted,
+        reason: None,
+    })
+    .unwrap_or_default()
+}
+
 #[test]
 fn source_passes_through_until_edge_then_grants_to_peer() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
@@ -72,6 +81,7 @@ fn source_passes_through_until_edge_then_grants_to_peer() {
 fn source_forwards_input_with_incrementing_counters_while_peer_owns() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40)); // cross → peer owns, counters reset
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
 
     let a = e.on_local_input(LocalInputEvent::Key {
         usage: 0x04,
@@ -158,6 +168,82 @@ fn target_accepts_grant_then_injects_with_anti_replay() {
             mods: 0
         })]
     );
+}
+
+#[test]
+fn target_drops_input_before_current_epoch_grant() {
+    let mut t = EngineCore::new_target(ME, PEER);
+    let key = to_cbor(&KeyEvent {
+        usage: 0x07,
+        down: true,
+        mods: 0,
+        owner_epoch: 0,
+        ctr: 1,
+    })
+    .unwrap();
+
+    assert!(
+        t.on_control(TYPE_KEY_EVENT, &key).is_empty(),
+        "a target must not inject peer input before accepting an ownership grant"
+    );
+}
+
+#[test]
+fn source_reclaims_when_ownership_ack_deadline_expires() {
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    e.on_local_input(cursor(99, 40));
+    assert!(!e.is_owner());
+
+    e.on_tick();
+    e.on_tick();
+    let actions = e.on_tick();
+    assert!(e.is_owner(), "lost ACK returns ownership locally");
+    assert!(has_set_mode(&actions, CaptureMode::PassiveEdge));
+}
+
+#[test]
+fn negative_ownership_ack_reclaims_local_input() {
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    e.on_local_input(cursor(99, 40));
+    let ack = to_cbor(&OwnershipAck {
+        owner_epoch: 1,
+        accepted: false,
+        reason: Some("blocked".to_string()),
+    })
+    .unwrap();
+
+    let actions = e.on_control(TYPE_OWNERSHIP_ACK, &ack);
+    assert!(e.is_owner());
+    assert!(has_set_mode(&actions, CaptureMode::PassiveEdge));
+}
+
+#[test]
+fn input_rate_cap_drops_excess_peer_events() {
+    let mut t = EngineCore::new_target(ME, PEER);
+    let grant = to_cbor(&OwnershipTransfer {
+        to: ME.to_vec(),
+        owner_epoch: 1,
+        layout_rev: 0,
+        reason: TransferReason::EdgeCross,
+    })
+    .unwrap();
+    t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
+
+    let mut injected = 0usize;
+    for ctr in 1..=260 {
+        let key = to_cbor(&KeyEvent {
+            usage: 0x07,
+            down: true,
+            mods: 0,
+            owner_epoch: 1,
+            ctr,
+        })
+        .unwrap();
+        if !t.on_control(TYPE_KEY_EVENT, &key).is_empty() {
+            injected = injected.saturating_add(1);
+        }
+    }
+    assert_eq!(injected, 240, "single-peer burst cap is enforced");
 }
 
 #[test]
@@ -276,6 +362,7 @@ fn target_injects_motion_and_drops_out_of_order_seq() {
 fn source_reclaims_after_heartbeat_timeout() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40)); // hand off to peer
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
     assert!(!e.is_owner());
 
     // Three silent ticks (no peer heartbeat) → reclaim local input.
@@ -293,6 +380,7 @@ fn source_reclaims_after_heartbeat_timeout() {
 fn peer_heartbeat_prevents_reclaim() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
     // Heartbeat arrives between ticks, resetting the miss counter each time.
     for _ in 0..6 {
         e.on_tick();
@@ -367,6 +455,7 @@ fn edge_cross_escalates_to_active_forward_first() {
 fn reclaim_by_crossing_back_drops_to_passive_edge() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40)); // cross to peer → ActiveForward
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
     assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
 
     // Move the (suppressed) cursor back across the near edge → reclaim locally.
@@ -386,6 +475,7 @@ fn reclaim_by_crossing_back_drops_to_passive_edge() {
 fn heartbeat_timeout_reclaim_drops_to_passive_edge() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40)); // hand off → ActiveForward
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
     assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
 
     e.on_tick();

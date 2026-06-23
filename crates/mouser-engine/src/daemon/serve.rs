@@ -82,51 +82,59 @@ pub(super) async fn serve(
             }
         };
 
-    // Wait for the first connection to form (auto-dial, accept, or IPC Connect).
-    let Some((conn, can_control)) = next_connection(
-        store,
-        &endpoint,
-        &me,
-        my_id,
-        &my_b32,
-        &registry,
-        role,
-        bridge.as_ref(),
-    )
-    .await
-    else {
-        eprintln!("mouserd: shutting down");
-        let _ = capture.stop();
-        return Ok(());
-    };
+    loop {
+        let Some((conn, can_control)) = next_connection(
+            store,
+            &endpoint,
+            &me,
+            my_id,
+            &my_b32,
+            &registry,
+            role,
+            bridge.as_ref(),
+        )
+        .await
+        else {
+            break;
+        };
 
-    let peer = conn
-        .peer_device_id()
-        .ok_or("peer did not present a device_id")?;
-    if let Some(bridge) = bridge.as_ref() {
-        bridge.set_connected(&format_device_id(&peer), &my_b32);
-    }
-    eprintln!(
-        "mouserd: connected; {}",
-        if can_control {
-            "this machine can control the peer"
-        } else {
-            "receive-only target mode"
+        let peer = conn
+            .peer_device_id()
+            .ok_or("peer did not present a device_id")?;
+        if let Some(bridge) = bridge.as_ref() {
+            bridge.set_connected(&format_device_id(&peer), &my_b32);
         }
-    );
+        eprintln!(
+            "mouserd: connected; {}",
+            if can_control {
+                "this machine can control the peer"
+            } else {
+                "receive-only target mode"
+            }
+        );
 
-    run_session(
-        my_id,
-        peer,
-        can_control,
-        conn,
-        injector,
-        Arc::clone(&capture),
-        bridge.as_ref(),
-    )
-    .await;
-    if let Some(bridge) = bridge.as_ref() {
-        bridge.set_idle();
+        let end = run_session(
+            my_id,
+            peer,
+            can_control,
+            conn,
+            Arc::clone(&injector),
+            Arc::clone(&capture),
+            bridge.as_ref(),
+        )
+        .await;
+        if let Some(bridge) = bridge.as_ref() {
+            bridge.set_idle();
+        }
+        match end {
+            SessionEnd::Shutdown => break,
+            SessionEnd::Disconnected => {
+                eprintln!("mouserd: session ended; searching for peers");
+            }
+            SessionEnd::ConnectionLost => {
+                eprintln!("mouserd: connection lost; returning to discovery");
+            }
+        }
     }
     eprintln!("mouserd: shutting down");
     let _ = capture.stop();
@@ -212,15 +220,16 @@ async fn dial_connect_request(
             format_device_id(&peer_id)
         ));
     }
-    let addr = match request.addr {
-        Some(addr) => addr,
-        None => registry_addr_for(registry, &peer_id).await.ok_or_else(|| {
-            format!(
-                "peer {} not currently discoverable",
-                format_device_id(&peer_id)
-            )
-        })?,
-    };
+    let registry_addr = registry_addr_for(registry, &peer_id).await.ok_or_else(|| {
+        format!(
+            "peer {} not currently discoverable",
+            format_device_id(&peer_id)
+        )
+    })?;
+    let addr = request
+        .addr
+        .filter(|addr| *addr == registry_addr)
+        .unwrap_or(registry_addr);
     eprintln!("mouserd: dialing {addr} (IPC connect)");
     endpoint
         .connect_interactive(me, addr, PinPolicy::Pinned(peer_id))
@@ -250,13 +259,6 @@ async fn registry_addr_for(registry: &PeerRegistry, peer_id: &DeviceId) -> Optio
     }
 }
 
-/// Run the connected session: start the engine runtime (which owns the capture
-/// adapter and drives its mode from ownership), then wait until ctrl-c or an IPC
-/// `Disconnect` ends it.
-///
-/// The runtime never installs an always-on hook: a controller comes up in passive
-/// edge sensing (no suppression, local input untouched) and only escalates to
-/// suppressing capture while it is actively driving the peer.
 async fn run_session(
     my_id: DeviceId,
     peer: DeviceId,
@@ -265,7 +267,7 @@ async fn run_session(
     injector: Arc<dyn InputInjection>,
     capture: Arc<dyn InputCapture>,
     bridge: Option<&IpcBridge>,
-) {
+) -> SessionEnd {
     let core = if can_control {
         EngineCore::new_source(my_id, peer, source_layout())
     } else {
@@ -283,14 +285,23 @@ async fn run_session(
     }
 
     // End the session on ctrl-c or an IPC Disconnect.
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+    let end = tokio::select! {
+        _ = tokio::signal::ctrl_c() => SessionEnd::Shutdown,
         _ = wait_for_disconnect(bridge) => {
             eprintln!("mouserd: disconnect requested over IPC");
+            SessionEnd::Disconnected
         }
-    }
+        _ = runtime.wait_dead() => SessionEnd::ConnectionLost,
+    };
     // Tear down the runtime tasks and the capture adapter (drops any hooks/poll).
     runtime.shutdown();
+    end
+}
+
+enum SessionEnd {
+    Shutdown,
+    Disconnected,
+    ConnectionLost,
 }
 
 /// Resolve when an IPC `Disconnect` command arrives (inert in headless mode).
