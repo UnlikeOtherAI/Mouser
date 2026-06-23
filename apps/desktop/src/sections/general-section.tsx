@@ -21,6 +21,7 @@ export function GeneralSection({
   const { settings, updateSettings, resetData } = useWorkspace();
   const [confirmingReset, setConfirmingReset] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
 
   return (
     <div className="space-y-6">
@@ -107,40 +108,58 @@ export function GeneralSection({
           title="Reset Mouser"
           description="Forget all paired devices and restore default settings. This device keeps its own identity, but other devices will need to pair with it again."
           control={
-            confirmingReset ? (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  disabled={resetting}
-                  onClick={() => {
-                    setResetting(true);
-                    void resetData().finally(() => {
-                      setResetting(false);
+            <div className="flex flex-col items-end gap-1.5">
+              {confirmingReset ? (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={resetting}
+                    onClick={() => {
+                      setResetting(true);
+                      setResetError(null);
+                      resetData()
+                        .then(() => setConfirmingReset(false))
+                        .catch((e: unknown) =>
+                          setResetError(
+                            e instanceof Error ? e.message : String(e),
+                          ),
+                        )
+                        .finally(() => setResetting(false));
+                    }}
+                    className="rounded-lg border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-xs font-medium text-rose-200 hover:bg-rose-500/20 disabled:opacity-50"
+                  >
+                    {resetting ? "Resetting…" : "Reset everything"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={resetting}
+                    onClick={() => {
                       setConfirmingReset(false);
-                    });
-                  }}
-                  className="rounded-lg border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-xs font-medium text-rose-200 hover:bg-rose-500/20 disabled:opacity-50"
-                >
-                  {resetting ? "Resetting…" : "Reset everything"}
-                </button>
+                      setResetError(null);
+                    }}
+                    className="rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-fg hover:bg-ink-line disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
                 <button
                   type="button"
-                  disabled={resetting}
-                  onClick={() => setConfirmingReset(false)}
-                  className="rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-fg hover:bg-ink-line disabled:opacity-50"
+                  onClick={() => {
+                    setConfirmingReset(true);
+                    setResetError(null);
+                  }}
+                  className="rounded-lg border border-rose-500/50 px-3 py-1 text-xs font-medium text-rose-200 hover:bg-rose-500/10"
                 >
-                  Cancel
+                  Reset…
                 </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setConfirmingReset(true)}
-                className="rounded-lg border border-rose-500/50 px-3 py-1 text-xs font-medium text-rose-200 hover:bg-rose-500/10"
-              >
-                Reset…
-              </button>
-            )
+              )}
+              {resetError ? (
+                <p className="max-w-xs text-right text-xs text-rose-300">
+                  Reset failed: {resetError}
+                </p>
+              ) : null}
+            </div>
           }
         />
       </SectionCard>

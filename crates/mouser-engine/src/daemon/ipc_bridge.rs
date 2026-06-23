@@ -377,16 +377,24 @@ async fn command_loop(
                 // Republish so every connected surface (UI + MCP) reflects it at once.
                 publisher.publish(build_snapshot(&shared));
             }
-            Some(Command::ResetData) => {
-                if let Err(e) = shared.store.reset_data() {
-                    eprintln!("mouserd: failed to reset data: {e}");
+            Some(Command::ResetData) => match shared.store.reset_data() {
+                Ok(()) => {
+                    // Drop any active session: the peer is no longer trusted after a
+                    // reset, so a still-open connection to it must not linger. Signalling
+                    // unconditionally is harmless when already idle (the plain Disconnect
+                    // path does the same).
+                    let _ = disconnect_tx.send(());
+                    // Settings revert to defaults in memory too; peer `trusted` flags are
+                    // recomputed from the (now empty) store on the next build_snapshot.
+                    *lock(&shared.settings) = SettingsDto::default();
+                    publisher.publish(build_snapshot(&shared));
+                    eprintln!("mouserd: reset — cleared trusted peers and settings");
                 }
-                // Settings revert to defaults in memory too; peer `trusted` flags are
-                // recomputed from the (now empty) store on the next build_snapshot.
-                *lock(&shared.settings) = SettingsDto::default();
-                publisher.publish(build_snapshot(&shared));
-                eprintln!("mouserd: reset — cleared trusted peers and settings");
-            }
+                // Disk reset failed: leave in-memory state untouched so the snapshot keeps
+                // reporting the real (unchanged) trust + settings — the UI then shows the
+                // reset did not take, rather than a false success — and it can be retried.
+                Err(e) => eprintln!("mouserd: reset failed, store left unchanged: {e}"),
+            },
             // GetSnapshot is answered by the server; nothing reaches here.
             Some(Command::GetSnapshot) => {}
             None => return, // server dropped
