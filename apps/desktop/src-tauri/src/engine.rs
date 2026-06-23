@@ -119,10 +119,17 @@ pub fn start(app: &tauri::AppHandle) {
         clipboard,
     } = adapters;
 
+    // Run the engine in "target" role for the desktop UI: explicit-connect-only. The user
+    // drives connections from the UI (an IPC Connect dials *and* controls the peer), and
+    // inbound peers are still accepted — but the engine never AUTO-dials a discovered peer.
+    // This makes Disconnect stick (in "auto" the lower-id side instantly re-dials a trusted
+    // peer, undoing the disconnect) and avoids the reconnect-redial loop on a dropped link
+    // (a "target" lost connection returns to discovery instead of redialing forever, which
+    // otherwise shows as a stuck "connecting").
     let task = tauri::async_runtime::spawn(async move {
         if let Err(e) = mouser_engine::daemon::run_engine(
             store,
-            "auto".to_string(),
+            "target".to_string(),
             injector,
             capture,
             clipboard,

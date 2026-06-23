@@ -8,7 +8,7 @@
 //! (and, in the future, §5 SAS pairing) — never from the TXT record.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use data_encoding::BASE32_NOPAD;
@@ -55,28 +55,54 @@ pub fn peer_device_id(advert: &PeerAdvert) -> Option<DeviceId> {
     decode_device_id(&advert.id)
 }
 
-/// The first dialable socket address for a peer (resolved IP + interactive port).
-/// `None` if the peer advertised no address or no interactive port.
+/// The best dialable socket address for a peer's interactive endpoint (resolved IP +
+/// interactive port). `None` if the peer advertised no usable address or no interactive
+/// port. Prefers a routable address over a link-local IPv6 — see [`best_dialable_ip`].
 pub fn peer_socket_addr(advert: &PeerAdvert) -> Option<SocketAddr> {
     if advert.iport == 0 {
         return None;
     }
-    advert
-        .addrs
-        .first()
-        .map(|ip| SocketAddr::new(*ip, advert.iport))
+    best_dialable_ip(&advert.addrs).map(|ip| SocketAddr::new(ip, advert.iport))
 }
 
-/// The first dialable socket address for a peer's bulk endpoint.
-/// `None` if the peer advertised no address or no bulk port.
+/// The best dialable socket address for a peer's bulk endpoint.
+/// `None` if the peer advertised no usable address or no bulk port.
 pub fn peer_bulk_socket_addr(advert: &PeerAdvert) -> Option<SocketAddr> {
     if advert.bport == 0 {
         return None;
     }
-    advert
-        .addrs
-        .first()
-        .map(|ip| SocketAddr::new(*ip, advert.bport))
+    best_dialable_ip(&advert.addrs).map(|ip| SocketAddr::new(ip, advert.bport))
+}
+
+/// Choose which advertised IP to dial. A peer commonly advertises several addresses at
+/// once — an IPv4, a global IPv6, and a link-local IPv6 — and the order is not
+/// meaningful. A bare link-local `fe80::/10` is NOT reachable from another host without
+/// an interface scope id, so dialing it just hangs until timeout (the cause of a stuck
+/// "connecting"). Prefer, in order: a routable IPv4 (most reliable on a LAN), then a
+/// routable IPv6, falling back to the first advertised address only when nothing better
+/// exists — so a peer that advertises any routable address is always dialed on it.
+fn best_dialable_ip(addrs: &[IpAddr]) -> Option<IpAddr> {
+    let routable_v4 = addrs.iter().find(|ip| match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(_) => false,
+    });
+    if let Some(ip) = routable_v4 {
+        return Some(*ip);
+    }
+    let routable_v6 = addrs.iter().find(|ip| match ip {
+        IpAddr::V6(v6) => !v6.is_loopback() && !is_ipv6_link_local(v6) && !v6.is_unspecified(),
+        IpAddr::V4(_) => false,
+    });
+    if let Some(ip) = routable_v6 {
+        return Some(*ip);
+    }
+    addrs.first().copied()
+}
+
+/// Whether an IPv6 address is link-local (`fe80::/10`) — unreachable from another host
+/// without an interface scope id, so never the preferred dial target.
+fn is_ipv6_link_local(v6: &Ipv6Addr) -> bool {
+    (v6.segments().first().copied().unwrap_or(0) & 0xffc0) == 0xfe80
 }
 
 /// Best-effort primary outbound IPv4 of this host, to advertise an A record on the
