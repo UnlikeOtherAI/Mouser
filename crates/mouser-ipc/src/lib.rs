@@ -92,8 +92,6 @@ mod loopback_tests {
         client
             .send_command(&Command::Connect {
                 peer_id: want_peer.clone(),
-                host: Some("192.168.1.50".to_string()),
-                port: Some(49970),
             })
             .await
             .expect("send connect");
@@ -101,14 +99,7 @@ mod loopback_tests {
             .await
             .expect("command did not arrive in time")
             .expect("server still receiving");
-        assert_eq!(
-            command,
-            Command::Connect {
-                peer_id: want_peer,
-                host: Some("192.168.1.50".to_string()),
-                port: Some(49970),
-            }
-        );
+        assert_eq!(command, Command::Connect { peer_id: want_peer });
     }
 
     /// A snapshot the daemon publishes after connect is pushed to the live client.

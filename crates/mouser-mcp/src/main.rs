@@ -367,12 +367,7 @@ async fn run_tool(name: &str, args: &Value) -> Result<String, String> {
         "engine_log" => read_engine_log(),
         "connect" => {
             let peer_id = arg_peer_id(args)?;
-            send_then_snapshot(Command::Connect {
-                peer_id,
-                host: None,
-                port: None,
-            })
-            .await
+            send_then_snapshot(Command::Connect { peer_id }).await
         }
         "disconnect" => send_then_snapshot(Command::Disconnect).await,
         "get_settings" => get_settings_text().await,
