@@ -65,6 +65,17 @@ mod loopback_tests {
         let mut server = Server::bind_at(&socket, initial.clone())
             .await
             .expect("bind server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&socket)
+                .expect("socket metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
         let mut client = Client::connect_at(&socket).await.expect("connect client");
 

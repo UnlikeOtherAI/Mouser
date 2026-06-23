@@ -2682,6 +2682,7 @@ name = "mouser-ipc"
 version = "0.0.0"
 dependencies = [
  "ciborium",
+ "nix",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -2812,6 +2813,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
