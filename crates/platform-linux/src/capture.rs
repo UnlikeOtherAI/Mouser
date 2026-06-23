@@ -35,6 +35,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -42,7 +43,8 @@ use std::time::Duration;
 
 use input_linux::{EvdevHandle, Key};
 use mouser_core::platform::{
-    CaptureDecision, CaptureMode, InputCapture, InputSink, PlatformError, PlatformResult,
+    CaptureDecision, CaptureMode, InputCapture, InputSink, LocalInputEvent, PlatformError,
+    PlatformResult,
 };
 
 use crate::capture_translate::{to_local_event, VirtualCursor};
@@ -65,6 +67,28 @@ const IDLE_POLL: Duration = Duration::from_millis(4);
 /// in logical pixels, when no explicit bound is supplied.
 const DEFAULT_DESKTOP_W: i32 = 1920;
 const DEFAULT_DESKTOP_H: i32 = 1080;
+const LEFT_CTRL_BIT: u16 = 1 << 0;
+const RIGHT_CTRL_BIT: u16 = 1 << 4;
+const EMERGENCY_RECLAIM_CTRL_MASK: u16 = LEFT_CTRL_BIT | RIGHT_CTRL_BIT;
+
+/// The local emergency-reclaim chord is both Ctrl keys held at once.
+#[must_use]
+pub fn emergency_reclaim_chord_from_mods(mods: u16) -> bool {
+    mods & EMERGENCY_RECLAIM_CTRL_MASK == EMERGENCY_RECLAIM_CTRL_MASK
+}
+
+/// Whether a captured key event exposes the emergency-reclaim chord to the sink.
+#[must_use]
+pub fn is_emergency_reclaim_event(event: LocalInputEvent) -> bool {
+    matches!(
+        event,
+        LocalInputEvent::Key {
+            down: true,
+            mods,
+            ..
+        } if emergency_reclaim_chord_from_mods(mods)
+    )
+}
 
 /// One opened evdev device the capture reads from and (when suppressing) grabs.
 struct CaptureDevice {
@@ -103,6 +127,12 @@ impl Default for LinuxCapture {
     }
 }
 
+impl Drop for LinuxCapture {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 impl LinuxCapture {
     /// A not-yet-started capture handle with the default desktop bound.
     #[must_use]
@@ -135,6 +165,75 @@ impl LinuxCapture {
 /// same discipline `platform-mac` and the uinput injector use.
 fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[derive(Debug, Default)]
+struct EmergencyReclaim {
+    held_mods: u16,
+    active: bool,
+}
+
+impl EmergencyReclaim {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn observe(&mut self, event: LocalInputEvent) -> (LocalInputEvent, bool) {
+        let was_active = self.active;
+        let event = match event {
+            LocalInputEvent::Key { usage, down, .. } => {
+                self.update_modifier(usage, down);
+                if emergency_reclaim_chord_from_mods(self.held_mods) {
+                    self.active = true;
+                }
+                LocalInputEvent::Key {
+                    usage,
+                    down,
+                    mods: self.held_mods,
+                }
+            }
+            other => other,
+        };
+        let force_pass = was_active || self.active;
+        if self.active && self.held_mods & EMERGENCY_RECLAIM_CTRL_MASK == 0 {
+            self.active = false;
+        }
+        (event, force_pass)
+    }
+
+    fn update_modifier(&mut self, usage: u16, down: bool) {
+        let Some(bit) = modifier_bit(usage) else {
+            return;
+        };
+        if down {
+            self.held_mods |= bit;
+        } else {
+            self.held_mods &= !bit;
+        }
+    }
+}
+
+fn modifier_bit(usage: u16) -> Option<u16> {
+    if (0xE0..=0xE7).contains(&usage) {
+        Some(1 << (usage - 0xE0))
+    } else {
+        None
+    }
+}
+
+fn decision_for(
+    sink: &dyn InputSink,
+    event: LocalInputEvent,
+    reclaim: &mut EmergencyReclaim,
+) -> CaptureDecision {
+    let (event, force_pass) = reclaim.observe(event);
+    let decision = catch_unwind(AssertUnwindSafe(|| sink.on_event(event)))
+        .unwrap_or(CaptureDecision::PassThrough);
+    if force_pass {
+        CaptureDecision::PassThrough
+    } else {
+        decision
+    }
 }
 
 /// Capture could not open any usable input device — almost always missing
@@ -239,6 +338,7 @@ fn drain_device(
     dev: &EvdevHandle<File>,
     sink: &dyn InputSink,
     cursor: &VirtualCursor,
+    reclaim: &mut EmergencyReclaim,
 ) -> (CaptureDecision, bool) {
     let mut decision = CaptureDecision::PassThrough;
     let mut read_any = false;
@@ -248,7 +348,10 @@ fn drain_device(
     while let Ok(ev) = dev.read_input_event() {
         read_any = true;
         if let Some(local) = to_local_event(ev.kind, ev.code, ev.value, cursor) {
-            if matches!(sink.on_event(local), CaptureDecision::Suppress) {
+            if matches!(
+                decision_for(sink, local, reclaim),
+                CaptureDecision::Suppress
+            ) {
                 decision = CaptureDecision::Suppress;
             }
         }
@@ -282,12 +385,13 @@ impl LinuxCapture {
         let handle = std::thread::Builder::new()
             .name("mouser-linux-capture".into())
             .spawn(move || {
+                let mut reclaim = EmergencyReclaim::new();
                 while running.load(Ordering::Relaxed) {
                     let mut any = false;
                     let mut frame = CaptureDecision::PassThrough;
                     for dev in devices.iter() {
                         let (decision, read_any) =
-                            drain_device(&dev.handle, sink.as_ref(), &cursor);
+                            drain_device(&dev.handle, sink.as_ref(), &cursor, &mut reclaim);
                         any |= read_any;
                         if matches!(decision, CaptureDecision::Suppress) {
                             frame = CaptureDecision::Suppress;

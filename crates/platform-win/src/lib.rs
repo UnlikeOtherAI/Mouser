@@ -54,6 +54,10 @@ mod cfhtml;
 #[cfg(target_os = "windows")]
 pub mod adapter;
 #[cfg(target_os = "windows")]
+mod capture;
+#[cfg(target_os = "windows")]
+mod capture_hooks;
+#[cfg(target_os = "windows")]
 pub mod inject;
 #[cfg(target_os = "windows")]
 pub use adapter::{active_display_bounds, display_bounds, DisplayBounds, WinCapture, WinInjector};

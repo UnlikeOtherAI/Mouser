@@ -89,6 +89,30 @@ impl ModifierState {
             true // was not held -> pressed
         }
     }
+
+    /// HID modifier bitmask for the modifier keys currently held.
+    #[must_use]
+    pub fn modifier_bits(&self) -> u16 {
+        let mut bits = 0;
+        for keycode in &self.held {
+            if let Some(usage) = cgkeycode_to_hid_usage(*keycode).and_then(modifier_bit) {
+                bits |= usage;
+            }
+        }
+        bits
+    }
+}
+
+fn modifier_bit(usage: u16) -> Option<u16> {
+    if (0xE0..=0xE7).contains(&usage) {
+        Some(1 << (usage - 0xE0))
+    } else {
+        None
+    }
+}
+
+fn saturating_i64_to_i32(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
 }
 
 /// Resolve a macOS `FlagsChanged` event into the `(HID usage, down)` of the
@@ -203,8 +227,8 @@ pub fn to_local_event(etype: CGEventType, event: &CGEvent) -> Option<LocalInputE
             let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
             let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
             Some(LocalInputEvent::Scroll {
-                dx: dx as i32,
-                dy: dy as i32,
+                dx: saturating_i64_to_i32(dx),
+                dy: saturating_i64_to_i32(dy),
             })
         }
         _ => None,
@@ -242,6 +266,21 @@ mod tests {
         // usages (0xE5, 0xE7) on press.
         assert_eq!(flags_changed_event(0x3C, &mut s), Some((0xE5, true)));
         assert_eq!(flags_changed_event(0x36, &mut s), Some((0xE7, true)));
+    }
+
+    #[test]
+    fn modifier_bits_include_held_left_and_right_ctrl() {
+        let mut s = ModifierState::new();
+        assert_eq!(flags_changed_event(0x3B, &mut s), Some((0xE0, true)));
+        assert_eq!(flags_changed_event(0x3E, &mut s), Some((0xE4, true)));
+        assert_eq!(s.modifier_bits(), (1 << 0) | (1 << 4));
+    }
+
+    #[test]
+    fn scroll_delta_conversion_saturates_instead_of_wrapping() {
+        assert_eq!(saturating_i64_to_i32(i64::from(i32::MAX) + 1), i32::MAX);
+        assert_eq!(saturating_i64_to_i32(i64::from(i32::MIN) - 1), i32::MIN);
+        assert_eq!(saturating_i64_to_i32(-120), -120);
     }
 
     #[test]

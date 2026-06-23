@@ -1,17 +1,12 @@
 //! macOS adapters implementing the `mouser_core` platform traits (audit H2/H3).
 //!
-//! - [`MacInjector`] implements `mouser_core::InputInjection`. The free
-//!   functions in [`crate::inject`] are its private bodies; it adds the
-//!   `display_id` → global-coordinate translation (audit M1) and threads the
-//!   wire `mods`/`ScrollUnit` through.
-//! - [`MacCapture`] implements `mouser_core::InputCapture`. It installs a
-//!   **default** (suppress-capable) `CGEventTap` on a background run loop and
-//!   honors the [`CaptureDecision`] the sink returns: `Suppress` drops the event
-//!   locally, `PassThrough` keeps it. Real suppression needs an active
-//!   `CGEventTap` backed by **Accessibility**; when that tap can't be created the
-//!   adapter falls back to listen-only and reports `can_suppress() == false`
-//!   instead of pretending it swallowed input.
+//! - [`MacInjector`] wraps [`crate::inject`] and adds display-local to global
+//!   coordinate translation (audit M1).
+//! - [`MacCapture`] installs a background `CGEventTap`, honors
+//!   [`CaptureDecision`], and falls back to listen-only when Accessibility is
+//!   missing so `can_suppress() == false` is honest.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -69,6 +64,75 @@ fn boxed(e: inject::InjectError) -> PlatformError {
 /// is undefined behavior). Behavior on the happy (unpoisoned) path is identical.
 fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+const LEFT_CTRL_BIT: u16 = 1 << 0;
+const RIGHT_CTRL_BIT: u16 = 1 << 4;
+const EMERGENCY_RECLAIM_CTRL_MASK: u16 = LEFT_CTRL_BIT | RIGHT_CTRL_BIT;
+
+/// The local emergency-reclaim chord is both Ctrl keys held at once.
+#[must_use]
+pub fn emergency_reclaim_chord_from_mods(mods: u16) -> bool {
+    mods & EMERGENCY_RECLAIM_CTRL_MASK == EMERGENCY_RECLAIM_CTRL_MASK
+}
+
+/// Whether a captured key event exposes the emergency-reclaim chord to the sink.
+#[must_use]
+pub fn is_emergency_reclaim_event(event: LocalInputEvent) -> bool {
+    matches!(
+        event,
+        LocalInputEvent::Key {
+            down: true,
+            mods,
+            ..
+        } if emergency_reclaim_chord_from_mods(mods)
+    )
+}
+
+#[derive(Debug, Default)]
+struct EmergencyReclaim {
+    held_ctrl_bits: u16,
+    active: bool,
+}
+
+impl EmergencyReclaim {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn observe(&mut self, event: LocalInputEvent) -> bool {
+        let was_active = self.active;
+        if let LocalInputEvent::Key { usage, down, mods } = event {
+            self.update_ctrl(usage, down);
+            if emergency_reclaim_chord_from_mods(mods | self.held_ctrl_bits) {
+                self.active = true;
+            }
+        }
+        let force_pass = was_active || self.active;
+        if self.active && self.held_ctrl_bits == 0 {
+            self.active = false;
+        }
+        force_pass
+    }
+
+    fn update_ctrl(&mut self, usage: u16, down: bool) {
+        let Some(bit) = ctrl_bit(usage) else {
+            return;
+        };
+        if down {
+            self.held_ctrl_bits |= bit;
+        } else {
+            self.held_ctrl_bits &= !bit;
+        }
+    }
+}
+
+fn ctrl_bit(usage: u16) -> Option<u16> {
+    match usage {
+        0xE0 => Some(LEFT_CTRL_BIT),
+        0xE4 => Some(RIGHT_CTRL_BIT),
+        _ => None,
+    }
 }
 
 /// Error when a wire `display_id` matches no active display.
@@ -141,6 +205,12 @@ pub struct MacCapture {
 impl Default for MacCapture {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for MacCapture {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
@@ -285,8 +355,18 @@ fn events_of_interest() -> Vec<CGEventType> {
 
 /// Hand one modeled event to the sink and translate its [`CaptureDecision`] into
 /// the tap's [`CallbackResult`].
-fn decision_for(sink: &dyn InputSink, ev: LocalInputEvent) -> CallbackResult {
-    match sink.on_event(ev) {
+fn decision_for(
+    sink: &dyn InputSink,
+    ev: LocalInputEvent,
+    reclaim: &Mutex<EmergencyReclaim>,
+) -> CallbackResult {
+    let force_pass = lock_recover(reclaim).observe(ev);
+    let decision = catch_unwind(AssertUnwindSafe(|| sink.on_event(ev)))
+        .unwrap_or(CaptureDecision::PassThrough);
+    if force_pass {
+        return CallbackResult::Keep;
+    }
+    match decision {
         CaptureDecision::PassThrough => CallbackResult::Keep,
         CaptureDecision::Suppress => CallbackResult::Drop,
     }
@@ -305,21 +385,19 @@ fn handle_flags_changed(
     sink: &dyn InputSink,
     event: &CGEvent,
     state: &Mutex<ModifierState>,
+    reclaim: &Mutex<EmergencyReclaim>,
 ) -> CallbackResult {
     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
     let resolved = u16::try_from(keycode).ok().and_then(|kc| {
         let mut guard = lock_recover(state);
-        flags_changed_event(kc, &mut guard)
+        flags_changed_event(kc, &mut guard).map(|(usage, down)| LocalInputEvent::Key {
+            usage,
+            down,
+            mods: guard.modifier_bits(),
+        })
     });
     match resolved {
-        Some((usage, down)) => decision_for(
-            sink,
-            LocalInputEvent::Key {
-                usage,
-                down,
-                mods: 0,
-            },
-        ),
+        Some(ev) => decision_for(sink, ev, reclaim),
         None => CallbackResult::Keep,
     }
 }
@@ -336,12 +414,13 @@ fn make_callback(
        + Send
        + 'static {
     let mod_state = Arc::new(Mutex::new(ModifierState::new()));
+    let reclaim = Arc::new(Mutex::new(EmergencyReclaim::new()));
     move |_proxy, etype, event| {
         if matches!(etype, CGEventType::FlagsChanged) {
-            return handle_flags_changed(sink.as_ref(), event, &mod_state);
+            return handle_flags_changed(sink.as_ref(), event, &mod_state, &reclaim);
         }
         match to_local_event(etype, event) {
-            Some(ev) => decision_for(sink.as_ref(), ev),
+            Some(ev) => decision_for(sink.as_ref(), ev, &reclaim),
             // Events we don't model are always passed through.
             None => CallbackResult::Keep,
         }
@@ -415,101 +494,5 @@ impl std::fmt::Display for CaptureStartFailed {
 impl std::error::Error for CaptureStartFailed {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Sink that records every event and replies with a fixed decision.
-    struct RecordingSink {
-        decision: CaptureDecision,
-        seen: Mutex<Vec<LocalInputEvent>>,
-    }
-
-    impl RecordingSink {
-        fn new(decision: CaptureDecision) -> Self {
-            Self {
-                decision,
-                seen: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl InputSink for RecordingSink {
-        fn on_event(&self, event: LocalInputEvent) -> CaptureDecision {
-            self.seen.lock().expect("seen").push(event);
-            self.decision
-        }
-    }
-
-    #[test]
-    fn suppress_decision_drops_the_event() {
-        // A modifier Key the engine wants swallowed maps to a tap Drop, and the
-        // sink actually saw the event.
-        let sink = RecordingSink::new(CaptureDecision::Suppress);
-        let key = LocalInputEvent::Key {
-            usage: 0xE3,
-            down: true,
-            mods: 0,
-        };
-        assert!(matches!(decision_for(&sink, key), CallbackResult::Drop));
-        assert_eq!(sink.seen.lock().expect("seen").as_slice(), &[key]);
-    }
-
-    #[test]
-    fn passthrough_decision_keeps_the_event() {
-        let sink = RecordingSink::new(CaptureDecision::PassThrough);
-        let key = LocalInputEvent::Key {
-            usage: 0xE0,
-            down: false,
-            mods: 0,
-        };
-        assert!(matches!(decision_for(&sink, key), CallbackResult::Keep));
-    }
-
-    #[test]
-    fn lock_recover_recovers_a_poisoned_mutex() {
-        // Poison a mutex by panicking while its guard is held, then prove the
-        // runtime lock helper still hands back the (intact) data instead of
-        // propagating the panic — capture must never abort on a poisoned lock.
-        let m = Arc::new(Mutex::new(7_u32));
-        let m2 = Arc::clone(&m);
-        let _ = std::thread::spawn(move || {
-            let _g = m2.lock().expect("acquire to poison");
-            panic!("poison the mutex");
-        })
-        .join();
-        assert!(m.lock().is_err(), "mutex should be poisoned");
-        // The helper recovers rather than panics, and the value is unchanged.
-        assert_eq!(*lock_recover(&m), 7);
-    }
-
-    #[test]
-    fn capture_control_path_survives_poison() {
-        // Poison the real capture mutex (panic while holding its guard), then
-        // prove the InputCapture control path (can_suppress / stop) recovers
-        // instead of panicking — a poisoned lock must never abort capture.
-        let cap = MacCapture::new();
-        let inner = Arc::clone(&cap.inner);
-        let _ = std::thread::spawn(move || {
-            let _g = inner.lock().expect("acquire to poison");
-            panic!("poison the capture mutex");
-        })
-        .join();
-        assert!(
-            cap.inner.lock().is_err(),
-            "capture mutex should be poisoned"
-        );
-        // Both go through `lock_recover` and must return, not unwind.
-        assert!(!cap.can_suppress());
-        assert!(cap.stop().is_ok());
-    }
-
-    #[test]
-    fn unknown_display_id_is_an_error() {
-        // `u32::MAX` is never a valid CG display id, so the injector reports an
-        // error (not a warp to the wrong place) instead of falling back to the
-        // main display (audit M1).
-        let inj = MacInjector::new();
-        let err = inj.move_cursor(u32::MAX, 0, 0).unwrap_err();
-        assert!(err.downcast_ref::<UnknownDisplay>().is_some());
-    }
-}
+#[path = "adapter_tests.rs"]
+mod tests;
