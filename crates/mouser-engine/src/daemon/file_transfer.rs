@@ -11,13 +11,15 @@ use mouser_files::{FileSource, Outbound, Receiver, ReceiverConfig, Sender, SinkE
 use mouser_net::{BulkConnection, BulkEndpoint, PinPolicy, TransferStream};
 use mouser_protocol::{
     from_cbor, to_cbor, FileAccept, FileAck, FileChunk, FileDone, FileOffer, FileReject,
-    TYPE_FILE_ACCEPT, TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE, TYPE_FILE_OFFER,
-    TYPE_FILE_REJECT,
+    TYPE_CLIPBOARD_DATA, TYPE_FILE_ACCEPT, TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE,
+    TYPE_FILE_OFFER, TYPE_FILE_REJECT,
 };
 use tokio::sync::watch;
 
 use crate::daemon_store::DaemonStore;
 use crate::discovery::{self, PeerRegistry};
+
+use super::clipboard_bulk::{self, ClipboardBulkTx};
 
 /// Temporary binding id while the interactive Hello/SAS session id is not wired yet.
 pub(crate) const BULK_SESSION_ID: u64 = 0;
@@ -38,19 +40,28 @@ pub(crate) async fn run_bulk_acceptor(
     endpoint: Arc<BulkEndpoint>,
     active_peer: watch::Receiver<Option<DeviceId>>,
     quarantine: PathBuf,
+    clipboard_tx: ClipboardBulkTx,
 ) {
     loop {
         match endpoint.accept_bulk(BULK_SESSION_ID).await {
             Ok(conn) => {
-                let expected = *active_peer.borrow();
-                if expected.is_none_or(|peer| conn.peer_device_id() != Some(peer)) {
+                let peer_id = match conn.peer_device_id() {
+                    Some(peer_id) => peer_id,
+                    None => {
+                        eprintln!("mouserd: rejected bulk connection without a peer id");
+                        conn.close();
+                        continue;
+                    }
+                };
+                if *active_peer.borrow() != Some(peer_id) {
                     eprintln!("mouserd: rejected bulk connection from non-active peer");
                     conn.close();
                     continue;
                 }
                 let dir = quarantine.clone();
+                let clipboard_tx = clipboard_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_bulk_connection(conn, dir).await {
+                    if let Err(e) = serve_bulk_connection(conn, peer_id, dir, clipboard_tx).await {
                         eprintln!("mouserd: bulk file receiver stopped: {e}");
                     }
                 });
@@ -63,29 +74,42 @@ pub(crate) async fn run_bulk_acceptor(
     }
 }
 
-#[cfg(unix)]
-async fn serve_bulk_connection(conn: BulkConnection, quarantine: PathBuf) -> Result<(), String> {
+async fn serve_bulk_connection(
+    conn: BulkConnection,
+    peer_id: DeviceId,
+    quarantine: PathBuf,
+    clipboard_tx: ClipboardBulkTx,
+) -> Result<(), String> {
     std::fs::create_dir_all(&quarantine)
         .map_err(|e| format!("create quarantine {}: {e}", quarantine.display()))?;
     loop {
         match conn.accept_transfer().await {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                let (ty, payload) = stream.recv_msg().await.map_err(|e| e.to_string())?;
                 let dir = quarantine.clone();
+                let clipboard_tx = clipboard_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = run_receiver_stream(stream, dir).await {
-                        eprintln!("mouserd: file transfer failed: {e}");
+                    let result = match ty {
+                        TYPE_FILE_OFFER => run_receiver_stream(stream, dir, payload).await,
+                        TYPE_CLIPBOARD_DATA => {
+                            clipboard_bulk::receive_clipboard_stream(
+                                stream,
+                                peer_id,
+                                payload,
+                                clipboard_tx,
+                            )
+                            .await
+                        }
+                        other => Err(format!("unknown bulk stream type {other:#06x}")),
+                    };
+                    if let Err(e) = result {
+                        eprintln!("mouserd: bulk stream failed: {e}");
                     }
                 });
             }
             Err(e) => return Err(e.to_string()),
         }
     }
-}
-
-#[cfg(not(unix))]
-async fn serve_bulk_connection(conn: BulkConnection, _quarantine: PathBuf) -> Result<(), String> {
-    conn.close();
-    Err("file receive is not available on this platform yet".to_string())
 }
 
 /// Programmatic daemon send API: send local files to a discovered peer's bulk port.
@@ -160,12 +184,9 @@ fn next_transfer_id() -> u64 {
 async fn run_receiver_stream(
     mut stream: TransferStream,
     quarantine: PathBuf,
+    first_payload: Vec<u8>,
 ) -> Result<(), String> {
-    let (ty, payload) = stream.recv_msg().await.map_err(|e| e.to_string())?;
-    if ty != TYPE_FILE_OFFER {
-        return Err(format!("expected FileOffer, got {ty:#06x}"));
-    }
-    let offer: FileOffer = from_cbor(&payload).map_err(|e| e.to_string())?;
+    let offer: FileOffer = from_cbor(&first_payload).map_err(|e| e.to_string())?;
     let transfer_id = offer.transfer_id;
     let config = ReceiverConfig::new(quarantine);
     let (mut receiver, out) =
@@ -396,75 +417,5 @@ fn hash_file(file: &std::fs::File, len: u64) -> Result<mouser_files::Hash, Strin
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use mouser_files::sha256;
-
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("mouser-engine-{tag}-{}-{now}", std::process::id()))
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn daemon_bulk_loopback_sends_file_into_quarantine() {
-        let receiver_id = DeviceIdentity::generate();
-        let sender_id = DeviceIdentity::generate();
-        let receiver_device = receiver_id.device_id();
-        let sender_device = sender_id.device_id();
-
-        let receiver = BulkEndpoint::bind_server(
-            &receiver_id,
-            mouser_net::loopback_addr(),
-            PinPolicy::Pinned(sender_device),
-        )
-        .expect("bind receiver");
-        let receiver_addr = receiver.local_addr().expect("receiver addr");
-        let sender = BulkEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind sender");
-
-        let quarantine = scratch_dir("quarantine");
-        let source_dir = scratch_dir("source");
-        std::fs::create_dir_all(&quarantine).expect("create quarantine");
-        std::fs::create_dir_all(&source_dir).expect("create source dir");
-        let source_path = source_dir.join("sample.txt");
-        let bytes = b"mouser daemon file transfer\nsmall but real\n".to_vec();
-        std::fs::write(&source_path, &bytes).expect("write source");
-        let expected_hash = sha256(&bytes);
-
-        let recv_task = tokio::spawn({
-            let quarantine = quarantine.clone();
-            async move {
-                let conn = receiver.accept_bulk(BULK_SESSION_ID).await.expect("accept");
-                serve_bulk_connection(conn, quarantine).await
-            }
-        });
-
-        send_paths_to_addr(
-            &sender,
-            &sender_id,
-            receiver_device,
-            receiver_addr,
-            vec![source_path],
-        )
-        .await
-        .expect("send file");
-
-        let landed = quarantine.join("sample.txt");
-        for _ in 0..200 {
-            if landed.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let got = std::fs::read(&landed).expect("read landed file");
-        assert_eq!(got, bytes);
-        assert_eq!(sha256(&got), expected_hash);
-
-        sender.close();
-        recv_task.abort();
-        let _ = std::fs::remove_dir_all(&quarantine);
-        let _ = std::fs::remove_dir_all(&source_dir);
-    }
-}
+#[path = "file_transfer_tests.rs"]
+mod tests;

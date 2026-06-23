@@ -8,12 +8,15 @@
 //! Tauri desktop UI can reflect and drive the engine.
 
 mod clipboard;
+mod clipboard_bulk;
 mod direct;
 mod file_transfer;
 mod ipc_bridge;
+mod ipc_health;
 mod pairing;
 mod reconnect;
 mod serve;
+mod serve_session;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

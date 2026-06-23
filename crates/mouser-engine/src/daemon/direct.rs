@@ -12,7 +12,7 @@ use mouser_protocol::Os;
 use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::{EngineCore, RuntimeHandle};
 
-use super::clipboard::{run_driver, SettingsProvider};
+use super::clipboard::{run_driver, DriverConfig, SettingsProvider};
 use super::source_layout;
 
 /// Connect to an explicit peer (TrustOnFirstUse) and report the handshake, then
@@ -93,10 +93,14 @@ pub(super) async fn serve_direct(
         tokio::spawn(run_driver(
             lane,
             clipboard,
-            my_id,
-            peer,
-            Os::Unknown,
-            SettingsProvider::Fixed(store.load_settings()),
+            DriverConfig {
+                my_id,
+                peer_id: peer,
+                peer_os: Os::Unknown,
+                settings: SettingsProvider::Fixed(store.load_settings()),
+                bulk_sender: None,
+                bulk_rx: None,
+            },
         ))
     });
     eprintln!(
