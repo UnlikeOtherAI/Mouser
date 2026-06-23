@@ -377,6 +377,16 @@ async fn command_loop(
                 // Republish so every connected surface (UI + MCP) reflects it at once.
                 publisher.publish(build_snapshot(&shared));
             }
+            Some(Command::ResetData) => {
+                if let Err(e) = shared.store.reset_data() {
+                    eprintln!("mouserd: failed to reset data: {e}");
+                }
+                // Settings revert to defaults in memory too; peer `trusted` flags are
+                // recomputed from the (now empty) store on the next build_snapshot.
+                *lock(&shared.settings) = SettingsDto::default();
+                publisher.publish(build_snapshot(&shared));
+                eprintln!("mouserd: reset — cleared trusted peers and settings");
+            }
             // GetSnapshot is answered by the server; nothing reaches here.
             Some(Command::GetSnapshot) => {}
             None => return, // server dropped

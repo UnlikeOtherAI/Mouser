@@ -150,6 +150,15 @@ impl DaemonStore {
         })
     }
 
+    /// Forget all remembered state: clear the trusted-peer pins and remove persisted
+    /// settings (reverting them to defaults). The identity seed is kept on purpose —
+    /// resetting it would change this device's id and break other devices' trust of it.
+    pub fn reset_data(&self) -> Result<(), DaemonStoreError> {
+        remove_if_present(&self.trusted_peers_path())?;
+        remove_if_present(&self.settings_path())?;
+        Ok(())
+    }
+
     fn settings_path(&self) -> PathBuf {
         self.dir.join(SETTINGS_FILE)
     }
@@ -244,6 +253,19 @@ pub fn parse_peer_id_arg(peer_id: &str) -> Result<DeviceId, DaemonStoreError> {
 /// Display-only base32 text for a raw device id.
 pub fn format_device_id(device_id: &DeviceId) -> String {
     BASE32_NOPAD.encode(device_id).to_lowercase()
+}
+
+/// Remove a store file if present; a missing file counts as success (already cleared).
+fn remove_if_present(path: &Path) -> Result<(), DaemonStoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DaemonStoreError::Io {
+            op: "remove",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn decode_identity_seed(path: &Path, bytes: &[u8]) -> Result<[u8; 32], DaemonStoreError> {

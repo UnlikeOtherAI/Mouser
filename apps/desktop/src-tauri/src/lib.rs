@@ -332,6 +332,13 @@ async fn set_settings(settings: SettingsDto) -> Result<(), String> {
     send_command(Command::UpdateSettings { settings }).await
 }
 
+/// Forget all remembered state — clear trusted peers + restore default settings (the
+/// device's identity is kept). The engine wipes its store and republishes a snapshot.
+#[tauri::command]
+async fn reset_data() -> Result<(), String> {
+    send_command(Command::ResetData).await
+}
+
 /// Apply a connectivity remediation flagged by the engine's diagnostics: open the OS
 /// settings pane where the user can fix it (e.g. Network Connections to disable a dead
 /// adapter, or the firewall). Mapped per-OS; an unknown action is a no-op error.
@@ -570,6 +577,7 @@ pub fn run() {
             deny_pairing,
             set_settings,
             run_remediation,
+            reset_data,
             set_tray_icon_visible
         ])
         .build(tauri::generate_context!())

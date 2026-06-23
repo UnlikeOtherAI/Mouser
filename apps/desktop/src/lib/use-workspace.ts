@@ -79,6 +79,11 @@ export interface Pairing {
 // How often we re-poll the engine snapshot over IPC. The daemon pushes snapshots
 // on change, but the UI uses a simple request/reply poll (no event subscription).
 const SNAPSHOT_POLL_MS = 2000;
+
+// Consecutive offline polls before the UI actually shows "engine not responding". The
+// engine is in-process, so a lone offline poll is a transient IPC blip, not an outage —
+// debouncing it stops the device list from flickering on/off.
+const OFFLINE_GRACE_POLLS = 3;
 // While a connect is in flight we poll faster so the connected/failed outcome
 // surfaces promptly instead of being missed between 2s polls (a dial can fail in a
 // fraction of a second).
@@ -211,6 +216,8 @@ export interface Workspace {
   diagnostics: HealthItem[];
   /** Trigger a remediation action (e.g. open the relevant OS settings pane). */
   runRemediation: (action: string) => Promise<void>;
+  /** Forget all trusted devices and reset settings to defaults (identity is kept). */
+  resetData: () => Promise<void>;
 }
 
 async function tauriInvoke(): Promise<
@@ -251,6 +258,8 @@ export function useWorkspace(): Workspace {
   // Last logged engine/connection signatures, so the poll logs transitions only.
   const lastRunning = useRef<boolean | null>(null);
   const lastConnSig = useRef<string | null>(null);
+  // Consecutive offline polls (see OFFLINE_GRACE_POLLS) — debounces transient blips.
+  const offlineStreak = useRef(0);
   // When the user just edited a setting, briefly let the optimistic value stand so
   // a poll arriving before the daemon's republish doesn't flicker it back.
   const settingsEditedAt = useRef(0);
@@ -289,6 +298,16 @@ export function useWorkspace(): Workspace {
         try {
           const raw = await invoke<RawEngineSnapshot>("engine_snapshot");
           if (cancelled) return;
+          // The engine runs in-process; "offline" almost always means a transient IPC
+          // blip on a single poll (the app querying its own engine), not a real outage.
+          // Don't blank the UI on one — only surface offline after a few consecutive
+          // failures, so the device list and connection state don't flicker on/off.
+          if (!raw.engine_running) {
+            offlineStreak.current += 1;
+            if (offlineStreak.current < OFFLINE_GRACE_POLLS) return; // keep last good state
+          } else {
+            offlineStreak.current = 0;
+          }
           if (lastRunning.current !== raw.engine_running) {
             lastRunning.current = raw.engine_running;
             logDebug(
@@ -481,6 +500,19 @@ export function useWorkspace(): Workspace {
     }
   }, []);
 
+  const resetData = useCallback(async (): Promise<void> => {
+    const invoke = await tauriInvoke();
+    if (invoke === null) return; // browser dev — nothing to reset
+    logDebug("info", "reset requested: clearing trusted devices + settings");
+    try {
+      await invoke("reset_data");
+      logDebug("info", "reset complete (trusted devices + settings cleared)");
+    } catch (e) {
+      logDebug("error", `reset failed: ${errMessage(e)}`);
+      throw e;
+    }
+  }, []);
+
   return {
     devices,
     peers,
@@ -501,5 +533,6 @@ export function useWorkspace(): Workspace {
     updateSettings,
     diagnostics,
     runRemediation,
+    resetData,
   };
 }

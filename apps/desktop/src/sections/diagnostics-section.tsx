@@ -158,8 +158,8 @@ export function DiagnosticsSection(): React.JSX.Element {
         <div className="space-y-2">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted">
-              The <code>mouserd</code> daemon's own diagnostics (discovery, dials,
-              trust checks). Refreshes every {ENGINE_LOG_POLL_MS / 1000}s.
+              The engine's own diagnostics (discovery, dials, trust checks),
+              captured in-process. Refreshes every {ENGINE_LOG_POLL_MS / 1000}s.
             </p>
             <button
               type="button"
@@ -175,7 +175,7 @@ export function DiagnosticsSection(): React.JSX.Element {
           <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-ink px-3 py-2 text-[11px] leading-relaxed text-fg">
             {engineLog.trim().length > 0
               ? engineLog
-              : "(no engine log yet — the daemon writes here once it starts)"}
+              : "(no engine log captured yet)"}
           </pre>
         </div>
       </SectionCard>

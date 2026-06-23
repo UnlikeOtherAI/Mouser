@@ -150,8 +150,8 @@ export function DevicesSection(): React.JSX.Element {
       ) : null}
       {!engineRunning ? (
         <p className="rounded-xl border border-dashed border-amber-500/40 px-4 py-3 text-xs text-amber-300">
-          The Mouser engine is not running. Start the <code>mouserd</code>{" "}
-          daemon to discover and connect to other machines.
+          The Mouser engine is not responding. Quit and reopen Mouser to
+          restart it.
         </p>
       ) : !loading && peers.length === 0 ? (
         <p className="rounded-xl border border-dashed border-ink-line px-4 py-3 text-xs text-muted">

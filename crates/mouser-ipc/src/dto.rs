@@ -344,6 +344,10 @@ pub enum Command {
         /// The complete new settings.
         settings: SettingsDto,
     },
+    /// Forget all remembered state: clear every trusted-peer pin and restore default
+    /// settings (the device's own identity seed is kept). The engine wipes the on-disk
+    /// store and republishes a fresh snapshot so the UI + MCP reflect the cleared state.
+    ResetData,
     /// Ask the daemon to reply with the current [`Snapshot`] immediately.
     GetSnapshot,
 }

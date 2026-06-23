@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { SectionCard } from "../components/section-card";
 import { Segmented } from "../components/segmented";
 import { SettingRow } from "../components/setting-row";
@@ -17,7 +18,9 @@ export function GeneralSection({
   showDiagnostics,
   onShowDiagnosticsChange,
 }: GeneralSectionProps): React.JSX.Element {
-  const { settings, updateSettings } = useWorkspace();
+  const { settings, updateSettings, resetData } = useWorkspace();
+  const [confirmingReset, setConfirmingReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   return (
     <div className="space-y-6">
@@ -95,6 +98,49 @@ export function GeneralSection({
               checked={showDiagnostics}
               onChange={onShowDiagnosticsChange}
             />
+          }
+        />
+      </SectionCard>
+
+      <SectionCard title="Reset">
+        <SettingRow
+          title="Reset Mouser"
+          description="Forget all paired devices and restore default settings. This device keeps its own identity, but other devices will need to pair with it again."
+          control={
+            confirmingReset ? (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={resetting}
+                  onClick={() => {
+                    setResetting(true);
+                    void resetData().finally(() => {
+                      setResetting(false);
+                      setConfirmingReset(false);
+                    });
+                  }}
+                  className="rounded-lg border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-xs font-medium text-rose-200 hover:bg-rose-500/20 disabled:opacity-50"
+                >
+                  {resetting ? "Resetting…" : "Reset everything"}
+                </button>
+                <button
+                  type="button"
+                  disabled={resetting}
+                  onClick={() => setConfirmingReset(false)}
+                  className="rounded-lg border border-ink-line px-3 py-1 text-xs font-medium text-fg hover:bg-ink-line disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmingReset(true)}
+                className="rounded-lg border border-rose-500/50 px-3 py-1 text-xs font-medium text-rose-200 hover:bg-rose-500/10"
+              >
+                Reset…
+              </button>
+            )
           }
         />
       </SectionCard>
