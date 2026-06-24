@@ -29,7 +29,9 @@
 
 pub mod bulk;
 mod control;
+mod dial;
 pub mod discovery;
+mod endpoint_bind;
 mod handshake;
 pub mod identity;
 pub mod motion;
@@ -40,6 +42,7 @@ pub mod transport;
 
 pub use bulk::{BulkConnection, BulkEndpoint, TransferStream};
 pub use discovery::{Advertiser, Browser, Discovery, PeerAdvert, PeerEvent, SERVICE_TYPE};
+pub use endpoint_bind::{client_bind_for, dual_stack_addr, loopback_addr};
 pub use identity::{
     build_tls_certificate, device_id_from_cert, verifying_key_from_cert, TlsCertificate,
 };
@@ -48,9 +51,7 @@ pub use mouser_core::{DeviceId, DeviceIdentity};
 pub use pin::{DeviceIdPinVerifier, PinPolicy};
 pub use sas::compute_sas;
 pub use tls::ALPN_MOUSER_1;
-pub use transport::{
-    client_bind_for, dual_stack_addr, loopback_addr, InteractiveConnection, InteractiveEndpoint,
-};
+pub use transport::{InteractiveConnection, InteractiveEndpoint};
 
 /// Errors surfaced by the transport and discovery layers.
 #[derive(Debug, thiserror::Error)]

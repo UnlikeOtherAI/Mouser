@@ -85,7 +85,8 @@ impl BulkClipboardSender {
     }
 
     async fn connection_for(&self, addrs: &[SocketAddr]) -> Result<Arc<BulkConnection>, String> {
-        if let Some(conn) = self.connection.lock().await.as_ref().cloned() {
+        let mut guard = self.connection.lock().await;
+        if let Some(conn) = guard.as_ref().cloned() {
             return Ok(conn);
         }
         let conn = Arc::new(
@@ -99,10 +100,6 @@ impl BulkClipboardSender {
                 .await
                 .map_err(|e| e.to_string())?,
         );
-        let mut guard = self.connection.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            return Ok(Arc::clone(existing));
-        }
         *guard = Some(Arc::clone(&conn));
         Ok(conn)
     }
