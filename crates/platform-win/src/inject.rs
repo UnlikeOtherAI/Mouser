@@ -41,8 +41,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
 
 use crate::keymap::hid_usage_to_scancode;
@@ -196,6 +196,40 @@ pub fn move_cursor(x: i32, y: i32) -> Result<(), InjectError> {
         dwExtraInfo: 0,
     };
     send_mouse(mi)
+}
+
+/// The bottom-right-most pixel of the virtual desktop, in physical pixels.
+///
+/// Parking the cursor here is how [`crate::adapter::WinInjector::set_cursor_visible`]
+/// "hides" the local pointer while the peer owns input: there is no per-process
+/// cursor-hide on Windows that survives leaving our own windows (`ShowCursor`
+/// is window-message-scoped; `SetSystemCursor` mutates *system-wide* state that
+/// outlives the process and would strand the user's pointer on a crash — the
+/// exact class of bug the removed `ClipCursor` pin caused). Moving the cursor to
+/// the far corner keeps it out of the way using only ordinary, non-persistent
+/// `SetCursorPos`, so a crash merely leaves the pointer in a corner the user can
+/// drag back — nothing to recover.
+///
+/// # Errors
+/// [`InjectError::NoVirtualDesktop`] if the desktop has zero size.
+pub fn park_position() -> Result<(i32, i32), InjectError> {
+    let (left, top, w, h) = virtual_desktop()?;
+    // `w`/`h` are > 0 here (`virtual_desktop` rejects non-positive extents), so the
+    // last valid pixel index is `extent - 1`.
+    Ok((left + w - 1, top + h - 1))
+}
+
+/// Move the cursor to an absolute point in **physical screen pixels**
+/// (the space `GetCursorPos` / `SetCursorPos` use — *not* the normalized
+/// `0..=65535` `SendInput` space).
+///
+/// # Errors
+/// [`InjectError::Win32`] if `SetCursorPos` fails.
+pub fn set_cursor_pos(x: i32, y: i32) -> Result<(), InjectError> {
+    // SAFETY: `SetCursorPos` takes two plain `i32` screen coordinates and has no
+    // out-pointer or buffer; it is sound for any value (the OS clamps to the
+    // virtual desktop).
+    unsafe { SetCursorPos(x, y) }.map_err(InjectError::Win32)
 }
 
 /// Move the cursor by a relative delta in physical pixels.
