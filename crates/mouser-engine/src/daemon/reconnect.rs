@@ -16,7 +16,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const JITTER_PERCENT: u64 = 20;
 
 pub(super) enum ReconnectEnd {
-    Reconnected(Box<InteractiveConnection>),
+    /// Reconnected. `can_control` is true when we re-established as the dialer (source);
+    /// false when, with `accept_inbound`, we instead accepted the peer's inbound dial and
+    /// became its receiver (role handed off to the peer).
+    Reconnected {
+        conn: Box<InteractiveConnection>,
+        can_control: bool,
+    },
     Disconnected,
     Shutdown,
 }
@@ -59,6 +65,12 @@ fn stable_jitter(peer_id: &DeviceId, attempt: u32) -> u64 {
     hash
 }
 
+/// Re-establish a session with `peer_id`. With `accept_inbound`, the redial loop also
+/// accepts an inbound dial from `peer_id` (returning as the receiver) — used by a node that
+/// just lost the controller role so a takeover by the peer converges instead of deadlocking
+/// (both sides dialing, neither accepting). With `accept_inbound = false` we only re-dial
+/// as the controller (used by the side that holds the persistent source intent).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn redial_until_reconnected(
     store: &DaemonStore,
     endpoint: &InteractiveEndpoint,
@@ -66,6 +78,7 @@ pub(super) async fn redial_until_reconnected(
     registry: &PeerRegistry,
     peer_id: DeviceId,
     bridge: Option<&IpcBridge>,
+    accept_inbound: bool,
 ) -> ReconnectEnd {
     let peer_text = format_device_id(&peer_id);
     if let Some(bridge) = bridge {
@@ -104,20 +117,32 @@ pub(super) async fn redial_until_reconnected(
             "mouserd: redialing {peer_text} ({} candidate address(es))",
             addrs.len()
         );
-        match endpoint
-            .connect_interactive_any(me, &addrs, PinPolicy::Pinned(peer_id))
-            .await
-        {
-            Ok(conn) => return ReconnectEnd::Reconnected(Box::new(conn)),
-            Err(e) => {
-                // Keep the UI in "connecting" (we auto-retry with backoff); don't flash a
-                // transient per-attempt error that we immediately overwrite. The reason is
-                // captured in the diagnostics log for operators.
-                if let Some(bridge) = bridge {
-                    bridge.set_connecting(&peer_text);
+        let reconnected = tokio::select! {
+            dialed = endpoint.connect_interactive_any(me, &addrs, PinPolicy::Pinned(peer_id)) => {
+                match dialed {
+                    Ok(conn) => Some((conn, true)),
+                    Err(e) => {
+                        crate::diag!(info, "mouserd: reconnect to {peer_text} failed: {e}");
+                        None
+                    }
                 }
-                crate::diag!(info, "mouserd: reconnect to {peer_text} failed: {e}");
             }
+            accepted = accept_from(endpoint, store, registry, bridge, &peer_id), if accept_inbound => {
+                accepted
+            }
+            _ = tokio::signal::ctrl_c() => return ReconnectEnd::Shutdown,
+            _ = wait_for_disconnect(bridge) => return ReconnectEnd::Disconnected,
+        };
+        if let Some((conn, can_control)) = reconnected {
+            return ReconnectEnd::Reconnected {
+                conn: Box::new(conn),
+                can_control,
+            };
+        }
+        // Keep the UI in "connecting" (we auto-retry with backoff); don't flash a transient
+        // per-attempt error that we immediately overwrite.
+        if let Some(bridge) = bridge {
+            bridge.set_connecting(&peer_text);
         }
 
         let delay = reconnect_delay(attempt, &peer_id);
@@ -180,6 +205,27 @@ async fn wait_for_disconnect(bridge: Option<&IpcBridge>) {
     match bridge {
         Some(bridge) => bridge.next_disconnect_request().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Accept an inbound connection during a redial, but only honor it if it's from the peer we
+/// are reconnecting to (a peer taking over the controller role). A connection from anyone
+/// else is closed and ignored. Returns `(conn, can_control=false)` — we are now its
+/// receiver.
+async fn accept_from(
+    endpoint: &InteractiveEndpoint,
+    store: &DaemonStore,
+    registry: &PeerRegistry,
+    bridge: Option<&IpcBridge>,
+    peer_id: &DeviceId,
+) -> Option<(InteractiveConnection, bool)> {
+    match super::pairing::accept_trusted(endpoint, store, registry, bridge).await {
+        Ok(conn) if conn.peer_device_id() == Some(*peer_id) => Some((conn, false)),
+        Ok(other) => {
+            other.close();
+            None
+        }
+        Err(_) => None,
     }
 }
 
