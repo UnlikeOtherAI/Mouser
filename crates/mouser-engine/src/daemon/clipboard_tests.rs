@@ -137,6 +137,7 @@ async fn small_png_payload_syncs_over_bulk_and_applies_with_matching_hash() {
     let b_identity = DeviceIdentity::generate();
     let a_id = a_identity.device_id();
     let b_id = b_identity.device_id();
+    let a_session_id = 0xA11C_EB10_1234_5678;
     let a_clip = FakeClipboard::default();
     let b_clip = FakeClipboard::default();
     let png = fake_png().to_vec();
@@ -176,9 +177,7 @@ async fn small_png_payload_syncs_over_bulk_and_applies_with_matching_hash() {
     let sender = BulkEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind sender");
     let (clipboard_tx, clipboard_rx) = super::super::clipboard_bulk::channel();
     let accept_task = tokio::spawn(async move {
-        let conn = receiver
-            .accept_bulk(super::super::file_transfer::BULK_SESSION_ID)
-            .await?;
+        let conn = receiver.accept_bulk(a_session_id).await?;
         let peer_id = conn
             .peer_device_id()
             .ok_or_else(|| mouser_net::NetError::Connect("missing peer id".to_string()))?;
@@ -202,6 +201,7 @@ async fn small_png_payload_syncs_over_bulk_and_applies_with_matching_hash() {
         &a_identity,
         b_id,
         receiver_addr,
+        a_session_id,
         chunks,
     )
     .await

@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mouser_files::{sha256, FileSink, Outbound, Receiver, ReceiverConfig, Sender, SinkError};
-use mouser_net::{BulkEndpoint, DeviceIdentity, PinPolicy, TransferStream};
+use mouser_net::{BulkEndpoint, DeviceIdentity, InteractiveEndpoint, PinPolicy, TransferStream};
 use mouser_protocol::{
     from_cbor, to_cbor, FileAccept, FileChunk, FileDone, FileOffer, TYPE_FILE_ACCEPT,
     TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE, TYPE_FILE_OFFER,
@@ -282,6 +282,82 @@ async fn bulk_multi_file_transfer_over_two_connections() {
 
     let _ = fs::remove_dir_all(&quarantine);
     conn.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_hello_accepts_session_id_from_live_interactive_connection() {
+    let server_id = DeviceIdentity::generate();
+    let client_id = DeviceIdentity::generate();
+    let server_device_id = server_id.device_id();
+    let client_device_id = client_id.device_id();
+
+    let interactive_server = InteractiveEndpoint::bind_server(
+        &server_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::Pinned(client_device_id),
+    )
+    .expect("bind interactive server");
+    let interactive_addr = interactive_server
+        .local_addr()
+        .expect("interactive server addr");
+    let interactive_client =
+        InteractiveEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind client");
+
+    let accept_interactive = tokio::spawn(async move {
+        let conn = interactive_server
+            .accept_interactive()
+            .await
+            .expect("accept interactive");
+        (interactive_server, conn)
+    });
+    let client_conn = interactive_client
+        .connect_interactive(
+            &client_id,
+            interactive_addr,
+            PinPolicy::Pinned(server_device_id),
+        )
+        .await
+        .expect("connect interactive");
+    let (_interactive_server, server_conn) =
+        accept_interactive.await.expect("interactive accept task");
+
+    assert_eq!(client_conn.session_id(), server_conn.peer_session_id());
+    assert_eq!(server_conn.session_id(), client_conn.peer_session_id());
+
+    let bulk_server = BulkEndpoint::bind_server(
+        &server_id,
+        mouser_net::loopback_addr(),
+        PinPolicy::Pinned(client_device_id),
+    )
+    .expect("bind bulk server");
+    let bulk_addr = bulk_server.local_addr().expect("bulk server addr");
+    let bulk_client = BulkEndpoint::bind_client(mouser_net::loopback_addr()).expect("bind bulk");
+    let expected_session_id = server_conn.peer_session_id();
+    let dialer_session_id = client_conn.session_id();
+
+    let accept_bulk = tokio::spawn(async move {
+        let conn = bulk_server
+            .accept_bulk(expected_session_id)
+            .await
+            .expect("accept bulk");
+        (bulk_server, conn)
+    });
+    let client_bulk = bulk_client
+        .connect_bulk(
+            &client_id,
+            bulk_addr,
+            PinPolicy::Pinned(server_device_id),
+            dialer_session_id,
+        )
+        .await
+        .expect("connect bulk");
+    let (_bulk_server, server_bulk) = accept_bulk.await.expect("bulk accept task");
+    assert_eq!(server_bulk.peer_device_id(), Some(client_device_id));
+
+    client_bulk.close();
+    server_bulk.close();
+    client_conn.close();
+    server_conn.close();
 }
 
 /// A bulk connection whose `BulkHello` binds to the WRONG interactive session id must

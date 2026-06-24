@@ -16,6 +16,7 @@ async fn daemon_bulk_loopback_sends_file_into_quarantine() {
     let sender_id = DeviceIdentity::generate();
     let receiver_device = receiver_id.device_id();
     let sender_device = sender_id.device_id();
+    let sender_session_id = 0xCAFE_BABE_1234_5678;
 
     let receiver = BulkEndpoint::bind_server(
         &receiver_id,
@@ -39,7 +40,10 @@ async fn daemon_bulk_loopback_sends_file_into_quarantine() {
     let recv_task = tokio::spawn({
         let quarantine = quarantine.clone();
         async move {
-            let conn = receiver.accept_bulk(BULK_SESSION_ID).await.expect("accept");
+            let conn = receiver
+                .accept_bulk(sender_session_id)
+                .await
+                .expect("accept");
             serve_bulk_connection(conn, sender_device, quarantine, clipboard_tx).await
         }
     });
@@ -48,6 +52,7 @@ async fn daemon_bulk_loopback_sends_file_into_quarantine() {
         &sender,
         &sender_id,
         receiver_device,
+        sender_session_id,
         &[receiver_addr],
         vec![source_path],
     )

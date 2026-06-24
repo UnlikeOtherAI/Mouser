@@ -22,6 +22,7 @@ pub(super) struct SessionContext<'a> {
     pub bridge: Option<&'a IpcBridge>,
     pub identity: Arc<DeviceIdentity>,
     pub bulk_endpoint: Arc<BulkEndpoint>,
+    pub bulk_session_id: u64,
     pub clipboard_bulk_rx: ClipboardBulkRx,
 }
 
@@ -66,6 +67,7 @@ pub(super) async fn run_session(
         Arc::clone(&context.identity),
         PeerRegistry::clone(context.registry),
         peer,
+        context.bulk_session_id,
     );
     let clipboard_task = runtime.take_control_lane().map(|lane| {
         tokio::spawn(clipboard_driver::run_driver(
@@ -112,6 +114,7 @@ pub(super) async fn run_session(
                     Arc::clone(&context.bulk_endpoint),
                     Arc::clone(&context.identity),
                     PeerRegistry::clone(context.registry),
+                    context.bulk_session_id,
                     request,
                 );
             }
@@ -129,6 +132,7 @@ fn spawn_file_send(
     endpoint: Arc<BulkEndpoint>,
     identity: Arc<DeviceIdentity>,
     registry: PeerRegistry,
+    bulk_session_id: u64,
     request: FileSendRequest,
 ) {
     tokio::spawn(async move {
@@ -137,6 +141,7 @@ fn spawn_file_send(
             identity,
             registry,
             request.peer_id,
+            bulk_session_id,
             request.paths,
         )
         .await

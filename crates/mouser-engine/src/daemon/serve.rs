@@ -16,7 +16,7 @@ use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::discovery;
 use crate::discovery::PeerRegistry;
 
-use super::file_transfer;
+use super::file_transfer::{self, ActiveBulkSession};
 use super::ipc_bridge::{ConnectRequest, IpcBridge};
 use super::pairing;
 use super::reconnect::{redial_until_reconnected, ReconnectEnd};
@@ -59,18 +59,20 @@ pub(super) async fn serve(
     let iport = endpoint.local_addr().map_err(|e| e.to_string())?.port();
     let bulk_endpoint = Arc::new(
         mouser_net::BulkEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
-            .or_else(|_| mouser_net::BulkEndpoint::bind_server(&me, v4_bind, PinPolicy::TrustOnFirstUse))
+            .or_else(|_| {
+                mouser_net::BulkEndpoint::bind_server(&me, v4_bind, PinPolicy::TrustOnFirstUse)
+            })
             .map_err(|e| e.to_string())?,
     );
     let bport = bulk_endpoint
         .local_addr()
         .map_err(|e| e.to_string())?
         .port();
-    let (bulk_peer_tx, bulk_peer_rx) = tokio::sync::watch::channel(None);
+    let (bulk_session_tx, bulk_session_rx) = tokio::sync::watch::channel(None);
     let (clipboard_bulk_tx, clipboard_bulk_rx) = super::clipboard_bulk::channel();
     let bulk_task = tokio::spawn(file_transfer::run_bulk_acceptor(
         Arc::clone(&bulk_endpoint),
-        bulk_peer_rx,
+        bulk_session_rx,
         file_transfer::quarantine_dir(store),
         clipboard_bulk_tx.clone(),
     ));
@@ -138,6 +140,8 @@ pub(super) async fn serve(
         let peer = conn
             .peer_device_id()
             .ok_or("peer did not present a device_id")?;
+        let local_session_id = conn.session_id();
+        let peer_session_id = conn.peer_session_id();
         if let Some(bridge) = bridge.as_ref() {
             bridge.set_connected(&format_device_id(&peer), &my_b32);
         }
@@ -149,7 +153,10 @@ pub(super) async fn serve(
                 "receive-only target mode"
             }
         );
-        bulk_peer_tx.send_replace(Some(peer));
+        bulk_session_tx.send_replace(Some(ActiveBulkSession {
+            peer_id: peer,
+            expected_session_id: peer_session_id,
+        }));
 
         let end = run_session(
             my_id,
@@ -162,6 +169,7 @@ pub(super) async fn serve(
                 bridge: bridge.as_ref(),
                 identity: Arc::clone(&me),
                 bulk_endpoint: Arc::clone(&bulk_endpoint),
+                bulk_session_id: local_session_id,
                 clipboard_bulk_rx: Arc::clone(&clipboard_bulk_rx),
             },
             SessionAdapters {
@@ -171,7 +179,7 @@ pub(super) async fn serve(
             },
         )
         .await;
-        bulk_peer_tx.send_replace(None);
+        bulk_session_tx.send_replace(None);
         if let Some(bridge) = bridge.as_ref() {
             bridge.set_idle();
         }
