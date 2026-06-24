@@ -43,12 +43,37 @@ pub struct EdgeLayout {
 impl EdgeLayout {
     /// A symmetric side-by-side layout with the peer on the right.
     pub fn side_by_side(width: i32, height: i32, peer_width: i32, peer_height: i32) -> Self {
+        Self::with_edge(width, height, peer_width, peer_height, Edge::Right)
+    }
+
+    /// A layout with the peer on a chosen `edge` (the edge the cursor crosses to reach it).
+    pub fn with_edge(
+        width: i32,
+        height: i32,
+        peer_width: i32,
+        peer_height: i32,
+        edge: Edge,
+    ) -> Self {
         Self {
             width,
             height,
             peer_width,
             peer_height,
-            edge: Edge::Right,
+            edge,
+        }
+    }
+}
+
+impl Edge {
+    /// Parse a settings string (`"left" | "right" | "top" | "bottom"`) into an [`Edge`],
+    /// defaulting to [`Edge::Right`] for anything unrecognized.
+    #[must_use]
+    pub fn from_setting(s: &str) -> Self {
+        match s {
+            "left" => Edge::Left,
+            "top" => Edge::Top,
+            "bottom" => Edge::Bottom,
+            _ => Edge::Right,
         }
     }
 }

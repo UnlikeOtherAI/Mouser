@@ -200,10 +200,11 @@ fn default_role() -> &'static str {
     "auto"
 }
 
-/// The source-side edge layout, seeded from the local display size when available.
-fn source_layout() -> EdgeLayout {
+/// The source-side edge layout, seeded from the local display size when available, with
+/// the peer on `edge` (the edge the cursor crosses to reach it — user-configurable).
+pub(crate) fn source_layout(edge: crate::core::Edge) -> EdgeLayout {
     let (width, height) = local_display_size().unwrap_or((1920, 1080));
-    EdgeLayout::side_by_side(width, height, 1920, 1080)
+    EdgeLayout::with_edge(width, height, 1920, 1080, edge)
 }
 
 #[cfg(target_os = "windows")]

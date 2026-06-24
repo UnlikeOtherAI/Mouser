@@ -195,6 +195,10 @@ pub struct SettingsDto {
     /// Edge transfer behaviour: `"instant" | "delayed" | "locked"`.
     #[serde(default = "edge_default")]
     pub edge_behavior: String,
+    /// Which edge of THIS screen the controlled peer sits on — the edge the cursor crosses
+    /// to reach it: `"left" | "right" | "top" | "bottom"`. Applied when a session starts.
+    #[serde(default = "cross_edge_default")]
+    pub cross_edge: String,
     /// Crossing the far edge returns the cursor to the opposite side.
     #[serde(default)]
     pub wrap_around: bool,
@@ -257,6 +261,9 @@ fn yes() -> bool {
 fn edge_default() -> String {
     "instant".to_string()
 }
+fn cross_edge_default() -> String {
+    "right".to_string()
+}
 fn direction_default() -> String {
     "bidirectional".to_string()
 }
@@ -269,6 +276,7 @@ impl Default for SettingsDto {
         Self {
             cross_at_edges: true,
             edge_behavior: edge_default(),
+            cross_edge: cross_edge_default(),
             wrap_around: false,
             share_scroll: true,
             shared_clipboard: true,
