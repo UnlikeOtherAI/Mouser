@@ -35,7 +35,9 @@ pub(super) struct SessionAdapters {
 pub(super) enum SessionEnd {
     Shutdown,
     Disconnected,
-    ConnectionLost { reason: String },
+    ConnectionLost {
+        reason: String,
+    },
     /// The user explicitly asked (over IPC) to connect to a peer while this machine was a
     /// receiver (or connected to a different peer). End this session and re-establish as
     /// the **source** for `peer`, so an explicit Connect always makes the clicking machine

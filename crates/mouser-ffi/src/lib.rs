@@ -149,6 +149,9 @@ pub struct MobileClient {
     rt: tokio::runtime::Runtime,
     /// The active session, if connected.
     session: Mutex<Option<Session>>,
+    /// Last reported pointer position, to derive the relative delta the engine forwards to
+    /// the peer (the core drives the controlled cursor from per-event deltas).
+    last_pointer: Mutex<Option<(i32, i32)>>,
 }
 
 impl MobileClient {
@@ -178,6 +181,7 @@ impl MobileClient {
             identity,
             rt,
             session: Mutex::new(None),
+            last_pointer: Mutex::new(None),
         })
     }
 }
@@ -322,10 +326,28 @@ impl MobileClient {
     /// successive samples; the engine forwards their *motion* and the peer clamps the
     /// absolute result to its real display.
     pub fn send_pointer_moved(&self, display_id: u32, x: i32, y: i32) {
-        self.feed(LocalInputEvent::CursorMoved { display_id, x, y,
-    dx: 0,
-    dy: 0,
-});
+        // The engine drives the controlled peer from per-event relative deltas, so derive
+        // them from successive absolute samples (a phone trackpad has no OS-clamped cursor,
+        // so successive-sample deltas are accurate).
+        let (dx, dy) = {
+            let mut last = self
+                .last_pointer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let delta = match *last {
+                Some((px, py)) => (x - px, y - py),
+                None => (0, 0),
+            };
+            *last = Some((x, y));
+            delta
+        };
+        self.feed(LocalInputEvent::CursorMoved {
+            display_id,
+            x,
+            y,
+            dx,
+            dy,
+        });
     }
 
     /// Report a pointer button transition (`down` presses). Button index per §7.5

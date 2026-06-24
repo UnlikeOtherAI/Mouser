@@ -50,9 +50,6 @@ pub mod permission;
 pub mod tray;
 
 pub use adapter::{MacCapture, MacInjector};
-pub use permission::{
-    accessibility_trusted, input_monitoring_trusted, prompt_accessibility, prompt_input_monitoring,
-};
 pub use capture::{install_listen_only_tap, CaptureError};
 pub use clipboard::{ClipboardWriteFailed, MacClipboard};
 pub use display_info::{
@@ -73,5 +70,8 @@ pub use keymap::{
 pub use keymap_capture::{
     cgkeycode_to_hid_usage, cursor_moved_for_global, flags_changed_event, to_local_event,
     ModifierState,
+};
+pub use permission::{
+    accessibility_trusted, input_monitoring_trusted, prompt_accessibility, prompt_input_monitoring,
 };
 pub use tray::{state_label, state_tooltip, MacTray, TrayError};

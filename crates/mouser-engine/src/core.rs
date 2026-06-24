@@ -180,9 +180,7 @@ impl EngineCore {
         }
         let owns = self.is_owner();
         match event {
-            LocalInputEvent::CursorMoved { x, y, dx, dy, .. } => {
-                self.on_cursor(x, y, dx, dy, owns)
-            }
+            LocalInputEvent::CursorMoved { x, y, dx, dy, .. } => self.on_cursor(x, y, dx, dy, owns),
             other if owns => {
                 // Cursor is on our screen — let our own input drive our desktop.
                 let _ = other;

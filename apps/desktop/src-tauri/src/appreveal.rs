@@ -72,10 +72,7 @@ fn start_windows(app: &tauri::AppHandle) {
                 // Loopback + token, not mDNS-discoverable, and the port/token change on
                 // every launch — persist the tokenized URL to a fixed temp file so the
                 // user (or an agent on this machine) can find it without scraping stderr.
-                let _ = std::fs::write(
-                    std::env::temp_dir().join("mouser-appreveal-url.txt"),
-                    &url,
-                );
+                let _ = std::fs::write(std::env::temp_dir().join("mouser-appreveal-url.txt"), &url);
             }
             Ok(None) => eprintln!("AppReveal: in-app MCP server started on {addr}"),
             Err(e) => eprintln!("AppReveal: started on {addr}, but session url unavailable: {e}"),

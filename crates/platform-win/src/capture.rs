@@ -211,8 +211,12 @@ fn passive_poll_thread(sink: Arc<dyn InputSink>, stop: Arc<AtomicBool>) {
         if let Ok(point) = inject::cursor_position() {
             let pos = (point.x, point.y);
             if last != Some(pos) {
+                let (dx, dy) = match last {
+                    Some((px, py)) => (point.x - px, point.y - py),
+                    None => (0, 0),
+                };
                 last = Some(pos);
-                let event = virtual_point_to_event(&displays, point.x, point.y);
+                let event = virtual_point_to_event(&displays, point.x, point.y, dx, dy);
                 let _ = catch_unwind(AssertUnwindSafe(|| sink.on_event(event)));
             }
         }

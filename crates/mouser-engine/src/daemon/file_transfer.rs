@@ -119,7 +119,10 @@ fn spawn_bulk_receiver(
         }
     };
     if *active_session.borrow() != Some(session) || peer_id != session.peer_id {
-        crate::diag!(info, "mouserd: rejected bulk connection from non-active peer");
+        crate::diag!(
+            info,
+            "mouserd: rejected bulk connection from non-active peer"
+        );
         conn.close();
         return;
     }

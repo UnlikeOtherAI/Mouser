@@ -423,7 +423,8 @@ impl Browser {
         let resolver = self.resolver.clone();
         let host = hostname.to_string();
         tokio::spawn(async move {
-            let Ok(rx) = resolver.resolve_hostname(&host, Some(RERESOLVE_WINDOW.as_millis() as u64))
+            let Ok(rx) =
+                resolver.resolve_hostname(&host, Some(RERESOLVE_WINDOW.as_millis() as u64))
             else {
                 return;
             };
