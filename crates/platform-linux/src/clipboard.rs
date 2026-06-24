@@ -1,12 +1,13 @@
-//! Linux clipboard adapter — `wl-clipboard-rs`-backed
+//! Linux clipboard adapter — Wayland and X11-backed
 //! [`mouser_core::platform::Clipboard`].
 //!
-//! [`LinuxClipboard`] moves raw bytes to/from the **Wayland** clipboard for a given
-//! [`ClipFormat`], addressing each format by its MIME type. It does **no**
+//! [`LinuxClipboard`] moves raw bytes to/from the session clipboard for a given
+//! [`ClipFormat`], addressing each format by its MIME type where the compositor or
+//! selection protocol supports it. It does **no**
 //! canonicalization, hashing, dedup, or loop-prevention — per spec §7.7 that lives
-//! in the engine; this is a thin byte mover for one format. X11-only sessions are
-//! covered via XWayland on modern desktops; a native X11 backend can be added later
-//! behind this same trait.
+//! in the engine; this is a thin byte mover for one format. Runtime selection keeps
+//! the existing Wayland path for Wayland sessions and uses a native X11 selection
+//! backend for pure-X11 sessions.
 //!
 //! ## Format mapping (spec §7.7 / Appendix C)
 //! | `ClipFormat` | MIME type                  |
@@ -30,10 +31,12 @@
 //! changed" (spec §7.7), including binary-only image/file changes.
 //!
 //! ## Build
-//! The Wayland backend is `#[cfg(target_os = "linux")]`; on other hosts only the
+//! The native backends are `#[cfg(target_os = "linux")]`; on other hosts only the
 //! [`UNSUPPORTED`](crate::UNSUPPORTED) marker and this module's type *signatures*
 //! (via the stub below) compile, so `cargo build -p platform-linux` succeeds
-//! everywhere. The native code is exercised on Linux.
+//! everywhere. The native code is exercised on Linux. The X11 backend uses the
+//! `UTF8_STRING` target for [`ClipFormat::Utf8Text`] and MIME atoms for rich and
+//! binary formats.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -48,7 +51,7 @@ const TOKEN_FORMATS: [ClipFormat; 5] = [
     ClipFormat::UriList,
 ];
 
-/// The MIME type a [`ClipFormat`] is carried as on the Wayland clipboard.
+/// The MIME type a [`ClipFormat`] is carried as on the Linux clipboard.
 ///
 /// Shared by the native and stub builds so the mapping is verified on every host.
 #[must_use]
@@ -65,28 +68,46 @@ pub fn mime_type(format: ClipFormat) -> &'static str {
 #[cfg(target_os = "linux")]
 mod imp {
     use std::io::Read;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
 
-    use mouser_core::platform::{ClipFormat, Clipboard, PlatformError, PlatformResult};
+    use mouser_core::platform::{
+        ClipFormat, Clipboard as CoreClipboard, PlatformError, PlatformResult,
+    };
     use wl_clipboard_rs::copy::{MimeType as CopyMime, Options, Source};
     use wl_clipboard_rs::paste::{
         get_contents, ClipboardType, Error as PasteError, MimeType as PasteMime, Seat,
     };
+    use x11_clipboard::{Atom, Clipboard as X11Clipboard};
 
     use super::{change_token_from_reader, mime_type};
 
-    /// `wl-clipboard-rs`-backed [`Clipboard`] over the regular Wayland clipboard.
-    ///
-    /// Zero-sized: the clipboard is a compositor-global resource. Each `write` spawns
-    /// the standard wl-clipboard serving handoff (the data is offered until another
-    /// client takes ownership), matching how `wl-copy` behaves.
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct LinuxClipboard;
+    const X11_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Clipboard adapter selected for the current Linux graphical session.
+    pub struct LinuxClipboard {
+        backend: Backend,
+    }
+
+    enum Backend {
+        Wayland,
+        X11(Box<Mutex<X11Clipboard>>),
+        Unavailable(ClipboardUnavailable),
+    }
+
+    impl Default for LinuxClipboard {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     impl LinuxClipboard {
-        /// A clipboard adapter bound to the regular Wayland clipboard.
+        /// A clipboard adapter bound to the current session type.
         #[must_use]
         pub fn new() -> Self {
-            Self
+            Self {
+                backend: selected_backend(),
+            }
         }
 
         /// A content token for change detection (Wayland has no native counter).
@@ -96,34 +117,76 @@ mod imp {
         /// clipboard changed (spec §7.7), including binary-only image/file changes.
         #[must_use]
         pub fn change_token(&self) -> u64 {
-            change_token_from_reader(|format| match read_mime(mime_type(format)) {
+            change_token_from_reader(|format| match self.read_backend(format) {
                 Ok(Some(bytes)) => Some(bytes),
                 _ => None,
             })
         }
+
+        fn read_backend(&self, format: ClipFormat) -> PlatformResult<Option<Vec<u8>>> {
+            match &self.backend {
+                Backend::Wayland => read_wayland_mime(mime_type(format)),
+                Backend::X11(clipboard) => read_x11(clipboard.as_ref(), format),
+                Backend::Unavailable(e) => Err(Box::new(e.clone())),
+            }
+        }
+
+        fn write_backend(&self, format: ClipFormat, data: &[u8]) -> PlatformResult<()> {
+            match &self.backend {
+                Backend::Wayland => write_wayland_mime(mime_type(format), data),
+                Backend::X11(clipboard) => write_x11(clipboard.as_ref(), format, data),
+                Backend::Unavailable(e) => Err(Box::new(e.clone())),
+            }
+        }
     }
 
-    impl Clipboard for LinuxClipboard {
+    impl CoreClipboard for LinuxClipboard {
         fn change_token(&self) -> PlatformResult<u64> {
             Ok(LinuxClipboard::change_token(self))
         }
 
         fn read(&self, format: ClipFormat) -> PlatformResult<Option<Vec<u8>>> {
-            read_mime(mime_type(format))
+            self.read_backend(format)
         }
 
         fn write(&self, format: ClipFormat, data: &[u8]) -> PlatformResult<()> {
-            let mime = CopyMime::Specific(mime_type(format).to_owned());
-            let source = Source::Bytes(data.to_vec().into_boxed_slice());
-            Options::new()
-                .copy(source, mime)
-                .map_err(|e| -> PlatformError { Box::new(e) })
+            self.write_backend(format, data)
+        }
+    }
+
+    fn selected_backend() -> Backend {
+        if use_x11_backend() {
+            match X11Clipboard::new() {
+                Ok(clipboard) => Backend::X11(Box::new(Mutex::new(clipboard))),
+                Err(e) => Backend::Unavailable(ClipboardUnavailable {
+                    backend: "X11",
+                    message: e.to_string(),
+                }),
+            }
+        } else {
+            Backend::Wayland
+        }
+    }
+
+    fn use_x11_backend() -> bool {
+        use_x11_backend_for(
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            std::env::var_os("DISPLAY").is_some(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        )
+    }
+
+    fn use_x11_backend_for(session: Option<&str>, display: bool, wayland: bool) -> bool {
+        match session.map(str::to_ascii_lowercase).as_deref() {
+            Some("x11") => true,
+            Some("wayland") => false,
+            _ => display && !wayland,
         }
     }
 
     /// Read the regular clipboard for one MIME type, mapping the "empty"/"no such
     /// type" family of errors to `Ok(None)` and real failures to `Err`.
-    fn read_mime(mime: &str) -> PlatformResult<Option<Vec<u8>>> {
+    fn read_wayland_mime(mime: &str) -> PlatformResult<Option<Vec<u8>>> {
         match get_contents(
             ClipboardType::Regular,
             Seat::Unspecified,
@@ -144,6 +207,79 @@ mod imp {
         }
     }
 
+    fn write_wayland_mime(mime: &str, data: &[u8]) -> PlatformResult<()> {
+        let mime = CopyMime::Specific(mime.to_owned());
+        let source = Source::Bytes(data.to_vec().into_boxed_slice());
+        Options::new()
+            .copy(source, mime)
+            .map_err(|e| -> PlatformError { Box::new(e) })
+    }
+
+    fn read_x11(
+        clipboard: &Mutex<X11Clipboard>,
+        format: ClipFormat,
+    ) -> PlatformResult<Option<Vec<u8>>> {
+        let clipboard = lock_recover(clipboard);
+        let target = x11_target(&clipboard, format)?;
+        let bytes = clipboard
+            .load(
+                clipboard.getter.atoms.clipboard,
+                target,
+                clipboard.getter.atoms.property,
+                X11_TIMEOUT,
+            )
+            .map_err(|e| -> PlatformError { Box::new(e) })?;
+        if bytes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(bytes))
+        }
+    }
+
+    fn write_x11(
+        clipboard: &Mutex<X11Clipboard>,
+        format: ClipFormat,
+        data: &[u8],
+    ) -> PlatformResult<()> {
+        let clipboard = lock_recover(clipboard);
+        let target = x11_target(&clipboard, format)?;
+        clipboard
+            .store(clipboard.setter.atoms.clipboard, target, data.to_vec())
+            .map_err(|e| -> PlatformError { Box::new(e) })
+    }
+
+    fn x11_target(clipboard: &X11Clipboard, format: ClipFormat) -> PlatformResult<Atom> {
+        match format {
+            ClipFormat::Utf8Text => Ok(clipboard.getter.atoms.utf8_string),
+            other => clipboard
+                .getter
+                .get_atom(mime_type(other))
+                .map_err(|e| -> PlatformError { Box::new(e) }),
+        }
+    }
+
+    fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ClipboardUnavailable {
+        backend: &'static str,
+        message: String,
+    }
+
+    impl std::fmt::Display for ClipboardUnavailable {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{} clipboard backend unavailable: {}",
+                self.backend, self.message
+            )
+        }
+    }
+
+    impl std::error::Error for ClipboardUnavailable {}
+
     #[cfg(test)]
     mod tests {
         use super::super::fnv1a;
@@ -162,6 +298,14 @@ mod imp {
             let m = CopyMime::Specific(mime_type(ClipFormat::Png).to_owned());
             assert!(matches!(m, CopyMime::Specific(s) if s == "image/png"));
         }
+
+        #[test]
+        fn session_type_selects_x11_only_for_x11() {
+            assert!(use_x11_backend_for(Some("x11"), true, true));
+            assert!(!use_x11_backend_for(Some("wayland"), true, true));
+            assert!(use_x11_backend_for(None, true, false));
+            assert!(!use_x11_backend_for(None, true, true));
+        }
     }
 }
 
@@ -173,20 +317,20 @@ pub use imp::LinuxClipboard;
 /// It implements the [`Clipboard`](mouser_core::platform::Clipboard) trait by
 /// returning a typed [`Unsupported`] error for every operation, and a `change_token`
 /// of `0`. This keeps the type and its trait impl present off-target (so dependent
-/// code type-checks everywhere) while the real Wayland backend is Linux-only.
+/// code type-checks everywhere) while the real backends are Linux-only.
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinuxClipboard;
 
 #[cfg(not(target_os = "linux"))]
 impl LinuxClipboard {
-    /// A stub clipboard adapter (no Wayland backend off Linux).
+    /// A stub clipboard adapter (no Linux clipboard backend off Linux).
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    /// Always `0` off-target: there is no Wayland clipboard to fingerprint.
+    /// Always `0` off-target: there is no Linux clipboard to fingerprint.
     #[must_use]
     pub fn change_token(&self) -> u64 {
         0
@@ -220,10 +364,7 @@ pub struct Unsupported;
 #[cfg(not(target_os = "linux"))]
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the Linux Wayland clipboard backend is only available on Linux"
-        )
+        write!(f, "the Linux clipboard backend is only available on Linux")
     }
 }
 

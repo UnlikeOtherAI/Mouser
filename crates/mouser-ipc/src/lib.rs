@@ -8,14 +8,22 @@
 //! change + on request, forward [`Command`]s); the UI runs the [`Client`] (connect,
 //! recv snapshots, send commands).
 //!
-//! It is panic-free (the workspace clippy lints deny `unwrap`/`panic`/indexing) and
-//! `unsafe`-free, like the protocol and core crates.
+//! It is panic-free (the workspace clippy lints deny `unwrap`/`panic`/indexing).
+//! The steady-state transport is safe Rust; the Windows named-pipe security setup
+//! has a narrow Win32 FFI allowance for DACL and token SID checks.
+
+#![deny(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod client;
 pub mod codec;
 pub mod dto;
 pub mod path;
 pub mod server;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_security;
 
 pub use client::Client;
 pub use codec::{read_message, write_message, IpcError, MAX_FRAME};

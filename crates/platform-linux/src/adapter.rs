@@ -13,6 +13,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use input_linux::Key;
 use mouser_core::platform::{InputInjection, PlatformError, PlatformResult, ScrollUnit};
 
+use crate::display::{DesktopBounds, NoActiveDisplays, UnknownDisplay, X11Display};
 use crate::keymap::{hid_usage_to_evdev, mods_to_evdev};
 use crate::uinput::{Button, VirtualDevice, ABS_MAX};
 
@@ -42,45 +43,49 @@ impl std::error::Error for UnknownButton {}
 
 /// Linux input injector backed by a uinput virtual device.
 ///
-/// `move_cursor` receives display-local **logical pixels**; uinput has no notion
-/// of displays, so the injector scales `(x, y)` against a virtual-desktop bound
-/// into the device's normalized `0..=ABS_MAX` absolute range. The `display_id` is
-/// accepted for contract parity; true per-display routing on Linux needs the
-/// compositor layout (Wayland/X11) and is out of scope for this adapter — it maps
-/// into the single global pointer space (documented limitation, cf. mac M1).
+/// `move_cursor` receives display-local **logical pixels**. On X11, RandR maps the
+/// `display_id` to an output rectangle, then the global root-window point is scaled
+/// into the virtual device's normalized `0..=ABS_MAX` absolute range. Wayland
+/// compositors need a compositor-specific geometry backend before this adapter can
+/// route display-local absolute motion there.
 pub struct UinputInjector {
     dev: Mutex<VirtualDevice>,
-    desktop_w: i32,
-    desktop_h: i32,
+    display: Mutex<Option<X11Display>>,
 }
 
 impl UinputInjector {
-    /// Create the virtual device with a pass-through coordinate bound
-    /// (`x,y` clamped straight into `0..=ABS_MAX`).
-    ///
-    /// # Errors
-    /// Propagates [`VirtualDevice::new`] failures (e.g. `/dev/uinput` `EACCES`).
+    /// Create the virtual device. Display geometry is resolved lazily from X11
+    /// RandR on the first absolute cursor move.
     pub fn new() -> PlatformResult<Self> {
-        Self::with_desktop_bounds(ABS_MAX, ABS_MAX)
-    }
-
-    /// Create the virtual device, scaling logical pixels against a
-    /// `desktop_w × desktop_h` bound into the normalized absolute range.
-    ///
-    /// # Errors
-    /// Propagates [`VirtualDevice::new`] failures.
-    pub fn with_desktop_bounds(desktop_w: i32, desktop_h: i32) -> PlatformResult<Self> {
         let dev = VirtualDevice::new().map_err(boxed)?;
         Ok(Self {
             dev: Mutex::new(dev),
-            desktop_w: desktop_w.max(1),
-            desktop_h: desktop_h.max(1),
+            display: Mutex::new(None),
         })
     }
 
-    fn scale(&self, v: i32, bound: i32) -> i32 {
-        let v = v.clamp(0, bound);
-        ((v as i64 * ABS_MAX as i64) / bound as i64) as i32
+    fn absolute_point(&self, display_id: u32, x: i32, y: i32) -> PlatformResult<(i32, i32)> {
+        let mut guard = lock_recover(&self.display);
+        if guard.is_none() {
+            *guard = Some(X11Display::connect()?);
+        }
+        let Some(display) = guard.as_ref() else {
+            return Err(boxed(NoActiveDisplays));
+        };
+        let displays_result = display.active_display_bounds();
+        if displays_result.is_err() {
+            *guard = None;
+        }
+        let displays = displays_result?;
+        let bounds = displays
+            .iter()
+            .copied()
+            .find(|display| display.id == display_id)
+            .ok_or_else(|| boxed(UnknownDisplay(display_id)))?;
+        let desktop =
+            DesktopBounds::from_displays(&displays).ok_or_else(|| boxed(NoActiveDisplays))?;
+        let (gx, gy) = bounds.local_to_global(x, y);
+        Ok((desktop.scale_x(gx, ABS_MAX), desktop.scale_y(gy, ABS_MAX)))
     }
 }
 
@@ -110,9 +115,8 @@ fn button_of(index: u8) -> Result<Button, UnknownButton> {
 }
 
 impl InputInjection for UinputInjector {
-    fn move_cursor(&self, _display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
-        let ax = self.scale(x, self.desktop_w);
-        let ay = self.scale(y, self.desktop_h);
+    fn move_cursor(&self, display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
+        let (ax, ay) = self.absolute_point(display_id, x, y)?;
         lock_recover(&self.dev).move_abs(ax, ay).map_err(boxed)
     }
 

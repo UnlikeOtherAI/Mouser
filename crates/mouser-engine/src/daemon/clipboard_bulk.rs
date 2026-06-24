@@ -11,8 +11,6 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::discovery::{self, PeerRegistry};
 
-use super::file_transfer::BULK_SESSION_ID;
-
 /// Upper bound on a single inbound clipboard transfer's reassembled size. Each chunk is
 /// already capped at [`MAX_DATA_CHUNK`] (1 MiB), but the receive loop runs `while !last`
 /// with no total bound — a (cert-pinned, active) peer that never sets `last` could stream
@@ -43,6 +41,7 @@ pub(super) struct BulkClipboardSender {
     identity: Arc<DeviceIdentity>,
     registry: PeerRegistry,
     peer: DeviceId,
+    interactive_session_id: u64,
     connection: Arc<Mutex<Option<Arc<BulkConnection>>>>,
 }
 
@@ -52,12 +51,14 @@ impl BulkClipboardSender {
         identity: Arc<DeviceIdentity>,
         registry: PeerRegistry,
         peer: DeviceId,
+        interactive_session_id: u64,
     ) -> Self {
         Self {
             endpoint,
             identity,
             registry,
             peer,
+            interactive_session_id,
             connection: Arc::new(Mutex::new(None)),
         }
     }
@@ -85,7 +86,8 @@ impl BulkClipboardSender {
     }
 
     async fn connection_for(&self, addrs: &[SocketAddr]) -> Result<Arc<BulkConnection>, String> {
-        if let Some(conn) = self.connection.lock().await.as_ref().cloned() {
+        let mut guard = self.connection.lock().await;
+        if let Some(conn) = guard.as_ref().cloned() {
             return Ok(conn);
         }
         let conn = Arc::new(
@@ -94,15 +96,11 @@ impl BulkClipboardSender {
                     self.identity.as_ref(),
                     addrs,
                     PinPolicy::Pinned(self.peer),
-                    BULK_SESSION_ID,
+                    self.interactive_session_id,
                 )
                 .await
                 .map_err(|e| e.to_string())?,
         );
-        let mut guard = self.connection.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            return Ok(Arc::clone(existing));
-        }
         *guard = Some(Arc::clone(&conn));
         Ok(conn)
     }
@@ -119,16 +117,27 @@ pub(super) async fn send_chunks_to_addr(
     identity: &DeviceIdentity,
     peer: DeviceId,
     addr: SocketAddr,
+    interactive_session_id: u64,
     chunks: Vec<ClipboardData>,
 ) -> Result<BulkConnection, String> {
     if chunks.is_empty() {
         return endpoint
-            .connect_bulk(identity, addr, PinPolicy::Pinned(peer), BULK_SESSION_ID)
+            .connect_bulk(
+                identity,
+                addr,
+                PinPolicy::Pinned(peer),
+                interactive_session_id,
+            )
             .await
             .map_err(|e| e.to_string());
     }
     let conn = endpoint
-        .connect_bulk(identity, addr, PinPolicy::Pinned(peer), BULK_SESSION_ID)
+        .connect_bulk(
+            identity,
+            addr,
+            PinPolicy::Pinned(peer),
+            interactive_session_id,
+        )
         .await
         .map_err(|e| e.to_string())?;
     send_chunks_on_connection(&conn, chunks).await?;

@@ -2,66 +2,145 @@
 //!
 //! This is the host-shaped, side-effect-free half of Linux capture: a raw evdev
 //! `(kind, code, value)` triple → the wire's [`LocalInputEvent`] model (HID
-//! usages on Usage Page 0x07, §7.5 button indices, integrated cursor position).
+//! usages on Usage Page 0x07, §7.5 button indices, display-local cursor position).
 //! Keeping it separate from the device/thread runtime in [`crate::capture`] keeps
 //! both modules focused and lets the translation be unit-tested in isolation.
 //!
 //! Linux-only: it depends on `input_linux`'s `EventKind`/`KeyState` codes.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use input_linux::{EventKind, KeyState};
 use mouser_core::platform::LocalInputEvent;
 
+use crate::display::{global_point_to_event, DisplayBounds, X11Display};
 use crate::keymap::{
     evdev_btn_to_button, evdev_code_to_hid_usage, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y,
 };
 
-/// Integrated virtual-cursor position for relative-motion → absolute translation.
+/// Cursor position mapper for relative evdev motion.
 ///
-/// evdev pointers report relative deltas (`REL_X`/`REL_Y`); the wire wants an
-/// absolute [`LocalInputEvent::CursorMoved`]. This accumulates the deltas and
-/// clamps to a desktop bound (documented single-global-space limitation — see
-/// [`crate::capture`] module docs).
-pub(crate) struct VirtualCursor {
+/// Passive edge sensing uses XQueryPointer as the source of truth, then maps the
+/// root-window point to a RandR output and display-local coordinates. Once the
+/// engine asks to suppress local input, Xorg may stop receiving the grabbed evdev
+/// device, so the mapper integrates deltas from the last real point until capture
+/// returns to pass-through.
+pub(crate) struct CursorMapper {
+    display: Mutex<Option<X11Display>>,
     x: AtomicI32,
     y: AtomicI32,
-    w: i32,
-    h: i32,
+    initialized: AtomicBool,
+    integrating: AtomicBool,
+    #[cfg(test)]
+    test_displays: Option<Vec<DisplayBounds>>,
 }
 
-impl VirtualCursor {
-    /// Start centered in a `w × h` logical-pixel desktop bound.
-    pub(crate) fn new(w: i32, h: i32) -> Self {
+impl CursorMapper {
+    pub(crate) fn new() -> Self {
         Self {
-            x: AtomicI32::new(w / 2),
-            y: AtomicI32::new(h / 2),
-            w,
-            h,
+            display: Mutex::new(None),
+            x: AtomicI32::new(0),
+            y: AtomicI32::new(0),
+            initialized: AtomicBool::new(false),
+            integrating: AtomicBool::new(false),
+            #[cfg(test)]
+            test_displays: None,
         }
     }
 
-    /// Apply a relative delta, clamp to the desktop bound, and return the new
-    /// absolute position.
-    fn apply(&self, dx: i32, dy: i32) -> (i32, i32) {
-        let nx = (self.x.load(Ordering::Relaxed).saturating_add(dx)).clamp(0, self.w);
-        let ny = (self.y.load(Ordering::Relaxed).saturating_add(dy)).clamp(0, self.h);
+    #[cfg(test)]
+    pub(crate) fn with_static_display(display: DisplayBounds, x: i32, y: i32) -> Self {
+        Self {
+            display: Mutex::new(None),
+            x: AtomicI32::new(x),
+            y: AtomicI32::new(y),
+            initialized: AtomicBool::new(true),
+            integrating: AtomicBool::new(true),
+            test_displays: Some(vec![display]),
+        }
+    }
+
+    pub(crate) fn set_integrating(&self, integrating: bool) {
+        self.integrating.store(integrating, Ordering::Relaxed);
+    }
+
+    fn store(&self, x: i32, y: i32) {
+        self.x.store(x, Ordering::Relaxed);
+        self.y.store(y, Ordering::Relaxed);
+        self.initialized.store(true, Ordering::Relaxed);
+    }
+
+    fn apply(&self, dx: i32, dy: i32) -> Option<(i32, i32)> {
+        if !self.initialized.load(Ordering::Relaxed) {
+            return None;
+        }
+        let nx = self.x.load(Ordering::Relaxed).saturating_add(dx);
+        let ny = self.y.load(Ordering::Relaxed).saturating_add(dy);
         self.x.store(nx, Ordering::Relaxed);
         self.y.store(ny, Ordering::Relaxed);
-        (nx, ny)
+        Some((nx, ny))
     }
+
+    fn displays(&self) -> Option<Vec<DisplayBounds>> {
+        #[cfg(test)]
+        if let Some(displays) = &self.test_displays {
+            return Some(displays.clone());
+        }
+
+        let mut guard = lock_recover(&self.display);
+        if guard.is_none() {
+            *guard = X11Display::connect().ok();
+        }
+        let display = guard.as_ref()?;
+        let displays_result = display.active_display_bounds();
+        if displays_result.is_err() {
+            *guard = None;
+        }
+        displays_result.ok()
+    }
+
+    fn real_position(&self) -> Option<(i32, i32, Vec<DisplayBounds>)> {
+        let mut guard = lock_recover(&self.display);
+        if guard.is_none() {
+            *guard = X11Display::connect().ok();
+        }
+        let display = guard.as_ref()?;
+        let position = display.cursor_global_position();
+        let displays = display.active_display_bounds();
+        if position.is_err() || displays.is_err() {
+            *guard = None;
+            return None;
+        }
+        let (x, y) = position.ok()?;
+        Some((x, y, displays.ok()?))
+    }
+
+    fn event_from_delta(&self, dx: i32, dy: i32) -> Option<LocalInputEvent> {
+        if !self.integrating.load(Ordering::Relaxed) {
+            let (x, y, displays) = self.real_position()?;
+            self.store(x, y);
+            return Some(global_point_to_event(&displays, x, y));
+        }
+        let (x, y) = self.apply(dx, dy)?;
+        let displays = self.displays()?;
+        Some(global_point_to_event(&displays, x, y))
+    }
+}
+
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Translate one raw evdev event into a [`LocalInputEvent`], or `None` for events
 /// we don't forward (SYN, key autorepeat, unmapped keys/axes, hi-res wheels).
 ///
-/// `cursor` integrates relative pointer motion into an absolute position
-/// (documented single-global-space limitation).
+/// `cursor` resolves relative pointer motion to display-local absolute motion.
 pub(crate) fn to_local_event(
     kind: EventKind,
     code: u16,
     value: i32,
-    cursor: &VirtualCursor,
+    cursor: &CursorMapper,
 ) -> Option<LocalInputEvent> {
     match kind {
         EventKind::Key => {
@@ -86,22 +165,8 @@ pub(crate) fn to_local_event(
             })
         }
         EventKind::Relative => match code {
-            REL_X => {
-                let (x, y) = cursor.apply(value, 0);
-                Some(LocalInputEvent::CursorMoved {
-                    display_id: 0,
-                    x,
-                    y,
-                })
-            }
-            REL_Y => {
-                let (x, y) = cursor.apply(0, value);
-                Some(LocalInputEvent::CursorMoved {
-                    display_id: 0,
-                    x,
-                    y,
-                })
-            }
+            REL_X => cursor.event_from_delta(value, 0),
+            REL_Y => cursor.event_from_delta(0, value),
             // evdev wheel detents arrive as ±1; report in 1/120 units so the
             // engine's `Detent120` path sees whole notches (mirror of the
             // injector's `/120`).
@@ -124,8 +189,8 @@ mod tests {
     use super::*;
 
     /// `to_local_event` is pure translation, exercised without any real device.
-    fn cursor() -> VirtualCursor {
-        VirtualCursor::new(1000, 1000)
+    fn cursor() -> CursorMapper {
+        CursorMapper::new()
     }
 
     #[test]
@@ -179,33 +244,30 @@ mod tests {
     }
 
     #[test]
-    fn relative_motion_integrates_and_clamps() {
-        let c = VirtualCursor::new(100, 100); // starts centered at (50, 50)
-                                              // Move right by 20.
+    fn suppressing_relative_motion_integrates_from_real_position() {
+        let display = DisplayBounds {
+            id: 7,
+            left: 1000,
+            top: 500,
+            width: 300,
+            height: 200,
+        };
+        let c = CursorMapper::with_static_display(display, 1050, 550);
+
         assert_eq!(
             to_local_event(EventKind::Relative, REL_X, 20, &c),
             Some(LocalInputEvent::CursorMoved {
-                display_id: 0,
+                display_id: 7,
                 x: 70,
                 y: 50
             })
         );
-        // Move down by 70 -> clamped to the bound (100).
         assert_eq!(
-            to_local_event(EventKind::Relative, REL_Y, 70, &c),
+            to_local_event(EventKind::Relative, REL_Y, 10, &c),
             Some(LocalInputEvent::CursorMoved {
-                display_id: 0,
+                display_id: 7,
                 x: 70,
-                y: 100
-            })
-        );
-        // Move far left -> clamped to 0.
-        assert_eq!(
-            to_local_event(EventKind::Relative, REL_X, -500, &c),
-            Some(LocalInputEvent::CursorMoved {
-                display_id: 0,
-                x: 0,
-                y: 100
+                y: 60
             })
         );
     }

@@ -29,10 +29,14 @@ use quinn::{
 };
 
 use crate::control::{self, ControlStream};
+use crate::dial::DialErrors;
+use crate::endpoint_bind::bind_dual_stack_server;
 use crate::identity::{build_tls_certificate, TlsCertificate};
 use crate::motion::{MotionPlane, MotionSender};
 use crate::pin::PinPolicy;
 use crate::{tls, NetError};
+
+pub use crate::endpoint_bind::{client_bind_for, dual_stack_addr, loopback_addr};
 
 /// QUIC keep-alive interval (H1): PING often enough to keep an idle interactive
 /// connection alive through NAT/firewall idle timers and to surface a dead path fast.
@@ -75,63 +79,6 @@ const DATAGRAM_RECV_BUFFER: usize = 16 * 1024;
 enum ConnectionEnd {
     Initiator,
     Acceptor,
-}
-
-/// Loopback wildcard bind address (port 0 → OS-assigned) for an interactive plane.
-pub fn loopback_addr() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0))
-}
-
-/// Wildcard client-bind address matching the destination's family (port 0 →
-/// OS-assigned). A client that dials a LAN/remote peer must bind the *unspecified*
-/// address so the OS routes egress out the right interface — a loopback bind
-/// (`127.0.0.1`) can only reach the same host and silently fails to a remote peer.
-pub fn client_bind_for(dest: SocketAddr) -> SocketAddr {
-    match dest {
-        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-        SocketAddr::V6(_) => SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0)),
-    }
-}
-
-/// Unspecified IPv6 bind (`[::]:0`) for a dual-stack server listener — one socket
-/// serving both IPv4 (v4-mapped) and IPv6 dialers (macOS/Linux default
-/// `IPV6_V6ONLY=off`). Used by the daemon so a peer that resolves us to either family
-/// can connect. See [`InteractiveEndpoint::bind_server`].
-pub fn dual_stack_addr() -> SocketAddr {
-    SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 0], 0))
-}
-
-/// Bind a **server** [`Endpoint`] that genuinely accepts both IPv4 and IPv6 dialers when
-/// given a wildcard IPv6 address. `quinn::Endpoint::server` binds a plain `UdpSocket` and
-/// never clears `IPV6_V6ONLY`, so on Windows (which defaults `V6ONLY=on`) a `[::]` server
-/// is IPv6-only and silently drops IPv4 peers. We mirror `quinn::Endpoint::client`'s own
-/// socket setup — socket2 + `set_only_v6(false)` — but with our server config, so the
-/// listener is dual-stack on every platform. (The earlier breakage that the old comment
-/// warned about came from a botched manual socket; this matches quinn's known-good path.)
-pub(crate) fn bind_dual_stack_server(
-    server_config: ServerConfig,
-    addr: SocketAddr,
-) -> Result<Endpoint, NetError> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|e| NetError::Io(e.to_string()))?;
-    if addr.is_ipv6() {
-        // Best-effort: accept v4-mapped peers on the wildcard v6 socket. Failure is fine —
-        // the platform is already dual-stack (macOS/Linux default off) or refuses to change.
-        let _ = socket.set_only_v6(false);
-    }
-    socket
-        .bind(&addr.into())
-        .map_err(|e| NetError::Io(e.to_string()))?;
-    let runtime =
-        quinn::default_runtime().ok_or_else(|| NetError::Io("no async runtime found".into()))?;
-    Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(server_config),
-        socket.into(),
-        runtime,
-    )
-    .map_err(|e| NetError::Io(e.to_string()))
 }
 
 /// Build the shared [`TransportConfig`] applied to both endpoints (H1, A4).
@@ -215,15 +162,16 @@ impl InteractiveEndpoint {
     /// complete the §6.1 handshake. Callers pass addresses most-reachable-first (routable
     /// IPv4 before IPv6); each is tried under [`DIAL_ATTEMPT_TIMEOUT`], so a peer that
     /// resolved to a family it isn't actually listening on no longer hangs the dial on the
-    /// 20s idle timeout — it's abandoned in seconds and the next address is tried. Returns
-    /// the last attempt's error if every candidate fails.
+    /// 20s idle timeout — it's abandoned in seconds and the next address is tried. If
+    /// every candidate fails, returns a combined error led by the first non-timeout
+    /// failure so a trailing dead address cannot bury a cert-pin or identity mismatch.
     pub async fn connect_interactive_any(
         &self,
         identity: &DeviceIdentity,
         addrs: &[SocketAddr],
         peer_policy: PinPolicy,
     ) -> Result<InteractiveConnection, NetError> {
-        let mut last_err = NetError::Connect("no dialable address for peer".to_string());
+        let mut errors = DialErrors::new();
         for &addr in addrs {
             match tokio::time::timeout(
                 DIAL_ATTEMPT_TIMEOUT,
@@ -232,11 +180,11 @@ impl InteractiveEndpoint {
             .await
             {
                 Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => last_err = e,
-                Err(_) => last_err = NetError::Connect(format!("timed out dialing {addr}")),
+                Ok(Err(e)) => errors.push_error(addr, e),
+                Err(_) => errors.push_timeout(addr),
             }
         }
-        Err(last_err)
+        Err(errors.finish())
     }
 
     /// Accept the next inbound interactive connection (§6.1). The control stream is
@@ -258,9 +206,7 @@ impl InteractiveEndpoint {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(NetError::Connect(
-                "inbound handshake timed out".to_string(),
-            )),
+            Err(_) => Err(NetError::Connect("inbound handshake timed out".to_string())),
         }
     }
 
@@ -530,28 +476,5 @@ impl Drop for InteractiveConnection {
         // Best-effort graceful close (H6): tell the peer we're gone so it doesn't have
         // to wait out the idle timeout. quinn flushes the CONNECTION_CLOSE on drop.
         self.connection.close(0u32.into(), b"bye");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Regression: a client that dials a LAN/remote peer must bind the *unspecified*
-    // address, never loopback — a `127.0.0.1`-bound UDP socket cannot transmit to a
-    // remote host, so the mobile client could never reach a desktop over wifi.
-    #[test]
-    fn client_bind_is_routable_not_loopback() {
-        let v4_peer: SocketAddr = "192.168.1.229:61600".parse().unwrap();
-        let bind = client_bind_for(v4_peer);
-        assert!(bind.ip().is_unspecified(), "{bind} must be unspecified");
-        assert!(!bind.ip().is_loopback(), "{bind} must not be loopback");
-        assert!(bind.is_ipv4(), "IPv4 peer -> IPv4 bind");
-        assert_eq!(bind.port(), 0, "OS-assigned ephemeral port");
-
-        let v6_peer: SocketAddr = "[fe80::1]:61600".parse().unwrap();
-        let bind6 = client_bind_for(v6_peer);
-        assert!(bind6.ip().is_unspecified());
-        assert!(bind6.is_ipv6(), "IPv6 peer -> IPv6 bind");
     }
 }

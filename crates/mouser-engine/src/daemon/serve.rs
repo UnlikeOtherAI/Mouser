@@ -16,7 +16,7 @@ use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::discovery;
 use crate::discovery::PeerRegistry;
 
-use super::file_transfer;
+use super::file_transfer::{self, ActiveBulkSession};
 use super::ipc_bridge::{ConnectRequest, IpcBridge};
 use super::pairing;
 use super::reconnect::{redial_until_reconnected, ReconnectEnd};
@@ -39,8 +39,8 @@ pub(super) async fn serve(
     let me = Arc::new(me);
     let my_id = me.device_id();
     let my_b32 = me.device_id_base32();
-    eprintln!("mouserd: device_id {my_b32}");
-    eprintln!("mouserd: role {role}");
+    crate::diag!(info, "mouserd: device_id {my_b32}");
+    crate::diag!(info, "mouserd: role {role}");
 
     // One endpoint both accepts (TrustOnFirstUse - trust is the §3 cert pin checked
     // against the mDNS-advertised id) and dials. Bind the dual-stack wildcard ([::]:0)
@@ -52,25 +52,30 @@ pub(super) async fn serve(
     let v4_bind = SocketAddr::from(([0u8, 0, 0, 0], 0));
     let endpoint = InteractiveEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
         .or_else(|e| {
-            eprintln!("mouserd: dual-stack bind failed ({e}); falling back to IPv4-only");
+            crate::diag!(
+                info,
+                "mouserd: dual-stack bind failed ({e}); falling back to IPv4-only"
+            );
             InteractiveEndpoint::bind_server(&me, v4_bind, PinPolicy::TrustOnFirstUse)
         })
         .map_err(|e| e.to_string())?;
     let iport = endpoint.local_addr().map_err(|e| e.to_string())?.port();
     let bulk_endpoint = Arc::new(
         mouser_net::BulkEndpoint::bind_server(&me, bind, PinPolicy::TrustOnFirstUse)
-            .or_else(|_| mouser_net::BulkEndpoint::bind_server(&me, v4_bind, PinPolicy::TrustOnFirstUse))
+            .or_else(|_| {
+                mouser_net::BulkEndpoint::bind_server(&me, v4_bind, PinPolicy::TrustOnFirstUse)
+            })
             .map_err(|e| e.to_string())?,
     );
     let bport = bulk_endpoint
         .local_addr()
         .map_err(|e| e.to_string())?
         .port();
-    let (bulk_peer_tx, bulk_peer_rx) = tokio::sync::watch::channel(None);
+    let (bulk_session_tx, bulk_session_rx) = tokio::sync::watch::channel(None);
     let (clipboard_bulk_tx, clipboard_bulk_rx) = super::clipboard_bulk::channel();
     let bulk_task = tokio::spawn(file_transfer::run_bulk_acceptor(
         Arc::clone(&bulk_endpoint),
-        bulk_peer_rx,
+        bulk_session_rx,
         file_transfer::quarantine_dir(store),
         clipboard_bulk_tx.clone(),
     ));
@@ -89,7 +94,8 @@ pub(super) async fn serve(
     let mdns = Discovery::new().map_err(|e| e.to_string())?;
     mdns.advertise(&advert, &host_ip)
         .map_err(|e| e.to_string())?;
-    eprintln!(
+    crate::diag!(
+        info,
         "mouserd: advertising {}:{iport} bulk:{bport} as {}",
         if host_ip.is_empty() { "auto" } else { &host_ip },
         advert.instance_name()
@@ -99,7 +105,7 @@ pub(super) async fn serve(
     let registry = PeerRegistry::new();
     let browser = mdns.browse().map_err(|e| e.to_string())?;
     tokio::spawn(discovery::run_registry(browser, registry.clone()));
-    eprintln!("mouserd: searching for peers on the local network...");
+    crate::diag!(info, "mouserd: searching for peers on the local network...");
 
     // Bring up the local IPC link so the desktop UI can see/drive the engine. The bridge
     // reads the shared registry for its snapshots; failure to bind it is non-fatal (the
@@ -108,7 +114,7 @@ pub(super) async fn serve(
         match IpcBridge::start(store.clone(), my_b32.clone(), hostname(), registry.clone()).await {
             Ok(bridge) => Some(bridge),
             Err(e) => {
-                eprintln!("mouserd: IPC unavailable ({e}); running headless");
+                crate::diag!(info, "mouserd: IPC unavailable ({e}); running headless");
                 None
             }
         };
@@ -138,18 +144,25 @@ pub(super) async fn serve(
         let peer = conn
             .peer_device_id()
             .ok_or("peer did not present a device_id")?;
+        let peer_text = format_device_id(&peer);
+        let session_id = conn.session_id();
+        let peer_session_id = conn.peer_session_id();
         if let Some(bridge) = bridge.as_ref() {
-            bridge.set_connected(&format_device_id(&peer), &my_b32);
+            bridge.set_connected(&peer_text, &my_b32);
         }
-        eprintln!(
-            "mouserd: connected; {}",
+        crate::diag!(
+            info,
+            "mouserd: connected peer_id={peer_text} session_id={session_id} peer_session_id={peer_session_id}; {}",
             if can_control {
                 "this machine can control the peer"
             } else {
                 "receive-only target mode"
             }
         );
-        bulk_peer_tx.send_replace(Some(peer));
+        bulk_session_tx.send_replace(Some(ActiveBulkSession {
+            peer_id: peer,
+            expected_session_id: peer_session_id,
+        }));
 
         let end = run_session(
             my_id,
@@ -162,6 +175,7 @@ pub(super) async fn serve(
                 bridge: bridge.as_ref(),
                 identity: Arc::clone(&me),
                 bulk_endpoint: Arc::clone(&bulk_endpoint),
+                bulk_session_id: session_id,
                 clipboard_bulk_rx: Arc::clone(&clipboard_bulk_rx),
             },
             SessionAdapters {
@@ -171,21 +185,32 @@ pub(super) async fn serve(
             },
         )
         .await;
-        bulk_peer_tx.send_replace(None);
-        if let Some(bridge) = bridge.as_ref() {
-            bridge.set_idle();
-        }
+        bulk_session_tx.send_replace(None);
         match end {
-            SessionEnd::Shutdown => break,
-            SessionEnd::Disconnected => {
-                eprintln!("mouserd: session ended; searching for peers");
+            SessionEnd::Shutdown => {
+                if let Some(bridge) = bridge.as_ref() {
+                    bridge.set_idle();
+                }
+                break;
             }
-            SessionEnd::ConnectionLost => {
+            SessionEnd::Disconnected => {
+                if let Some(bridge) = bridge.as_ref() {
+                    bridge.set_idle();
+                }
+                crate::diag!(info, "mouserd: session ended; searching for peers");
+            }
+            SessionEnd::ConnectionLost { reason } => {
+                if let Some(bridge) = bridge.as_ref() {
+                    bridge.set_connect_error(&reason);
+                }
                 if role == "target" || !can_control {
-                    eprintln!("mouserd: connection lost; returning to discovery");
+                    crate::diag!(
+                        warn,
+                        "mouserd: connection lost ({reason}); returning to discovery"
+                    );
                     continue;
                 }
-                eprintln!("mouserd: connection lost; redialing {peer:?}");
+                crate::diag!(warn, "mouserd: connection lost ({reason}); redialing");
                 match redial_until_reconnected(
                     store,
                     &endpoint,
@@ -200,14 +225,14 @@ pub(super) async fn serve(
                         pending = Some(*conn);
                     }
                     ReconnectEnd::Disconnected => {
-                        eprintln!("mouserd: reconnect stopped; searching for peers");
+                        crate::diag!(info, "mouserd: reconnect stopped; searching for peers");
                     }
                     ReconnectEnd::Shutdown => break,
                 }
             }
         }
     }
-    eprintln!("mouserd: shutting down");
+    crate::diag!(info, "mouserd: shutting down");
     bulk_endpoint.close();
     bulk_task.abort();
     let _ = capture.stop();
@@ -248,7 +273,7 @@ async fn next_connection(
                     match dial_connect_request(store, endpoint, me, registry, request).await {
                         Ok(conn) => return Some((conn, true)),
                         Err(e) => {
-                            eprintln!("mouserd: IPC connect failed: {e}");
+                            crate::diag!(info, "mouserd: IPC connect failed: {e}");
                             // Surface the reason to the UI instead of silently idling.
                             if let Some(bridge) = bridge { bridge.set_connect_error(&e); }
                             continue;
@@ -259,7 +284,7 @@ async fn next_connection(
             accepted = pairing::accept_trusted(endpoint, store, registry, bridge) => {
                 match accepted {
                     Ok(conn) => return Some((conn, false)),
-                    Err(e) => { eprintln!("mouserd: accept error: {e}"); continue; }
+                    Err(e) => { crate::diag!(info, "mouserd: accept error: {e}"); continue; }
                 }
             }
             dialed = dial_discovered_backoff(store, endpoint, me, my_id, my_b32, registry, role == "source", dial_failures), if can_dial => {
@@ -268,7 +293,7 @@ async fn next_connection(
                     // to this call, so the next call starts fresh at 0 — no reset needed.
                     Ok(conn) => return Some((conn, true)),
                     Err(e) => {
-                        eprintln!("mouserd: dial error: {e}");
+                        crate::diag!(info, "mouserd: dial error: {e}");
                         dial_failures = dial_failures.saturating_add(1);
                         continue;
                     }
@@ -313,7 +338,8 @@ async fn dial_connect_request(
             format_device_id(&peer_id)
         ));
     }
-    eprintln!(
+    crate::diag!(
+        info,
         "mouserd: dialing {} ({} candidate address(es), IPC connect)",
         format_device_id(&peer_id),
         addrs.len()
@@ -407,7 +433,8 @@ async fn dial_discovered(
                 Ok(false) => {
                     if warned_untrusted.insert(peer_id) {
                         let peer_text = format_device_id(&peer_id);
-                        eprintln!(
+                        crate::diag!(
+                            info,
                             "mouserd: found untrusted peer {}; run `mouserd trust {peer_text}` \
                              on this machine before connecting",
                             peer.instance_name()
@@ -417,7 +444,8 @@ async fn dial_discovered(
                 }
                 Err(e) => {
                     if warned_untrusted.insert(peer_id) {
-                        eprintln!(
+                        crate::diag!(
+                            info,
                             "mouserd: trust check failed for {}: {e}",
                             peer.instance_name()
                         );
@@ -429,7 +457,8 @@ async fn dial_discovered(
             if addrs.is_empty() {
                 continue;
             }
-            eprintln!(
+            crate::diag!(
+                info,
                 "mouserd: dialing {} ({} candidate address(es))",
                 peer.instance_name(),
                 addrs.len()

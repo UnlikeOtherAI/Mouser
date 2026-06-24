@@ -26,6 +26,10 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use crate::codec::{read_message, write_message, IpcError};
 use crate::dto::{Command, ServerMessage, Snapshot};
 use crate::path::default_socket_path;
+#[cfg(windows)]
+use crate::windows_security::{
+    create_user_pipe, current_process_user_sid, verify_pipe_client_user, UserSid,
+};
 
 const MAX_CLIENTS: usize = 4;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
@@ -169,19 +173,36 @@ impl IpcListener {
 struct IpcListener {
     pipe_name: PathBuf,
     pending: NamedPipeServer,
+    daemon_user_sid: UserSid,
 }
 
 #[cfg(windows)]
 impl IpcListener {
     fn bind(pipe_name: PathBuf) -> Result<Self, IpcError> {
-        let pending = pipe_options(true).create(pipe_name.as_os_str())?;
-        Ok(Self { pipe_name, pending })
+        let daemon_user_sid = current_process_user_sid()?;
+        let pending = create_pipe_instance(&pipe_name, true, &daemon_user_sid)?;
+        Ok(Self {
+            pipe_name,
+            pending,
+            daemon_user_sid,
+        })
     }
 
     async fn accept(&mut self) -> Result<IpcServerStream, std::io::Error> {
         self.pending.connect().await?;
-        let next = pipe_options(false).create(self.pipe_name.as_os_str())?;
-        Ok(std::mem::replace(&mut self.pending, next))
+        let next = match create_pipe_instance(&self.pipe_name, false, &self.daemon_user_sid) {
+            Ok(next) => next,
+            Err(e) => {
+                let _ = self.pending.disconnect();
+                return Err(e);
+            }
+        };
+        let connected = std::mem::replace(&mut self.pending, next);
+        if let Err(e) = verify_pipe_client_user(&connected, &self.daemon_user_sid) {
+            let _ = connected.disconnect();
+            return Err(e);
+        }
+        Ok(connected)
     }
 }
 
@@ -192,9 +213,22 @@ fn pipe_options(first_instance: bool) -> ServerOptions {
     if first_instance {
         options.first_pipe_instance(true);
     }
-    // TODO(R3-H3): attach a current-user DACL once this unsafe-free crate has a
-    // safe Windows SECURITY_ATTRIBUTES wrapper available.
     options
+}
+
+#[cfg(windows)]
+fn create_pipe_instance(
+    pipe_name: &Path,
+    first_instance: bool,
+    daemon_user_sid: &UserSid,
+) -> Result<NamedPipeServer, std::io::Error> {
+    // This pipe is the engine control plane: a client can trust devices, connect
+    // sessions, and send files by local path. The DACL therefore mirrors the
+    // Unix `0o600` socket mode: only the daemon process user's SID receives
+    // read/write pipe access. An explicit DACL with no Everyone/AuthUsers ACE
+    // means other local users have no allow entry, so they cannot open it.
+    let options = pipe_options(first_instance);
+    create_user_pipe(&options, pipe_name.as_os_str(), daemon_user_sid)
 }
 
 /// Accept connections forever, spawning a per-client task for each.

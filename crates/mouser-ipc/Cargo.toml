@@ -6,10 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Pure async IO + serde DTOs, unsafe-free, so it adopts the workspace lints
-# (panic-free discipline + `forbid(unsafe_code)`).
-[lints]
-workspace = true
+# This crate mostly remains unsafe-free, but the Windows named-pipe server must
+# call Win32 security APIs to attach a current-user DACL and verify peer tokens.
+# It therefore cannot adopt workspace `unsafe_code = "forbid"`; lib.rs keeps
+# the same lint discipline with a narrow Windows-only unsafe allowance.
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -19,6 +19,16 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", default-features = false, features = ["socket", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
