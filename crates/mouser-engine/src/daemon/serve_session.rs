@@ -13,7 +13,7 @@ use crate::{EngineCore, RuntimeHandle};
 use super::clipboard::{self as clipboard_driver, DriverConfig, SettingsProvider};
 use super::clipboard_bulk::{BulkClipboardSender, ClipboardBulkRx};
 use super::file_transfer;
-use super::ipc_bridge::{FileSendRequest, IpcBridge};
+use super::ipc_bridge::{ConnectRequest, FileSendRequest, IpcBridge};
 use super::source_layout;
 
 pub(super) struct SessionContext<'a> {
@@ -36,6 +36,11 @@ pub(super) enum SessionEnd {
     Shutdown,
     Disconnected,
     ConnectionLost { reason: String },
+    /// The user explicitly asked (over IPC) to connect to a peer while this machine was a
+    /// receiver (or connected to a different peer). End this session and re-establish as
+    /// the **source** for `peer`, so an explicit Connect always makes the clicking machine
+    /// the controller regardless of who auto-dialed first.
+    SwitchSource(DeviceId),
 }
 
 pub(super) async fn run_session(
@@ -107,6 +112,16 @@ pub(super) async fn run_session(
                 crate::diag!(info, "mouserd: disconnect requested over IPC");
                 break SessionEnd::Disconnected;
             }
+            request = wait_for_connect(context.bridge) => {
+                if let Some(request) = request {
+                    // An explicit Connect means "I want to control this peer." If we're a
+                    // receiver, or pointed at a different peer, switch to being its source.
+                    // If we're already its source, there's nothing to do.
+                    if !can_control || request.peer_id != peer {
+                        break SessionEnd::SwitchSource(request.peer_id);
+                    }
+                }
+            }
             request = wait_for_file_send(context.bridge), if file_send_open => {
                 let Some(request) = request else {
                     file_send_open = false;
@@ -169,6 +184,13 @@ fn spawn_file_send(
 async fn wait_for_disconnect(bridge: Option<&IpcBridge>) {
     match bridge {
         Some(bridge) => bridge.next_disconnect_request().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_connect(bridge: Option<&IpcBridge>) -> Option<ConnectRequest> {
+    match bridge {
+        Some(bridge) => bridge.next_connect_request().await,
         None => std::future::pending().await,
     }
 }

@@ -119,12 +119,43 @@ pub(super) async fn serve(
             }
         };
 
-    let mut pending = None;
+    // A connection carried over from a reconnect/switch, with its resolved role.
+    let mut pending: Option<(InteractiveConnection, bool)> = None;
+    // The peer this machine is the persistent **controller** of, set by an explicit user
+    // Connect. While set, we (re)dial it as source and refuse its inbound dials, so the
+    // clicking machine stays the controller regardless of the auto-dial tiebreaker. Cleared
+    // on user Disconnect.
+    let mut source_intent: Option<DeviceId> = None;
     loop {
-        let (conn, can_control) = if let Some(conn) = pending.take() {
-            (conn, true)
+        let (conn, can_control) = if let Some((conn, can_control)) = pending.take() {
+            (conn, can_control)
+        } else if let Some(target) = source_intent {
+            // We are the controller for `target`: keep (re)dialing it as source until it
+            // answers, the user disconnects, or shutdown. `accept_inbound = false` — we must
+            // not accept its dial (that would make us its receiver again).
+            match redial_until_reconnected(
+                store,
+                &endpoint,
+                &me,
+                &registry,
+                target,
+                bridge.as_ref(),
+                false,
+            )
+            .await
+            {
+                ReconnectEnd::Reconnected { conn, can_control } => (*conn, can_control),
+                ReconnectEnd::Disconnected => {
+                    source_intent = None;
+                    if let Some(bridge) = bridge.as_ref() {
+                        bridge.set_idle();
+                    }
+                    continue;
+                }
+                ReconnectEnd::Shutdown => break,
+            }
         } else {
-            let Some(found) = next_connection(
+            let Some((conn, can_control, explicit_source)) = next_connection(
                 store,
                 &endpoint,
                 &me,
@@ -138,7 +169,10 @@ pub(super) async fn serve(
             else {
                 break;
             };
-            found
+            if explicit_source {
+                source_intent = conn.peer_device_id();
+            }
+            (conn, can_control)
         };
 
         let peer = conn
@@ -194,14 +228,37 @@ pub(super) async fn serve(
                 break;
             }
             SessionEnd::Disconnected => {
+                // An explicit user Disconnect drops the controller intent too.
+                source_intent = None;
                 if let Some(bridge) = bridge.as_ref() {
                     bridge.set_idle();
                 }
                 crate::diag!(info, "mouserd: session ended; searching for peers");
             }
+            SessionEnd::SwitchSource(target) => {
+                // The user explicitly asked to control `target`. Become its persistent
+                // controller; the loop top re-dials it as source (and refuses its inbound).
+                source_intent = Some(target);
+                if let Some(bridge) = bridge.as_ref() {
+                    bridge.set_connecting(&format_device_id(&target));
+                }
+                crate::diag!(
+                    info,
+                    "mouserd: switching to controller role for {}",
+                    format_device_id(&target)
+                );
+            }
             SessionEnd::ConnectionLost { reason } => {
                 if let Some(bridge) = bridge.as_ref() {
                     bridge.set_connect_error(&reason);
+                }
+                if source_intent.is_some() {
+                    // We hold the controller intent; the loop top re-dials as source.
+                    crate::diag!(
+                        warn,
+                        "mouserd: connection lost ({reason}); re-dialing as controller"
+                    );
+                    continue;
                 }
                 if role == "target" || !can_control {
                     crate::diag!(
@@ -211,6 +268,9 @@ pub(super) async fn serve(
                     continue;
                 }
                 crate::diag!(warn, "mouserd: connection lost ({reason}); redialing");
+                // We were the controller (auto/source) and lost it: re-dial, but also accept
+                // an inbound from this peer so a takeover by the peer converges instead of
+                // deadlocking.
                 match redial_until_reconnected(
                     store,
                     &endpoint,
@@ -218,11 +278,12 @@ pub(super) async fn serve(
                     &registry,
                     peer,
                     bridge.as_ref(),
+                    true,
                 )
                 .await
                 {
-                    ReconnectEnd::Reconnected(conn) => {
-                        pending = Some(*conn);
+                    ReconnectEnd::Reconnected { conn, can_control } => {
+                        pending = Some((*conn, can_control));
                     }
                     ReconnectEnd::Disconnected => {
                         crate::diag!(info, "mouserd: reconnect stopped; searching for peers");
@@ -241,7 +302,10 @@ pub(super) async fn serve(
 
 /// Wait for the connection to form: an IPC `Connect{peer_id}` to a trusted,
 /// discovered peer, an auto-discovered dial (auto/source), or an inbound accept.
-/// Returns `(connection, can_control)`, or `None` if ctrl-c fired first.
+/// Returns `(connection, can_control, explicit_source)`, or `None` if ctrl-c fired first.
+/// `explicit_source` is true only for a user-driven IPC Connect, so the caller can persist
+/// the controller intent (after which it (re)dials that peer via the source-intent path and
+/// no longer enters this function for it).
 #[allow(clippy::too_many_arguments)]
 async fn next_connection(
     store: &DaemonStore,
@@ -252,7 +316,7 @@ async fn next_connection(
     registry: &PeerRegistry,
     role: &str,
     bridge: Option<&IpcBridge>,
-) -> Option<(InteractiveConnection, bool)> {
+) -> Option<(InteractiveConnection, bool, bool)> {
     // `target` only accepts; `source`/`auto` may dial. Either way an IPC Connect can
     // explicitly drive a dial to a chosen trusted peer.
     let can_dial = role != "target";
@@ -271,7 +335,7 @@ async fn next_connection(
                     let peer_text = format_device_id(&request.peer_id);
                     if let Some(bridge) = bridge { bridge.set_connecting(&peer_text); }
                     match dial_connect_request(store, endpoint, me, registry, request).await {
-                        Ok(conn) => return Some((conn, true)),
+                        Ok(conn) => return Some((conn, true, true)),
                         Err(e) => {
                             crate::diag!(info, "mouserd: IPC connect failed: {e}");
                             // Surface the reason to the UI instead of silently idling.
@@ -283,7 +347,7 @@ async fn next_connection(
             }
             accepted = pairing::accept_trusted(endpoint, store, registry, bridge) => {
                 match accepted {
-                    Ok(conn) => return Some((conn, false)),
+                    Ok(conn) => return Some((conn, false, false)),
                     Err(e) => { crate::diag!(info, "mouserd: accept error: {e}"); continue; }
                 }
             }
@@ -291,7 +355,7 @@ async fn next_connection(
                 match dialed {
                     // On success we return out of next_connection; dial_failures is local
                     // to this call, so the next call starts fresh at 0 — no reset needed.
-                    Ok(conn) => return Some((conn, true)),
+                    Ok(conn) => return Some((conn, true, false)),
                     Err(e) => {
                         crate::diag!(info, "mouserd: dial error: {e}");
                         dial_failures = dial_failures.saturating_add(1);
