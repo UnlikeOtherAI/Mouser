@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { PermissionBanner } from "./components/permission-banner";
 import { SideNav } from "./components/side-nav";
 import { DIAGNOSTICS_NAV_ITEM, NAV_ITEMS } from "./lib/mock-data";
 import {
@@ -115,6 +116,7 @@ export function App(): React.JSX.Element {
           <h1 className="mb-5 text-xl font-semibold tracking-tight">
             {SECTION_TITLES[active]}
           </h1>
+          <PermissionBanner />
           {renderSection(active, {
             showDiagnostics,
             onShowDiagnosticsChange: handleShowDiagnosticsChange,

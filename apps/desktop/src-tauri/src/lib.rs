@@ -383,6 +383,79 @@ fn firewall_settings_command() -> (&'static str, Vec<&'static str>) {
     ("xdg-open", vec!["settings:///network"])
 }
 
+/// Input-permission status for the controlling machine. On macOS, capturing/forwarding
+/// input needs **Accessibility** (suppress + inject) and **Input Monitoring** (the edge
+/// tap); without them the cursor silently won't cross. `relevant` is false on platforms
+/// that don't gate this behind a queryable runtime grant.
+#[derive(serde::Serialize)]
+struct InputPermissions {
+    relevant: bool,
+    accessibility: bool,
+    input_monitoring: bool,
+}
+
+/// Report whether this machine has the grants needed to control a peer (drive its cursor).
+#[tauri::command]
+fn input_permissions() -> InputPermissions {
+    #[cfg(target_os = "macos")]
+    {
+        InputPermissions {
+            relevant: true,
+            accessibility: platform_mac::accessibility_trusted(),
+            input_monitoring: platform_mac::input_monitoring_trusted(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows (SetWindowsHookEx) and Linux (evdev) aren't gated by a runtime grant the
+        // app can query, so report all-clear.
+        InputPermissions {
+            relevant: false,
+            accessibility: true,
+            input_monitoring: true,
+        }
+    }
+}
+
+/// Trigger the OS permission prompt for `kind` ("accessibility" | "input_monitoring") and
+/// open the exact Privacy pane (the system prompt only fires once per launch, so we also
+/// deep-link the user straight to the toggle). No-op on platforms without these grants.
+#[tauri::command]
+fn request_input_permission(kind: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        match kind.as_str() {
+            "accessibility" => {
+                let _ = platform_mac::prompt_accessibility();
+                open_settings_url(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                )
+            }
+            "input_monitoring" => {
+                let _ = platform_mac::prompt_input_monitoring();
+                open_settings_url(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+                )
+            }
+            other => Err(format!("unknown permission kind: {other}")),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = kind;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_settings_url(url: &str) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("could not open settings: {e}"))
+}
+
 /// Open a short-lived IPC client, fetch one snapshot, and close. Commands are rare and
 /// the snapshot is small, so a fresh connection per call keeps the shell stateless and
 /// avoids a background reader task fighting the command path over one socket.
@@ -572,6 +645,8 @@ pub fn run() {
             deny_pairing,
             set_settings,
             run_remediation,
+            input_permissions,
+            request_input_permission,
             reset_data,
             set_tray_icon_visible
         ])
