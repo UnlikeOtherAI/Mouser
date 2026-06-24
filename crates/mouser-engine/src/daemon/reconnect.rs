@@ -81,7 +81,7 @@ pub(super) async fn redial_until_reconnected(
                 if let Some(bridge) = bridge {
                     bridge.set_connect_error(&reason);
                 }
-                eprintln!("mouserd: reconnect stopped: {reason}");
+                crate::diag!(info, "mouserd: reconnect stopped: {reason}");
                 return ReconnectEnd::Disconnected;
             }
             Err(e) => {
@@ -89,7 +89,7 @@ pub(super) async fn redial_until_reconnected(
                 if let Some(bridge) = bridge {
                     bridge.set_connect_error(&reason);
                 }
-                eprintln!("mouserd: reconnect stopped: {reason}");
+                crate::diag!(info, "mouserd: reconnect stopped: {reason}");
                 return ReconnectEnd::Disconnected;
             }
         }
@@ -99,7 +99,8 @@ pub(super) async fn redial_until_reconnected(
             ResolveEnd::Disconnected => return ReconnectEnd::Disconnected,
             ResolveEnd::Shutdown => return ReconnectEnd::Shutdown,
         };
-        eprintln!(
+        crate::diag!(
+            info,
             "mouserd: redialing {peer_text} ({} candidate address(es))",
             addrs.len()
         );
@@ -114,7 +115,7 @@ pub(super) async fn redial_until_reconnected(
                     bridge.set_connect_error(&reason);
                     bridge.set_connecting(&peer_text);
                 }
-                eprintln!("mouserd: {reason}");
+                crate::diag!(info, "mouserd: {reason}");
             }
         }
 

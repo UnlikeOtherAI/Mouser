@@ -21,7 +21,7 @@ pub(super) async fn probe(store: &DaemonStore, addr: SocketAddr) -> Result<(), S
     let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
     let endpoint = InteractiveEndpoint::bind_client(mouser_net::client_bind_for(addr))
         .map_err(|e| e.to_string())?;
-    eprintln!("mouserd: probing {addr}...");
+    crate::diag!(info, "mouserd: probing {addr}...");
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         endpoint.connect_interactive(&me, addr, PinPolicy::TrustOnFirstUse),
@@ -37,12 +37,14 @@ pub(super) async fn probe(store: &DaemonStore, addr: SocketAddr) -> Result<(), S
         .as_ref()
         .map(format_device_id)
         .unwrap_or_else(|| "<missing>".to_string());
-    eprintln!(
+    crate::diag!(
+        info,
         "mouserd: PROBE OK - handshake with {addr} completed; ALPN={alpn:?}; \
          peer_device_id={peer_text}"
     );
     if let Some(peer_id) = peer {
-        eprintln!(
+        crate::diag!(
+            info,
             "mouserd: to trust this peer on this machine, run: mouserd trust {}",
             format_device_id(&peer_id)
         );
@@ -74,10 +76,10 @@ pub(super) async fn serve_direct(
 
     let me = store.load_or_create_identity().map_err(|e| e.to_string())?;
     let my_id = me.device_id();
-    eprintln!("mouserd: device_id {}", me.device_id_base32());
+    crate::diag!(info, "mouserd: device_id {}", me.device_id_base32());
     let endpoint = InteractiveEndpoint::bind_client(mouser_net::client_bind_for(addr))
         .map_err(|e| e.to_string())?;
-    eprintln!("mouserd: dialing {addr} directly...");
+    crate::diag!(info, "mouserd: dialing {addr} directly...");
     let conn = endpoint
         .connect_interactive(&me, addr, PinPolicy::Pinned(expected_peer))
         .await
@@ -85,7 +87,10 @@ pub(super) async fn serve_direct(
     let peer = conn
         .peer_device_id()
         .ok_or("peer did not present a device_id")?;
-    eprintln!("mouserd: connected directly; this machine can control the peer");
+    crate::diag!(
+        info,
+        "mouserd: connected directly; this machine can control the peer"
+    );
 
     let core = EngineCore::new_source(my_id, peer, source_layout());
     let mut runtime = RuntimeHandle::start(core, Arc::new(conn), injector, capture);
@@ -103,7 +108,8 @@ pub(super) async fn serve_direct(
             },
         ))
     });
-    eprintln!(
+    crate::diag!(
+        info,
         "mouserd: passive edge sensing active - local keyboard/mouse stay native; \
          suppressing capture installs only while controlling the peer"
     );

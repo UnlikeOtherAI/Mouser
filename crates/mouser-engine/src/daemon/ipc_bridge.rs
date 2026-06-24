@@ -113,7 +113,8 @@ impl IpcBridge {
         let server = Server::bind(build_snapshot(&shared))
             .await
             .map_err(|e| e.to_string())?;
-        eprintln!(
+        crate::diag!(
+            info,
             "mouserd: IPC listening at {}",
             server.socket_path().display()
         );
@@ -284,11 +285,13 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
         })
         .collect();
     peers.sort_by(|a, b| a.id.cmp(&b.id));
-    let diagnostics = super::ipc_health::build_diagnostics(shared.started, &peers);
+    let connection = lock(&shared.connection).clone();
+    let diagnostics =
+        super::ipc_health::build_diagnostics(shared.started, &peers, connection.error.as_deref());
     Snapshot {
         local: shared.local.clone(),
         peers,
-        connection: lock(&shared.connection).clone(),
+        connection,
         pairing: lock(&shared.pairing).clone(),
         settings: lock(&shared.settings).clone(),
         diagnostics,
@@ -330,11 +333,14 @@ async fn command_loop(
                         let _ = connect_tx.send(request);
                     }
                     Err(reason) => {
-                        eprintln!("mouserd: IPC Connect rejected for {peer_id}: {reason}");
+                        crate::diag!(
+                            info,
+                            "mouserd: IPC Connect rejected for {peer_id}: {reason}"
+                        );
                         publish_connect_error(&shared, &publisher, &reason);
                     }
                 },
-                None => eprintln!("mouserd: IPC Connect with invalid peer id: {peer_id}"),
+                None => crate::diag!(info, "mouserd: IPC Connect with invalid peer id: {peer_id}"),
             },
             Some(Command::Disconnect) => {
                 let _ = disconnect_tx.send(());
@@ -342,14 +348,14 @@ async fn command_loop(
             Some(Command::Trust { peer_id }) => match discovery::decode_device_id(&peer_id) {
                 Some(id) => match shared.store.trust_peer(id) {
                     Ok(()) => {
-                        eprintln!("mouserd: trusted peer {peer_id} (paired via IPC)");
+                        crate::diag!(info, "mouserd: trusted peer {peer_id} (paired via IPC)");
                         // Rebuild + push so the UI flips the peer to "paired" at once;
                         // the cached snapshot would otherwise not reflect the new trust.
                         publisher.publish(build_snapshot(&shared));
                     }
-                    Err(e) => eprintln!("mouserd: failed to trust peer {peer_id}: {e}"),
+                    Err(e) => crate::diag!(info, "mouserd: failed to trust peer {peer_id}: {e}"),
                 },
-                None => eprintln!("mouserd: IPC Trust with invalid peer id: {peer_id}"),
+                None => crate::diag!(info, "mouserd: IPC Trust with invalid peer id: {peer_id}"),
             },
             Some(Command::ApprovePairing { peer_id }) => {
                 let _ = decision_tx.send((peer_id, true));
@@ -361,11 +367,11 @@ async fn command_loop(
                 Ok(request) => {
                     let _ = file_send_tx.send(request);
                 }
-                Err(reason) => eprintln!("mouserd: IPC SendFiles rejected: {reason}"),
+                Err(reason) => crate::diag!(info, "mouserd: IPC SendFiles rejected: {reason}"),
             },
             Some(Command::UpdateSettings { settings }) => {
                 if let Err(e) = shared.store.save_settings(&settings) {
-                    eprintln!("mouserd: failed to persist settings: {e}");
+                    crate::diag!(info, "mouserd: failed to persist settings: {e}");
                 }
                 *lock(&shared.settings) = settings;
                 // Republish so every connected surface (UI + MCP) reflects it at once.
@@ -382,12 +388,12 @@ async fn command_loop(
                     // recomputed from the (now empty) store on the next build_snapshot.
                     *lock(&shared.settings) = SettingsDto::default();
                     publisher.publish(build_snapshot(&shared));
-                    eprintln!("mouserd: reset — cleared trusted peers and settings");
+                    crate::diag!(info, "mouserd: reset — cleared trusted peers and settings");
                 }
                 // Disk reset failed: leave in-memory state untouched so the snapshot keeps
                 // reporting the real (unchanged) trust + settings — the UI then shows the
                 // reset did not take, rather than a false success — and it can be retried.
-                Err(e) => eprintln!("mouserd: reset failed, store left unchanged: {e}"),
+                Err(e) => crate::diag!(info, "mouserd: reset failed, store left unchanged: {e}"),
             },
             // GetSnapshot is answered by the server; nothing reaches here.
             Some(Command::GetSnapshot) => {}

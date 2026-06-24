@@ -17,6 +17,7 @@
 
 pub mod core;
 pub mod daemon_store;
+pub mod diagnostics;
 pub mod discovery;
 pub mod runtime;
 

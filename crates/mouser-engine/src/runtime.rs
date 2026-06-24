@@ -31,8 +31,8 @@
 //! strong reference cycle with the runtime.
 
 mod control_lane;
+mod liveness;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -42,11 +42,11 @@ use mouser_core::platform::{
 };
 use mouser_net::{InteractiveConnection, MotionPlane};
 use mouser_protocol::{from_cbor, to_cbor, Datagram, PointerMotion};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{Action, CaptureDecision, EngineCore, Inject};
 use control_lane::{is_side_control, ControlLane, ControlMessage, Outgoing};
+use liveness::DeathState;
 
 pub use control_lane::ControlLane as RuntimeControlLane;
 
@@ -76,10 +76,10 @@ pub enum RuntimeState {
     Dead,
 }
 
-/// Lock the core, recovering the inner value if a task panicked while holding it
+/// Lock shared state, recovering the inner value if a task panicked while holding it
 /// (panic-free discipline: no `unwrap` on the poisoned guard).
-fn lock(core: &Mutex<EngineCore>) -> std::sync::MutexGuard<'_, EngineCore> {
-    core.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Shared {
@@ -99,7 +99,7 @@ impl Shared {
                 }
                 Action::Inject(inject) => {
                     if let Err(e) = apply_inject(&self.injector, inject) {
-                        eprintln!(
+                        crate::diag!(info,
                             "mouserd: input injection failed; blocking remote input and returning ownership: {e}"
                         );
                         let actions = lock(&self.core).on_injection_failed();
@@ -157,8 +157,7 @@ pub struct RuntimeHandle {
     shared: Arc<Shared>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     cancel: CancellationToken,
-    dead: Arc<AtomicBool>,
-    dead_notify: Arc<Notify>,
+    death: DeathState,
     control_lane: Option<ControlLane>,
 }
 
@@ -171,19 +170,6 @@ fn apply_inject(
         Inject::Button { button, down } => injector.button(button, down),
         Inject::Key { usage, down, mods } => injector.key(usage, down, mods),
         Inject::Scroll { dx, dy, unit } => injector.scroll(dx, dy, unit),
-    }
-}
-
-fn mark_dead(
-    dead: &Arc<AtomicBool>,
-    dead_notify: &Arc<Notify>,
-    cancel: &CancellationToken,
-    conn: &Arc<InteractiveConnection>,
-) {
-    if !dead.swap(true, Ordering::SeqCst) {
-        conn.close();
-        cancel.cancel();
-        dead_notify.notify_waiters();
     }
 }
 
@@ -218,8 +204,7 @@ impl RuntimeHandle {
         let (side_tx, side_rx) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
         let (mode_tx, mut mode_rx) = tokio::sync::mpsc::unbounded_channel::<CaptureMode>();
         let cancel = CancellationToken::new();
-        let dead = Arc::new(AtomicBool::new(false));
-        let dead_notify = Arc::new(Notify::new());
+        let death = DeathState::new();
         let shared = Arc::new(Shared {
             core: Mutex::new(core),
             out_tx,
@@ -233,8 +218,7 @@ impl RuntimeHandle {
         {
             let conn = Arc::clone(&conn);
             let cancel = cancel.clone();
-            let dead = Arc::clone(&dead);
-            let dead_notify = Arc::clone(&dead_notify);
+            let death = death.clone();
             let motion_plane = conn.motion_plane();
             tasks.push(tokio::spawn(async move {
                 let motion_plane = motion_plane;
@@ -243,13 +227,13 @@ impl RuntimeHandle {
                         _ = cancel.cancelled() => break,
                         msg = out_rx.recv() => {
                             let Some(msg) = msg else {
-                                mark_dead(&dead, &dead_notify, &cancel, &conn);
+                                death.mark(&cancel, &conn, "runtime outbound queue closed");
                                 break;
                             };
                             match msg {
                                 Outgoing::Control(ty, payload) => {
-                                    if conn.send_control(ty, &payload).await.is_err() {
-                                        mark_dead(&dead, &dead_notify, &cancel, &conn);
+                                    if let Err(e) = conn.send_control(ty, &payload).await {
+                                        death.mark(&cancel, &conn, format!("control send failed: {e}"));
                                         break;
                                     }
                                 }
@@ -260,7 +244,7 @@ impl RuntimeHandle {
                                                 .send_control(TYPE_POINTER_MOTION_FALLBACK, &payload)
                                                 .await,
                                             Err(e) => {
-                                                eprintln!(
+                                                crate::diag!(info,
                                                     "mouserd: failed to encode fallback pointer motion: {e}"
                                                 );
                                                 Ok(())
@@ -269,8 +253,8 @@ impl RuntimeHandle {
                                     } else {
                                         conn.send_motion(&motion)
                                     };
-                                    if send.is_err() {
-                                        mark_dead(&dead, &dead_notify, &cancel, &conn);
+                                    if let Err(e) = send {
+                                        death.mark(&cancel, &conn, format!("motion send failed: {e}"));
                                         break;
                                     }
                                 }
@@ -286,8 +270,7 @@ impl RuntimeHandle {
             let conn = Arc::clone(&conn);
             let shared = Arc::clone(&shared);
             let cancel = cancel.clone();
-            let dead = Arc::clone(&dead);
-            let dead_notify = Arc::clone(&dead_notify);
+            let death = death.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -306,8 +289,8 @@ impl RuntimeHandle {
                                 let actions = lock(&shared.core).on_control(ty, &payload);
                                 shared.dispatch(actions);
                             }
-                            Err(_) => {
-                                mark_dead(&dead, &dead_notify, &cancel, &conn);
+                            Err(e) => {
+                                death.mark(&cancel, &conn, format!("control receive failed: {e}"));
                                 break;
                             }
                         }
@@ -321,8 +304,7 @@ impl RuntimeHandle {
             let conn = Arc::clone(&conn);
             let shared = Arc::clone(&shared);
             let cancel = cancel.clone();
-            let dead = Arc::clone(&dead);
-            let dead_notify = Arc::clone(&dead_notify);
+            let death = death.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -332,8 +314,8 @@ impl RuntimeHandle {
                                 let actions = lock(&shared.core).on_motion(datagram);
                                 shared.dispatch(actions);
                             }
-                            Err(_) => {
-                                mark_dead(&dead, &dead_notify, &cancel, &conn);
+                            Err(e) => {
+                                death.mark(&cancel, &conn, format!("motion receive failed: {e}"));
                                 break;
                             }
                         }
@@ -378,13 +360,13 @@ impl RuntimeHandle {
                                 Ok(()) if mode == CaptureMode::ActiveForward
                                     && !shared.capture.can_suppress() =>
                                 {
-                                    eprintln!(
+                                    crate::diag!(info,
                                         "mouserd: capture downgrade: ActiveForward cannot suppress local input; local and remote may both receive events"
                                     );
                                 }
                                 Ok(()) => {}
                                 Err(e) => {
-                                    eprintln!("mouserd: capture set_mode({mode:?}) failed: {e}");
+                                    crate::diag!(info, "mouserd: capture set_mode({mode:?}) failed: {e}");
                                 }
                             }
                         }
@@ -403,8 +385,7 @@ impl RuntimeHandle {
             shared,
             tasks,
             cancel,
-            dead,
-            dead_notify,
+            death,
             control_lane: Some(control_lane),
         }
     }
@@ -439,7 +420,7 @@ impl RuntimeHandle {
     /// Runtime liveness: `Dead` means a network task observed connection loss or the
     /// outbound sender ended, and the sibling tasks have been cancelled.
     pub fn state(&self) -> RuntimeState {
-        if self.dead.load(Ordering::SeqCst) {
+        if self.death.is_dead() {
             RuntimeState::Dead
         } else {
             RuntimeState::Running
@@ -451,12 +432,13 @@ impl RuntimeHandle {
         self.state() == RuntimeState::Dead
     }
 
+    pub fn death_reason(&self) -> Option<String> {
+        self.death.reason()
+    }
+
     /// Resolve when the runtime reaches the terminal connection-dead state.
     pub async fn wait_dead(&self) {
-        if self.is_dead() {
-            return;
-        }
-        self.dead_notify.notified().await;
+        self.death.wait().await;
     }
 
     /// Stop all background tasks and tear capture down.
@@ -465,8 +447,7 @@ impl RuntimeHandle {
             shared,
             tasks,
             cancel,
-            dead: _,
-            dead_notify: _,
+            death: _,
             control_lane: _,
         } = self;
         cancel.cancel();
