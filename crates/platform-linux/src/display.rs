@@ -199,7 +199,13 @@ pub fn virtual_desktop_bounds() -> PlatformResult<DesktopBounds> {
 }
 
 #[must_use]
-pub(crate) fn global_point_to_event(displays: &[DisplayBounds], x: i32, y: i32) -> LocalInputEvent {
+pub(crate) fn global_point_to_event(
+    displays: &[DisplayBounds],
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+) -> LocalInputEvent {
     let bounds = displays
         .iter()
         .copied()
@@ -212,16 +218,16 @@ pub(crate) fn global_point_to_event(displays: &[DisplayBounds], x: i32, y: i32) 
                 display_id: bounds.id,
                 x,
                 y,
-                dx: 0,
-                dy: 0,
+                dx,
+                dy,
             }
         }
         None => LocalInputEvent::CursorMoved {
             display_id: 0,
             x,
             y,
-            dx: 0,
-            dy: 0,
+            dx,
+            dy,
         },
     }
 }
@@ -301,7 +307,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            global_point_to_event(&displays, 2020, 50),
+            global_point_to_event(&displays, 2020, 50, 0, 0),
             LocalInputEvent::CursorMoved {
                 display_id: 7,
                 x: 100,

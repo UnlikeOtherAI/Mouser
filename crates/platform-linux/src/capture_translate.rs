@@ -120,11 +120,15 @@ impl CursorMapper {
         if !self.integrating.load(Ordering::Relaxed) {
             let (x, y, displays) = self.real_position()?;
             self.store(x, y);
-            return Some(global_point_to_event(&displays, x, y));
+            // Position poll (not suppressing): absolute only — the engine reads
+            // raw deltas straight from the evdev REL stream when it owns motion.
+            return Some(global_point_to_event(&displays, x, y, 0, 0));
         }
         let (x, y) = self.apply(dx, dy)?;
         let displays = self.displays()?;
-        Some(global_point_to_event(&displays, x, y))
+        // Suppressing: carry the true HID delta so the peer keeps moving even
+        // once the integrated cursor is pinned at the display edge.
+        Some(global_point_to_event(&displays, x, y, dx, dy))
     }
 }
 
@@ -260,7 +264,7 @@ mod tests {
                 display_id: 7,
                 x: 70,
                 y: 50,
-                dx: 0,
+                dx: 20,
                 dy: 0,
             })
         );
@@ -271,7 +275,7 @@ mod tests {
                 x: 70,
                 y: 60,
                 dx: 0,
-                dy: 0,
+                dy: 10,
             })
         );
     }

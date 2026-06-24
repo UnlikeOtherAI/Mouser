@@ -64,6 +64,7 @@ pub(crate) fn clear_capture_state() {
     CAPTURE_MODS.store(0, Ordering::Release);
     CAPTURE_EMERGENCY_PASSTHROUGH.store(false, Ordering::Release);
     clear_capture_queue();
+    reset_last_capture_point();
     let mut state = lock_recover(capture_state());
     state.sink = None;
     state.displays.clear();
@@ -77,6 +78,7 @@ pub(crate) fn prepare_capture_state(sink: Arc<dyn InputSink>) -> Result<(), Capt
     CAPTURE_MODS.store(0, Ordering::Release);
     CAPTURE_EMERGENCY_PASSTHROUGH.store(false, Ordering::Release);
     clear_capture_queue();
+    reset_last_capture_point();
     state.displays = active_display_bounds().unwrap_or_default();
     state.sink = Some(sink);
     Ok(())
@@ -312,6 +314,8 @@ pub(crate) fn virtual_point_to_event(
     displays: &[DisplayBounds],
     x: i32,
     y: i32,
+    dx: i32,
+    dy: i32,
 ) -> LocalInputEvent {
     let bounds = displays
         .iter()
@@ -326,23 +330,48 @@ pub(crate) fn virtual_point_to_event(
                 display_id: bounds.id,
                 x: lx,
                 y: ly,
-                dx: 0,
-                dy: 0,
+                dx,
+                dy,
             }
         }
         None => LocalInputEvent::CursorMoved {
             display_id: 0,
             x,
             y,
-            dx: 0,
-            dy: 0,
+            dx,
+            dy,
         },
     }
 }
 
+/// Delta of the last dispatched capture cursor point, used to carry true motion
+/// to the peer. Coalescing keeps only the latest absolute point in the queue, so
+/// computing the delta here at dispatch time yields the full accumulated motion
+/// since the previous dispatch (not just the final coalesced segment).
+///
+/// NOTE: this is a successive-absolute delta. While the OS cursor is pinned at a
+/// screen edge during suppression the absolute point clamps, so the delta decays
+/// to 0 — same limitation macOS had before switching to CGEvent HID deltas. A
+/// true edge-pinned Windows-source fix needs Raw Input (WM_INPUT); tracked as a
+/// follow-up. Still strictly better than the previous hardcoded dx:0,dy:0.
+static LAST_CAPTURE_POINT: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
 fn cursor_event_for_virtual_point(x: i32, y: i32) -> LocalInputEvent {
     let displays = lock_recover(capture_state()).displays.clone();
-    virtual_point_to_event(&displays, x, y)
+    let (dx, dy) = {
+        let mut last = lock_recover(&LAST_CAPTURE_POINT);
+        let delta = match *last {
+            Some((px, py)) => (x - px, y - py),
+            None => (0, 0),
+        };
+        *last = Some((x, y));
+        delta
+    };
+    virtual_point_to_event(&displays, x, y, dx, dy)
+}
+
+fn reset_last_capture_point() {
+    *lock_recover(&LAST_CAPTURE_POINT) = None;
 }
 
 fn dispatch_capture_event(event: LocalInputEvent) {
