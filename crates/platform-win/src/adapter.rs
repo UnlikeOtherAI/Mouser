@@ -4,6 +4,8 @@
 //! from the capture module so the historical `adapter::WinCapture` path remains
 //! available while capture stays in its own focused source file.
 
+use std::sync::Mutex;
+
 use mouser_core::platform::{
     InputInjection, PlatformError, PlatformResult, ScrollUnit as CoreScrollUnit,
 };
@@ -19,15 +21,67 @@ pub use crate::capture::{
 use crate::inject::{self, Button, ScrollUnit as WinScrollUnit};
 
 /// Windows input injector backed by `SendInput`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct WinInjector;
+///
+/// `saved_cursor` holds the pre-hide cursor position while the peer owns input,
+/// so `set_cursor_visible(true)` can restore it. See [`WinInjector::set_cursor_visible`]
+/// for the crash-safe rationale behind parking (rather than `SetSystemCursor`-style
+/// system-wide hiding).
+#[derive(Debug, Default)]
+pub struct WinInjector {
+    /// Physical-pixel cursor position captured at the last `set_cursor_visible(false)`,
+    /// or `None` when the cursor is shown. `None` is the "visible" state, so a fresh
+    /// (or double-shown) injector starts visible.
+    saved_cursor: Mutex<Option<(i32, i32)>>,
+}
 
 impl WinInjector {
-    /// Create a stateless `SendInput` injector.
+    /// Create a `SendInput` injector with the cursor in the visible state.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
+}
+
+/// The next saved-cursor state given the current one and the requested visibility.
+///
+/// Pure bookkeeping for [`WinInjector::set_cursor_visible`], split out so the
+/// idempotency rules can be unit-tested without any Win32 call:
+///
+/// - hide while already hidden (`current = Some`) is a no-op — keep the *original*
+///   saved position, never overwrite it with the parked corner;
+/// - hide while visible (`current = None`) saves `live_pos`, to be parked;
+/// - show while hidden restores and clears to `None`;
+/// - show while already visible (`current = None`) is a no-op.
+///
+/// Returns `(next_saved, action)` where `action` tells the caller what Win32 work
+/// to perform.
+fn next_cursor_state(
+    current: Option<(i32, i32)>,
+    visible: bool,
+    live_pos: Option<(i32, i32)>,
+) -> (Option<(i32, i32)>, CursorAction) {
+    match (visible, current) {
+        // Hide while visible: remember where the cursor is, then park it.
+        (false, None) => (live_pos, CursorAction::Park),
+        // Hide while already hidden: keep the original saved position untouched.
+        (false, Some(saved)) => (Some(saved), CursorAction::None),
+        // Show while hidden: restore to the saved position and clear it.
+        (true, Some(saved)) => (None, CursorAction::Restore(saved)),
+        // Show while already visible: nothing to do.
+        (true, None) => (None, CursorAction::None),
+    }
+}
+
+/// What [`WinInjector::set_cursor_visible`] must do to the OS cursor after
+/// [`next_cursor_state`] decides the bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorAction {
+    /// No OS-cursor movement (idempotent double-hide / double-show).
+    None,
+    /// Park the cursor at the virtual-desktop corner (hide).
+    Park,
+    /// Move the cursor back to the carried physical-pixel position (show).
+    Restore((i32, i32)),
 }
 
 /// Bounds of one active monitor in Windows' virtual-desktop coordinate space.
@@ -221,7 +275,75 @@ impl InputInjection for WinInjector {
     fn scroll(&self, dx: i32, dy: i32, unit: CoreScrollUnit) -> PlatformResult<()> {
         inject::scroll(dx, dy, scroll_unit(unit)).map_err(boxed)
     }
+
+    /// Show or hide the local cursor while the peer owns input.
+    ///
+    /// ## Why parking, not a system cursor hide
+    /// Windows has no clean *per-process* "hide the global cursor" call: `ShowCursor`
+    /// only affects our own window-message queue, and `SetSystemCursor` (and the old
+    /// `ClipCursor` pin) mutate **system-wide** state that *survives process death* —
+    /// a crash, panic, or force-kill mid-handoff would strand the user with an invisible
+    /// or clamped pointer that an idle relaunch does not clear. A prior `ClipCursor` pin
+    /// caused exactly that ("unusable mouse"); this method deliberately avoids that class
+    /// of bug.
+    ///
+    /// Instead we *park* the cursor: on hide we save the current position
+    /// (`GetCursorPos`) and `SetCursorPos` it to the bottom-right-most pixel of the
+    /// virtual desktop; on show we move it back. `SetCursorPos` is ordinary,
+    /// non-persistent per-call state. If the process dies while hidden, the cursor is
+    /// simply sitting in a corner — fully recoverable by moving the mouse, with no
+    /// lingering system setting to undo.
+    ///
+    /// Idempotent: a double-hide keeps the *original* saved position (it does not
+    /// re-save the parked corner), and a double-show is a no-op.
+    fn set_cursor_visible(&self, visible: bool) -> PlatformResult<()> {
+        // Read the live position *before* taking the lock decision only when hiding;
+        // `next_cursor_state` ignores `live_pos` on every other branch, so an error
+        // reading it there must not fail the call.
+        let live_pos = if visible {
+            None
+        } else {
+            let p = inject::cursor_position().map_err(boxed)?;
+            Some((p.x, p.y))
+        };
+
+        // Hold the lock across the decision + the OS move so concurrent ownership
+        // transitions can't interleave a save/restore (poisoned lock => surface it).
+        let mut saved = self
+            .saved_cursor
+            .lock()
+            .map_err(|_| boxed(CursorLockPoisoned))?;
+        let (next, action) = next_cursor_state(*saved, visible, live_pos);
+
+        match action {
+            CursorAction::None => {}
+            CursorAction::Park => {
+                let (px, py) = inject::park_position().map_err(boxed)?;
+                inject::set_cursor_pos(px, py).map_err(boxed)?;
+            }
+            CursorAction::Restore((rx, ry)) => {
+                inject::set_cursor_pos(rx, ry).map_err(boxed)?;
+            }
+        }
+        // Commit the bookkeeping only after the OS move succeeded, so a failed park
+        // leaves us in the (truthful) visible state rather than claiming a save we
+        // never parked.
+        *saved = next;
+        Ok(())
+    }
 }
+
+/// The `saved_cursor` mutex was poisoned by a panic in another holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorLockPoisoned;
+
+impl std::fmt::Display for CursorLockPoisoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "saved-cursor lock poisoned")
+    }
+}
+
+impl std::error::Error for CursorLockPoisoned {}
 
 #[cfg(test)]
 #[path = "adapter_tests.rs"]

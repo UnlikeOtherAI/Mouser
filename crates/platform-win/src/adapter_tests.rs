@@ -29,3 +29,35 @@ fn modifier_bits_map_to_hid_usages() {
     );
     assert!(modifier_usages(1 << 12).is_empty());
 }
+
+#[test]
+fn cursor_hide_then_show_round_trips() {
+    // Visible -> hide: save the live position and park.
+    let (saved, action) = next_cursor_state(None, false, Some((100, 200)));
+    assert_eq!(saved, Some((100, 200)));
+    assert_eq!(action, CursorAction::Park);
+
+    // Hidden -> show: restore that exact position and clear the save.
+    let (saved, action) = next_cursor_state(saved, true, None);
+    assert_eq!(saved, None);
+    assert_eq!(action, CursorAction::Restore((100, 200)));
+}
+
+#[test]
+fn cursor_double_hide_keeps_original_saved_position() {
+    // First hide saves (100, 200).
+    let (saved, _) = next_cursor_state(None, false, Some((100, 200)));
+    // A second hide must NOT overwrite the save with the parked corner — the
+    // current live position would by then be the corner, losing the real spot.
+    let (saved, action) = next_cursor_state(saved, false, Some((9999, 9999)));
+    assert_eq!(saved, Some((100, 200)));
+    assert_eq!(action, CursorAction::None);
+}
+
+#[test]
+fn cursor_double_show_is_a_noop() {
+    // Already visible (None): showing again does nothing and stays visible.
+    let (saved, action) = next_cursor_state(None, true, None);
+    assert_eq!(saved, None);
+    assert_eq!(action, CursorAction::None);
+}
