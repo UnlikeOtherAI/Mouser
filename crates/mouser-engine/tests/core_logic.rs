@@ -504,6 +504,33 @@ fn heartbeat_timeout_reclaim_drops_to_passive_edge() {
     assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
 }
 
+// Mirrors the mobile FFI connect seed (crates/mouser-ffi/src/lib.rs): width-1 cross hands
+// off, then a `dx`-carrying nudge moves the peer cursor OFF the entry edge so the first
+// leftward user delta doesn't instantly trip the back-cross reclaim. The nudge MUST carry a
+// relative dx — an absolute-only nudge (dx:0) leaves peer_x at 0 and reclaims immediately.
+#[test]
+fn relative_nudge_off_entry_edge_survives_a_leftward_delta() {
+    const SEED_STEP: i32 = 16;
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(1, 100, 100, 100));
+    e.on_local_input(cursor(0, 50)); // x >= width-1 (==0) → cross to peer
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    assert!(!e.is_owner(), "peer owns after the edge cross");
+
+    // The relative nudge moves peer_x to SEED_STEP — still forwarding, not reclaiming.
+    let nudged = e.on_local_input(cursor_rel(SEED_STEP, 50, SEED_STEP, 0));
+    assert!(!e.is_owner(), "the nudge keeps the peer in control");
+    assert_eq!(motion_of(&nudged).map(|m| m.x), Some(SEED_STEP));
+
+    // A small leftward delta now decrements peer_x but stays off the edge → no reclaim.
+    let left = e.on_local_input(cursor_rel(SEED_STEP - 1, 50, -1, 0));
+    assert!(
+        !e.is_owner(),
+        "a leftward delta after the nudge must NOT instantly reclaim (regression: dx:0 seed)"
+    );
+    assert_eq!(motion_of(&left).map(|m| m.x), Some(SEED_STEP - 1));
+    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
+}
+
 fn motion_of(actions: &[Action]) -> Option<PointerMotion> {
     actions.iter().find_map(|a| match a {
         Action::SendMotion(m) => Some(*m),

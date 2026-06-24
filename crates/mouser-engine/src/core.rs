@@ -245,13 +245,15 @@ impl EngineCore {
         // event. Relative motion keeps flowing even when our local cursor is parked at the
         // screen edge / suppressed — the old absolute-position delta (x - prev_x) froze at
         // the edge (dx == 0), pinning the peer cursor near the entry point.
+        // `saturating_add`: dx/dy originate at untrusted capture/FFI boundaries, so a
+        // pathological delta must clamp rather than overflow-panic (debug) or wrap (release).
         self.peer_x = clamp(
-            self.peer_x + dx,
+            self.peer_x.saturating_add(dx),
             0,
             self.layout.peer_width.saturating_sub(1).max(0),
         );
         self.peer_y = clamp(
-            self.peer_y + dy,
+            self.peer_y.saturating_add(dy),
             0,
             self.layout.peer_height.saturating_sub(1).max(0),
         );
