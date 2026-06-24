@@ -80,7 +80,7 @@ export function LayoutSection(): React.JSX.Element {
       ) : (
         <>
           <LayoutCanvas
-            key={allDevices.map((d) => d.id).join(",")}
+            key={`${edge}:${allDevices.map((d) => d.id).join(",")}`}
             initialDevices={allDevices}
           />
           <div className="flex items-center gap-3">

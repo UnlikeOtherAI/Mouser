@@ -93,7 +93,8 @@ pub(super) async fn serve_direct(
     );
 
     let edge = crate::core::Edge::from_setting(&store.load_settings().cross_edge);
-    let core = EngineCore::new_source(my_id, peer, source_layout(edge));
+    // Direct dial has no mDNS advert for the peer; use source_layout's default peer size.
+    let core = EngineCore::new_source(my_id, peer, source_layout(edge, 0, 0));
     let mut runtime = RuntimeHandle::start(core, Arc::new(conn), injector, capture);
     let clipboard_task = runtime.take_control_lane().map(|lane| {
         tokio::spawn(run_driver(

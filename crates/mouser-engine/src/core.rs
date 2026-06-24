@@ -59,6 +59,11 @@ pub struct EngineCore {
     misses: u32,
     /// Our outgoing heartbeat sequence.
     hb_seq: u64,
+    /// Set once the platform reported it can't suppress local input: stop crossing to the
+    /// peer for the rest of this session (otherwise the cursor would cross-and-reclaim in a
+    /// loop while it rests on the edge). Cleared by a fresh session — the user grants the
+    /// permission and reconnects.
+    suppress_blocked: bool,
 }
 
 impl EngineCore {
@@ -88,6 +93,7 @@ impl EngineCore {
             peer_y: 0,
             misses: 0,
             hb_seq: 0,
+            suppress_blocked: false,
         }
     }
 
@@ -229,9 +235,11 @@ impl EngineCore {
     fn on_cursor(&mut self, x: i32, y: i32, dx: i32, dy: i32, owns: bool) -> Vec<Action> {
         if owns {
             // On our own screen: cross to the peer when we reach the configured edge.
-            // Absolute position senses the edge.
-            if self.crosses_out(x, y) {
-                return self.cross_to_peer(y);
+            // Absolute position senses the edge. Don't cross if we already learned this
+            // session that we can't suppress local input (would cross-and-reclaim in a loop
+            // while the cursor rests on the edge).
+            if !self.suppress_blocked && self.crosses_out(x, y) {
+                return self.cross_to_peer(x, y);
             }
             return vec![Action::Capture(CaptureDecision::PassThrough)];
         }
@@ -250,7 +258,7 @@ impl EngineCore {
             self.layout.peer_height.saturating_sub(1).max(0),
         );
         // Crossing back: the peer cursor hit the near edge moving toward us.
-        if self.crosses_back(dx) {
+        if self.crosses_back(dx, dy) {
             return self.reclaim_local();
         }
         let seq = self.next_seq();
@@ -278,19 +286,17 @@ impl EngineCore {
     }
 
     /// Has the peer cursor returned to the near edge (back toward us)?
-    fn crosses_back(&self, delta_along: i32) -> bool {
+    fn crosses_back(&self, dx: i32, dy: i32) -> bool {
         match self.layout.edge {
-            Edge::Right => self.peer_x <= 0 && delta_along < 0,
-            Edge::Left => {
-                self.peer_x >= self.layout.peer_width.saturating_sub(1) && delta_along > 0
-            }
-            // Vertical edges use the y delta; kept simple for v1 (x delta proxy unused).
-            Edge::Bottom => self.peer_y <= 0,
-            Edge::Top => self.peer_y >= self.layout.peer_height.saturating_sub(1),
+            // Horizontal edges track the x delta; vertical edges the y delta.
+            Edge::Right => self.peer_x <= 0 && dx < 0,
+            Edge::Left => self.peer_x >= self.layout.peer_width.saturating_sub(1) && dx > 0,
+            Edge::Bottom => self.peer_y <= 0 && dy < 0,
+            Edge::Top => self.peer_y >= self.layout.peer_height.saturating_sub(1) && dy > 0,
         }
     }
 
-    fn cross_to_peer(&mut self, y: i32) -> Vec<Action> {
+    fn cross_to_peer(&mut self, x: i32, y: i32) -> Vec<Action> {
         let Some(epoch) = self.ownership.grant_to(self.peer) else {
             return vec![Action::Capture(CaptureDecision::PassThrough)];
         };
@@ -298,17 +304,30 @@ impl EngineCore {
         self.guard = ReplayGuard::default();
         self.input_auth.revoke_epoch();
         self.pending_ack = Some(PendingAck::new(epoch));
-        // Seed the peer cursor at the entry edge.
-        self.peer_x = match self.layout.edge {
-            Edge::Right => 0,
-            Edge::Left => self.layout.peer_width.saturating_sub(1).max(0),
-            _ => clamp(
-                self.peer_x,
-                0,
-                self.layout.peer_width.saturating_sub(1).max(0),
-            ),
-        };
-        self.peer_y = clamp(y, 0, self.layout.peer_height.saturating_sub(1).max(0));
+        // Seed the peer cursor at the entry edge: the crossing axis is pinned to the entry
+        // side, the other axis carries over the local position so the cursor appears where
+        // it left. (Horizontal edges cross on x → carry y; vertical edges cross on y →
+        // carry x.)
+        let max_x = self.layout.peer_width.saturating_sub(1).max(0);
+        let max_y = self.layout.peer_height.saturating_sub(1).max(0);
+        match self.layout.edge {
+            Edge::Right => {
+                self.peer_x = 0;
+                self.peer_y = clamp(y, 0, max_y);
+            }
+            Edge::Left => {
+                self.peer_x = max_x;
+                self.peer_y = clamp(y, 0, max_y);
+            }
+            Edge::Bottom => {
+                self.peer_y = 0;
+                self.peer_x = clamp(x, 0, max_x);
+            }
+            Edge::Top => {
+                self.peer_y = max_y;
+                self.peer_x = clamp(x, 0, max_x);
+            }
+        }
         let transfer = encode(&OwnershipTransfer {
             to: self.peer.to_vec(),
             owner_epoch: epoch,
@@ -357,8 +376,15 @@ impl EngineCore {
     /// input to BOTH machines. Reclaim local control so the cursor stays put on this
     /// machine; the UI surfaces the missing permission so the user can grant it.
     pub fn on_suppress_unavailable(&mut self) -> Vec<Action> {
-        if self.role != Role::Source || self.is_owner() {
-            // Not forwarding to the peer right now — nothing to reclaim.
+        if self.role != Role::Source {
+            return Vec::new();
+        }
+        // Stop crossing for the rest of the session so we don't loop cross→reclaim while the
+        // cursor rests on the edge. A fresh session (after the user grants the permission and
+        // reconnects) starts with this clear.
+        self.suppress_blocked = true;
+        if self.is_owner() {
+            // Already local — nothing to reclaim, just block further crossing.
             return Vec::new();
         }
         self.reclaim_local()

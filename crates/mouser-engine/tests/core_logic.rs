@@ -3,7 +3,7 @@
 
 use mouser_core::platform::{CaptureMode, LocalInputEvent};
 use mouser_engine::core::{Action, CaptureDecision, EngineCore, Inject};
-use mouser_engine::EdgeLayout;
+use mouser_engine::{Edge, EdgeLayout};
 use mouser_protocol::{
     from_cbor, to_cbor, Datagram, KeyEvent, OwnershipAck, OwnershipTransfer, PointerButton,
     PointerMotion, TransferReason, TYPE_KEY_EVENT, TYPE_OWNERSHIP_ACK, TYPE_OWNERSHIP_TRANSFER,
@@ -502,4 +502,44 @@ fn heartbeat_timeout_reclaim_drops_to_passive_edge() {
         "a heartbeat-timeout reclaim tears down forwarding capture"
     );
     assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
+}
+
+fn motion_of(actions: &[Action]) -> Option<PointerMotion> {
+    actions.iter().find_map(|a| match a {
+        Action::SendMotion(m) => Some(*m),
+        _ => None,
+    })
+}
+
+/// A vertical (Bottom) cross: the peer is seeded at its TOP entry edge, a downward delta
+/// traverses it, and moving back up reclaims. Guards the per-edge seeding + back-cross.
+#[test]
+fn bottom_edge_crosses_seeds_top_and_traverses_then_reclaims() {
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::with_edge(100, 100, 100, 100, Edge::Bottom));
+    assert!(e.is_owner());
+    // Inside our screen: pass through.
+    assert!(has_capture(
+        &e.on_local_input(cursor(40, 50)),
+        CaptureDecision::PassThrough
+    ));
+    // Reach the bottom edge (y >= height-1): cross to the peer.
+    let a = e.on_local_input(cursor(40, 99));
+    assert!(
+        has_control(&a, TYPE_OWNERSHIP_TRANSFER).is_some(),
+        "crosses at the bottom edge"
+    );
+    assert!(!e.is_owner());
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    // Move down into the peer (dy > 0): the peer cursor advances down from the top entry.
+    let a = e.on_local_input(cursor_rel(40, 99, 0, 30));
+    let m = motion_of(&a).expect("motion forwarded while owning the peer");
+    assert!(m.y > 0, "peer cursor moved down from the top entry, got y={}", m.y);
+    assert!(has_capture(&a, CaptureDecision::Suppress));
+    // Move back up past the top entry (dy < 0, peer_y returns to 0): reclaim locally.
+    let a = e.on_local_input(cursor_rel(40, 99, 0, -50));
+    assert!(
+        has_set_mode(&a, CaptureMode::PassiveEdge),
+        "crossing back up reclaims to passive edge"
+    );
+    assert!(e.is_owner());
 }
