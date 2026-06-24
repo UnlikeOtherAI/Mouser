@@ -232,11 +232,11 @@ impl EngineCore {
 
     fn on_cursor(&mut self, x: i32, y: i32, dx: i32, dy: i32, owns: bool) -> Vec<Action> {
         if owns {
-            // On our own screen: cross to the peer when we reach the configured edge.
-            // Absolute position senses the edge. Don't cross if we already learned this
-            // session that we can't suppress local input (would cross-and-reclaim in a loop
-            // while the cursor rests on the edge).
-            if !self.suppress_blocked && self.crosses_out(x, y) {
+            // On our own screen: cross to the peer when motion pushes past the configured
+            // edge (predictive — see `crosses_out`; the clamped absolute position alone never
+            // reaches the wall). Don't cross if we already learned this session that we can't
+            // suppress local input (would cross-and-reclaim in a loop while resting on the edge).
+            if !self.suppress_blocked && self.crosses_out(x, y, dx, dy) {
                 return self.cross_to_peer(x, y);
             }
             return vec![Action::Capture(CaptureDecision::PassThrough)];
@@ -275,13 +275,22 @@ impl EngineCore {
         ]
     }
 
-    /// Does `(x, y)` reach the edge the peer sits on?
-    fn crosses_out(&self, x: i32, y: i32) -> bool {
+    /// Does the motion at `(x, y)` with true device delta `(dx, dy)` cross the edge the peer
+    /// sits on? PREDICTIVE: the OS clamps the on-screen cursor ~1px inside the display, so the
+    /// post-clamp absolute position never reliably reaches the exact boundary even while the
+    /// device keeps emitting motion into the wall — testing `x >= width-1` alone then never
+    /// fires ("the cursor won't leave"). Adding the delta so the *predicted* next position
+    /// (`x + dx`) reaching the bound triggers the cross, the way lan-mouse does, fixes that
+    /// while staying compatible with reaching the bound directly. (A cursor resting at the
+    /// clamped edge with `dx == 0` sits just inside the bound and won't cross; the
+    /// grant-once / `suppress_blocked` guards in `on_cursor` handle an exactly-pinned cursor
+    /// as before.)
+    fn crosses_out(&self, x: i32, y: i32, dx: i32, dy: i32) -> bool {
         match self.layout.edge {
-            Edge::Right => x >= self.layout.width.saturating_sub(1),
-            Edge::Left => x <= 0,
-            Edge::Bottom => y >= self.layout.height.saturating_sub(1),
-            Edge::Top => y <= 0,
+            Edge::Right => x.saturating_add(dx) >= self.layout.width.saturating_sub(1),
+            Edge::Left => x.saturating_add(dx) <= 0,
+            Edge::Bottom => y.saturating_add(dy) >= self.layout.height.saturating_sub(1),
+            Edge::Top => y.saturating_add(dy) <= 0,
         }
     }
 
