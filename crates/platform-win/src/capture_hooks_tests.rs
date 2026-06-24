@@ -50,16 +50,6 @@ fn key(usage: u16, down: bool) -> LocalInputEvent {
     }
 }
 
-fn cursor(x: i32, y: i32) -> LocalInputEvent {
-    LocalInputEvent::CursorMoved {
-        display_id: 0,
-        x,
-        y,
-        dx: 0,
-        dy: 0,
-    }
-}
-
 #[test]
 fn captured_keyboard_events_use_hid_usages() {
     let _guard = capture_test_lock();
@@ -207,8 +197,16 @@ fn coalescing_preserves_interleaved_key_transitions() {
         .filter(|e| matches!(e, LocalInputEvent::Key { .. }))
         .collect();
     assert_eq!(keys, vec![key(0x04, true), key(0x04, false)]);
-    assert!(!events.contains(&cursor(2, 2)));
-    assert!(events.contains(&cursor(3, 3)) && events.contains(&cursor(4, 4)));
+    // Match cursor events by position only: `cursor_event_for_virtual_point` now carries
+    // successive-absolute deltas, so the dx/dy of these events are nonzero and the test is
+    // only asserting which positions survive coalescing (the intermediate (2,2) is dropped).
+    let cursor_at = |events: &[LocalInputEvent], x: i32, y: i32| {
+        events.iter().any(|e| {
+            matches!(e, LocalInputEvent::CursorMoved { x: ex, y: ey, .. } if *ex == x && *ey == y)
+        })
+    };
+    assert!(!cursor_at(&events, 2, 2));
+    assert!(cursor_at(&events, 3, 3) && cursor_at(&events, 4, 4));
     clear_capture_state();
 }
 
@@ -294,6 +292,70 @@ fn overflow_eviction_prefers_cursors_then_falls_back_to_front() {
     all_transitions.push_back(QueuedCaptureEvent::Event(key(0x05, true)));
     drop_one_for_overflow(&mut all_transitions);
     assert_eq!(all_transitions.len(), 1);
+}
+
+#[test]
+fn raw_mouse_motion_relative_flags_pass_deltas_through() {
+    use crate::capture_rawinput::{raw_mouse_motion, RawMouseMotion};
+    // No MOUSE_MOVE_ABSOLUTE bit -> a relative device; lLastX/lLastY are true deltas.
+    assert_eq!(
+        raw_mouse_motion(0, 7, -3),
+        RawMouseMotion::Relative { dx: 7, dy: -3 }
+    );
+    // Negative deltas pass through unchanged (sign preserved).
+    assert_eq!(
+        raw_mouse_motion(0, -120, 45),
+        RawMouseMotion::Relative { dx: -120, dy: 45 }
+    );
+}
+
+#[test]
+fn raw_mouse_motion_absolute_flag_is_absolute() {
+    use crate::capture_rawinput::{raw_mouse_motion, RawMouseMotion};
+    // MOUSE_MOVE_ABSOLUTE (0x0001) -> absolute device: no usable per-event delta.
+    assert_eq!(raw_mouse_motion(0x0001, 500, 600), RawMouseMotion::Absolute);
+    // The bit dominates even mixed with other flag bits.
+    assert_eq!(
+        raw_mouse_motion(0x0001 | 0x0010, 1, 1),
+        RawMouseMotion::Absolute
+    );
+}
+
+#[test]
+fn raw_mouse_deltas_coalesce_by_summing() {
+    let _guard = capture_test_lock();
+    clear_capture_state();
+    lock_recover(capture_state()).displays = vec![DisplayBounds {
+        id: 3,
+        left: 0,
+        top: 0,
+        width: 800,
+        height: 600,
+    }];
+
+    // Two trailing raw deltas must SUM into a single queue entry (not replace).
+    enqueue_raw_mouse_delta(4, 5);
+    enqueue_raw_mouse_delta(10, -2);
+    {
+        let pending = lock_recover(&capture_queue().pending);
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending.back(),
+            Some(QueuedCaptureEvent::RawMouseDelta { dx: 14, dy: 3 })
+        ));
+    }
+
+    // And the worker dispatches one CursorMoved carrying the summed delta.
+    let sink = Arc::new(RecordingSink::default());
+    install_test_sink(&sink);
+    drain_capture_queue_for_test();
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events.first(),
+        Some(LocalInputEvent::CursorMoved { dx: 14, dy: 3, .. })
+    ));
+    clear_capture_state();
 }
 
 #[test]
