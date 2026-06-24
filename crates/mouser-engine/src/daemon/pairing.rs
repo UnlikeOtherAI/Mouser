@@ -24,12 +24,15 @@ pub(super) async fn accept_trusted(
             .await
             .map_err(|e| e.to_string())?;
         if !conn.is_channel_verified() {
-            eprintln!("mouserd: rejected peer before §5 channel verification completed");
+            crate::diag!(
+                info,
+                "mouserd: rejected peer before §5 channel verification completed"
+            );
             conn.close();
             continue;
         }
         let Some(peer_id) = conn.peer_device_id() else {
-            eprintln!("mouserd: rejected peer without a valid device_id");
+            crate::diag!(info, "mouserd: rejected peer without a valid device_id");
             conn.close();
             continue;
         };
@@ -44,7 +47,8 @@ pub(super) async fn accept_trusted(
             Some(_) => {}
             None => {
                 let peer_text = format_device_id(&peer_id);
-                eprintln!(
+                crate::diag!(
+                    info,
                     "mouserd: rejected untrusted peer {peer_text}; run \
                      `mouserd trust {peer_text}` to allow control (no UI to approve)"
                 );
@@ -76,7 +80,10 @@ async fn pair_via_ui(
     let peer_b32 = format_device_id(peer_id);
     let sas = conn.sas().map_err(|e| e.to_string())?;
     let name = pairing_name(conn, registry, peer_id).await;
-    eprintln!("mouserd: pairing request from {name} ({peer_b32}) with SAS {sas}");
+    crate::diag!(
+        info,
+        "mouserd: pairing request from {name} ({peer_b32}) with SAS {sas}"
+    );
     bridge.request_pairing(peer_b32.clone(), name, sas);
     let _guard = PairingGuard(bridge);
 
@@ -89,9 +96,9 @@ async fn pair_via_ui(
     };
     if approved {
         store.trust_peer(*peer_id).map_err(|e| e.to_string())?;
-        eprintln!("mouserd: paired with {peer_b32}");
+        crate::diag!(info, "mouserd: paired with {peer_b32}");
     } else {
-        eprintln!("mouserd: pairing with {peer_b32} not approved");
+        crate::diag!(info, "mouserd: pairing with {peer_b32} not approved");
     }
     Ok(approved)
 }

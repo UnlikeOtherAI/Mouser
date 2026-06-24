@@ -29,7 +29,8 @@ fn main() {
         let injector = match platform_linux::UinputInjector::new() {
             Ok(inj) => std::sync::Arc::new(inj),
             Err(e) => {
-                eprintln!(
+                mouser_engine::diag!(
+                    info,
                     "mouserd: cannot open /dev/uinput ({e}); add the user to the \
                      `input` group (or run as root) and relaunch"
                 );
@@ -49,7 +50,8 @@ fn main() {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        eprintln!(
+        mouser_engine::diag!(
+            info,
             "mouserd: this host's platform adapters are not wired into the daemon yet \
              (macOS, Windows and Linux are supported). The engine library is platform-agnostic."
         );

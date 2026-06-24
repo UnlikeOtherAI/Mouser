@@ -47,7 +47,7 @@ pub fn run(
     let store = match DaemonStore::open_default() {
         Ok(store) => store,
         Err(e) => {
-            eprintln!("mouserd: {e}");
+            crate::diag!(info, "mouserd: {e}");
             std::process::exit(1);
         }
     };
@@ -56,7 +56,7 @@ pub fn run(
         Ok(true) => return,
         Ok(false) => {}
         Err(e) => {
-            eprintln!("mouserd: {e}");
+            crate::diag!(info, "mouserd: {e}");
             std::process::exit(1);
         }
     }
@@ -67,7 +67,7 @@ pub fn run(
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("mouserd: failed to start tokio runtime: {e}");
+            crate::diag!(info, "mouserd: failed to start tokio runtime: {e}");
             std::process::exit(1);
         }
     };
@@ -75,7 +75,8 @@ pub fn run(
     // Direct modes take an explicit peer address and bypass mDNS (and IPC).
     if arg1 == "probe" || arg1 == "connect" {
         let Some(addr_str) = args.get(2).cloned() else {
-            eprintln!(
+            crate::diag!(
+                info,
                 "mouserd: `{arg1}` needs <host:port>, e.g. mouserd {arg1} 192.168.1.230:49970"
             );
             std::process::exit(1);
@@ -83,7 +84,7 @@ pub fn run(
         let addr: SocketAddr = match addr_str.parse() {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("mouserd: bad address {addr_str}: {e}");
+                crate::diag!(info, "mouserd: bad address {addr_str}: {e}");
                 std::process::exit(1);
             }
         };
@@ -106,7 +107,7 @@ pub fn run(
                 ))
             };
             if let Err(e) = result {
-                eprintln!("mouserd: {e}");
+                crate::diag!(info, "mouserd: {e}");
                 std::process::exit(1);
             }
         });
@@ -116,7 +117,7 @@ pub fn run(
     let role = role_from_arg(&arg1);
     rt.block_on(async move {
         if let Err(e) = serve::serve(&store, &role, injector, capture, clipboard).await {
-            eprintln!("mouserd: {e}");
+            crate::diag!(info, "mouserd: {e}");
             std::process::exit(1);
         }
     });
@@ -179,7 +180,11 @@ fn role_from_arg(arg: &str) -> String {
     match arg {
         role @ ("auto" | "source" | "target") => role.to_string(),
         other => {
-            eprintln!("mouserd: unknown role '{other}', using {}", default_role());
+            crate::diag!(
+                info,
+                "mouserd: unknown role '{other}', using {}",
+                default_role()
+            );
             default_role().to_string()
         }
     }
@@ -239,7 +244,8 @@ fn windows_firewall_hint(_iport: u16) {
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok())
         .unwrap_or_else(|| "mouserd.exe".to_string());
-    eprintln!(
+    crate::diag!(
+        info,
         "mouserd: Windows Firewall must allow inbound UDP for mDNS/QUIC. \
          If Windows prompts, allow Private networks. If peers do not appear, \
          run elevated PowerShell:\n  netsh advfirewall firewall add rule \

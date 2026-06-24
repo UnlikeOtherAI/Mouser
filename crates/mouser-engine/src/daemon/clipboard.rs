@@ -84,7 +84,7 @@ pub(super) async fn run_driver(
                 session.set_settings(settings.current());
                 let expired = session.engine.tick(tick);
                 if expired > 0 {
-                    eprintln!("mouserd: expired {expired} stalled clipboard pull(s)");
+                    crate::diag!(info, "mouserd: expired {expired} stalled clipboard pull(s)");
                 }
                 if let Ok(token) = clipboard.change_token() {
                     if last_token.is_some_and(|prev| prev == token) {
@@ -128,7 +128,7 @@ async fn recv_bulk_data(rx: &Option<ClipboardBulkRx>) -> Option<InboundClipboard
 
 fn send_frame(lane: &RuntimeControlLane, frame: ControlFrame) {
     if !lane.send(frame.ty, frame.payload) {
-        eprintln!("mouserd: clipboard control lane is closed");
+        crate::diag!(info, "mouserd: clipboard control lane is closed");
     }
 }
 
@@ -141,12 +141,15 @@ fn handle_output(
         ClipboardOutput::Control(frame) => send_frame(lane, frame),
         ClipboardOutput::Bulk(chunks) => {
             let Some(sender) = bulk_sender.clone() else {
-                eprintln!("mouserd: cannot send bulk clipboard data without a bulk endpoint");
+                crate::diag!(
+                    info,
+                    "mouserd: cannot send bulk clipboard data without a bulk endpoint"
+                );
                 return;
             };
             tokio::spawn(async move {
                 if let Err(e) = sender.send_chunks(chunks).await {
-                    eprintln!("mouserd: bulk clipboard send failed: {e}");
+                    crate::diag!(info, "mouserd: bulk clipboard send failed: {e}");
                 }
             });
         }
@@ -164,7 +167,10 @@ impl ControlFrame {
         match to_cbor(value) {
             Ok(payload) => Some(Self { ty, payload }),
             Err(e) => {
-                eprintln!("mouserd: failed to encode clipboard control frame: {e}");
+                crate::diag!(
+                    info,
+                    "mouserd: failed to encode clipboard control frame: {e}"
+                );
                 None
             }
         }
@@ -243,7 +249,7 @@ impl ClipboardSession {
                 .collect(),
             Ok(None) => Vec::new(),
             Err(e) => {
-                eprintln!("mouserd: ignored clipboard offer: {e}");
+                crate::diag!(info, "mouserd: ignored clipboard offer: {e}");
                 Vec::new()
             }
         }
@@ -256,7 +262,7 @@ impl ClipboardSession {
         match self.engine.on_pull(&pull, &self.source) {
             Ok(data) => route_clipboard_data(data, self.bulk_enabled),
             Err(e) => {
-                eprintln!("mouserd: ignored clipboard pull: {e}");
+                crate::diag!(info, "mouserd: ignored clipboard pull: {e}");
                 Vec::new()
             }
         }
@@ -282,12 +288,12 @@ impl ClipboardSession {
             Ok(Some(applied)) => {
                 if let Some(format) = to_platform(applied.format) {
                     if let Err(e) = clipboard.write(format, &applied.bytes) {
-                        eprintln!("mouserd: failed to write clipboard data: {e}");
+                        crate::diag!(info, "mouserd: failed to write clipboard data: {e}");
                     }
                 }
             }
             Ok(None) => {}
-            Err(e) => eprintln!("mouserd: ignored clipboard data: {e}"),
+            Err(e) => crate::diag!(info, "mouserd: ignored clipboard data: {e}"),
         }
     }
 }

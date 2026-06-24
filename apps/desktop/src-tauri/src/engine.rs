@@ -10,8 +10,6 @@
 //! aborts the task AND calls `capture.stop()` so any installed input hooks are released
 //! on quit (the no-stuck-keys path).
 
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -48,7 +46,10 @@ pub fn start(app: &tauri::AppHandle) {
     let store = match mouser_engine::daemon_store::DaemonStore::open_default() {
         Ok(store) => store,
         Err(e) => {
-            eprintln!("mouser-desktop: cannot open engine store: {e}; engine not started");
+            mouser_engine::diag!(
+                error,
+                "mouser-desktop: cannot open engine store: {e}; engine not started"
+            );
             return;
         }
     };
@@ -88,7 +89,8 @@ pub fn start(app: &tauri::AppHandle) {
                 clipboard: Arc::new(platform_linux::LinuxClipboard::new()),
             }),
             Err(e) => {
-                eprintln!(
+                mouser_engine::diag!(
+                    error,
                     "mouser-desktop: cannot open /dev/uinput ({e}); add the user to the \
                      `input` group (or run as root) and relaunch. Engine not started."
                 );
@@ -99,7 +101,8 @@ pub fn start(app: &tauri::AppHandle) {
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let adapters: Option<Adapters> = {
-        eprintln!(
+        mouser_engine::diag!(
+            error,
             "mouser-desktop: this host's platform adapters are not wired into the engine \
              yet (macOS, Windows and Linux are supported). Engine not started."
         );
@@ -136,7 +139,7 @@ pub fn start(app: &tauri::AppHandle) {
         )
         .await
         {
-            eprintln!("mouser-desktop: engine exited: {e}");
+            mouser_engine::diag!(error, "mouser-desktop: engine exited: {e}");
         }
     });
 
@@ -187,28 +190,13 @@ pub fn shutdown(app: &tauri::AppHandle) {
     }
 }
 
-/// Path to the engine log file. The in-process engine logs to the app's stderr now (the
-/// child-stderr -> file path is gone), so this file generally won't exist this phase and
-/// [`read_log_tail`] returns empty. Kept so the Diagnostics command still compiles.
-// TODO(P2): in-memory log ring buffer
-pub fn engine_log_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let dir = app.path().app_log_dir().ok()?;
-    Some(dir.join("mouserd.log"))
+/// Placeholder path kept for the existing Diagnostics command shim; the in-process
+/// engine exposes diagnostics through [`mouser_engine::diagnostics`] instead of a file.
+pub fn engine_log_path(_app: &tauri::AppHandle) -> Option<PathBuf> {
+    Some(PathBuf::from("in-memory-engine-log"))
 }
 
-/// Read the tail (up to `max_bytes`) of the engine log. Returns an empty string when the
-/// log doesn't exist yet — which, with the in-process engine, is the normal case this phase
-/// (the engine logs to the app's stderr, not a file).
-// TODO(P2): in-memory log ring buffer
-pub fn read_log_tail(path: &Path, max_bytes: usize) -> Result<String, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
-        Err(e) => return Err(e.to_string()),
-    };
-    let start = bytes.len().saturating_sub(max_bytes);
-    // `start <= len`, so this slice always exists; `.get` keeps it panic-free for the
-    // workspace's `indexing_slicing` lint.
-    let tail = bytes.get(start..).unwrap_or(&[]);
-    Ok(String::from_utf8_lossy(tail).into_owned())
+/// Read the in-memory engine log tail (up to `max_bytes`).
+pub fn read_log_tail(_path: &Path, max_bytes: usize) -> Result<String, String> {
+    Ok(mouser_engine::diagnostics::tail(max_bytes))
 }

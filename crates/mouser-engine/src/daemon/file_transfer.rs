@@ -48,13 +48,16 @@ pub(crate) async fn run_bulk_acceptor(
                 let peer_id = match conn.peer_device_id() {
                     Some(peer_id) => peer_id,
                     None => {
-                        eprintln!("mouserd: rejected bulk connection without a peer id");
+                        crate::diag!(info, "mouserd: rejected bulk connection without a peer id");
                         conn.close();
                         continue;
                     }
                 };
                 if *active_peer.borrow() != Some(peer_id) {
-                    eprintln!("mouserd: rejected bulk connection from non-active peer");
+                    crate::diag!(
+                        info,
+                        "mouserd: rejected bulk connection from non-active peer"
+                    );
                     conn.close();
                     continue;
                 }
@@ -62,12 +65,12 @@ pub(crate) async fn run_bulk_acceptor(
                 let clipboard_tx = clipboard_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = serve_bulk_connection(conn, peer_id, dir, clipboard_tx).await {
-                        eprintln!("mouserd: bulk file receiver stopped: {e}");
+                        crate::diag!(info, "mouserd: bulk file receiver stopped: {e}");
                     }
                 });
             }
             Err(e) => {
-                eprintln!("mouserd: bulk accept skipped: {e}");
+                crate::diag!(info, "mouserd: bulk accept skipped: {e}");
                 tokio::time::sleep(RECV_RETRY_DELAY).await;
             }
         }
@@ -103,7 +106,7 @@ async fn serve_bulk_connection(
                         other => Err(format!("unknown bulk stream type {other:#06x}")),
                     };
                     if let Err(e) = result {
-                        eprintln!("mouserd: bulk stream failed: {e}");
+                        crate::diag!(info, "mouserd: bulk stream failed: {e}");
                     }
                 });
             }

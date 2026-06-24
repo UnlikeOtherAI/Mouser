@@ -6,7 +6,7 @@ use mouser_core::platform::{Clipboard, InputCapture, InputInjection};
 use mouser_core::DeviceId;
 use mouser_net::{BulkEndpoint, DeviceIdentity, InteractiveConnection};
 
-use crate::daemon_store::DaemonStore;
+use crate::daemon_store::{format_device_id, DaemonStore};
 use crate::discovery::PeerRegistry;
 use crate::{EngineCore, RuntimeHandle};
 
@@ -34,7 +34,7 @@ pub(super) struct SessionAdapters {
 pub(super) enum SessionEnd {
     Shutdown,
     Disconnected,
-    ConnectionLost,
+    ConnectionLost { reason: String },
 }
 
 pub(super) async fn run_session(
@@ -45,6 +45,8 @@ pub(super) async fn run_session(
     context: SessionContext<'_>,
     adapters: SessionAdapters,
 ) -> SessionEnd {
+    let session_id = conn.session_id();
+    let peer_session_id = conn.peer_session_id();
     let core = if can_control {
         EngineCore::new_source(my_id, peer, source_layout())
     } else {
@@ -83,12 +85,16 @@ pub(super) async fn run_session(
     });
 
     if can_control {
-        eprintln!(
+        crate::diag!(
+            info,
             "mouserd: passive edge sensing active - local keyboard/mouse stay native; \
              suppressing capture installs only while controlling the peer"
         );
     } else {
-        eprintln!("mouserd: target ready - injecting input received from the source");
+        crate::diag!(
+            info,
+            "mouserd: target ready - injecting input received from the source"
+        );
     }
 
     let mut file_send_open = context.bridge.is_some();
@@ -96,7 +102,7 @@ pub(super) async fn run_session(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break SessionEnd::Shutdown,
             _ = wait_for_disconnect(context.bridge) => {
-                eprintln!("mouserd: disconnect requested over IPC");
+                crate::diag!(info, "mouserd: disconnect requested over IPC");
                 break SessionEnd::Disconnected;
             }
             request = wait_for_file_send(context.bridge), if file_send_open => {
@@ -105,7 +111,7 @@ pub(super) async fn run_session(
                     continue;
                 };
                 if request.peer_id != peer {
-                    eprintln!("mouserd: ignoring file-send request for an inactive peer");
+                    crate::diag!(info, "mouserd: ignoring file-send request for an inactive peer");
                     continue;
                 }
                 spawn_file_send(
@@ -115,7 +121,16 @@ pub(super) async fn run_session(
                     request,
                 );
             }
-            _ = runtime.wait_dead() => break SessionEnd::ConnectionLost,
+            _ = runtime.wait_dead() => {
+                let transport_reason = runtime
+                    .death_reason()
+                    .unwrap_or_else(|| "connection closed without a transport reason".to_string());
+                let reason = format!(
+                    "peer_id={} session_id={session_id} peer_session_id={peer_session_id}: {transport_reason}",
+                    format_device_id(&peer)
+                );
+                break SessionEnd::ConnectionLost { reason };
+            }
         }
     };
     if let Some(task) = clipboard_task {
@@ -141,7 +156,7 @@ fn spawn_file_send(
         )
         .await
         {
-            eprintln!("mouserd: file send failed: {e}");
+            crate::diag!(info, "mouserd: file send failed: {e}");
         }
     });
 }
