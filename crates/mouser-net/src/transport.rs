@@ -364,13 +364,6 @@ impl InteractiveConnection {
         Some(self.verified_peer_id)
     }
 
-    /// This type is only constructed after the §5 interactive `channel_sig` proof has
-    /// verified against the pinned cert key. Exposed so daemon gates can assert the
-    /// trust boundary before starting runtime traffic.
-    pub fn is_channel_verified(&self) -> bool {
-        true
-    }
-
     /// The local random session id sent in `Hello` (§7.1).
     pub fn session_id(&self) -> u64 {
         self.local_session_id

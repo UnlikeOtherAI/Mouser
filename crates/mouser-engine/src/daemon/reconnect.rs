@@ -110,12 +110,13 @@ pub(super) async fn redial_until_reconnected(
         {
             Ok(conn) => return ReconnectEnd::Reconnected(Box::new(conn)),
             Err(e) => {
-                let reason = format!("reconnect to {peer_text} failed: {e}");
+                // Keep the UI in "connecting" (we auto-retry with backoff); don't flash a
+                // transient per-attempt error that we immediately overwrite. The reason is
+                // captured in the diagnostics log for operators.
                 if let Some(bridge) = bridge {
-                    bridge.set_connect_error(&reason);
                     bridge.set_connecting(&peer_text);
                 }
-                crate::diag!(info, "mouserd: {reason}");
+                crate::diag!(info, "mouserd: reconnect to {peer_text} failed: {e}");
             }
         }
 

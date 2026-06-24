@@ -192,27 +192,3 @@ export interface ClipboardSettings {
 
 /** Clipboard payload kind, grouped to the three per-format gates (§7.7). */
 export type ClipFormat = "text" | "image" | "files";
-
-/** Direction of a single in-flight transfer relative to this device. */
-export type TransferDirection = "incoming" | "outgoing";
-
-/** Lifecycle of an in-flight transfer (engine `pending` → applied / dropped). */
-export type TransferState = "active" | "done" | "failed";
-
-/**
- * One in-flight clipboard transfer, mirroring the engine's progress events
- * (`reassembly::Progress`: `received_bytes` / `size`). Drives the Mac-style
- * "wait" indicator until `last = true` arrives and the hash verifies.
- */
-export interface ClipboardTransfer {
-  id: string;
-  /** Display name of the peer device on the other end. */
-  peer: string;
-  direction: TransferDirection;
-  format: ClipFormat;
-  /** Contiguous bytes reassembled so far (`Progress.received_bytes`). */
-  received: number;
-  /** Total expected size from the offer (`Progress.size`). */
-  total: number;
-  state: TransferState;
-}

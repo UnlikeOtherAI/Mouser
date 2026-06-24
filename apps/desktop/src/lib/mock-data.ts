@@ -1,4 +1,4 @@
-import type { ClipboardSettings, NavItem } from "./types";
+import type { NavItem } from "./types";
 
 // Static UI constants for the desktop shell. Live device/transfer data now comes
 // from the real machine via `useWorkspace` (the `local_device` Tauri command);
@@ -17,17 +17,4 @@ export const NAV_ITEMS: NavItem[] = [
 export const DIAGNOSTICS_NAV_ITEM: NavItem = {
   id: "diagnostics",
   label: "Diagnostics",
-};
-
-// Spec defaults, matching `ClipboardSettings::default()` in
-// crates/mouser-clipboard/src/settings.rs (§7.7): sharing on, all formats on,
-// unlimited size, prefer-native on, bidirectional.
-export const DEFAULT_CLIPBOARD_SETTINGS: ClipboardSettings = {
-  sharedClipboard: true,
-  syncText: true,
-  syncImages: true,
-  syncFiles: true,
-  maxAutoSyncBytes: 0,
-  preferNativeApple: true,
-  direction: "bidirectional",
 };

@@ -26,9 +26,8 @@ const OS_KIND: &str = if cfg!(target_os = "macos") {
     "linux"
 };
 
-/// A UI `Connect` request forwarded to the serve loop: the trusted peer to dial, plus an
-/// optional address the desktop already resolved over its own browse (when present the
-/// engine dials it directly; otherwise the engine resolves the id from its registry).
+/// A UI `Connect` request forwarded to the serve loop: the trusted peer to dial. The
+/// engine resolves the address from its discovery registry.
 pub(super) struct ConnectRequest {
     pub peer_id: DeviceId,
 }

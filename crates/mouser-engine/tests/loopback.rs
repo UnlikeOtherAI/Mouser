@@ -153,8 +153,6 @@ async fn source_drives_target_over_quic() {
         .await
         .expect("source connect");
     let (_server_ep, target_conn) = accept.await.expect("accept task");
-    assert!(source_conn.is_channel_verified());
-    assert!(target_conn.is_channel_verified());
 
     // Recording injector on the target.
     let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Recorded>();
