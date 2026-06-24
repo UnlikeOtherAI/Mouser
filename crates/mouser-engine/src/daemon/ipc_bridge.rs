@@ -221,6 +221,22 @@ impl IpcBridge {
         self.republish();
     }
 
+    /// Update the live input owner + ownership epoch on the active connection and
+    /// republish, so the UI snapshot tracks every cross (the source crossing out, or a
+    /// peer's ownership transfer landing). Ignored unless currently connected, so a
+    /// late update during teardown can't resurrect a closed connection.
+    pub fn set_owner_epoch(&self, owner_id: &str, epoch: u64) {
+        {
+            let mut conn = lock(&self.shared.connection);
+            if conn.state != ConnectionStateDto::Connected {
+                return;
+            }
+            conn.owner = Some(owner_id.to_string());
+            conn.epoch = Some(epoch);
+        }
+        self.republish();
+    }
+
     /// Surface a pending inbound pairing request to connected UIs (Allow/Deny prompt),
     /// naming the device that asked to connect.
     pub fn request_pairing(&self, peer_id: String, name: String, sas: String) {

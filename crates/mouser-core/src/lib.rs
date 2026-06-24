@@ -27,7 +27,8 @@ pub type DeviceId = [u8; 32];
 
 pub use election::{Election, ElectionEvent, Lease};
 pub use identity::{
-    device_id_from_public_key, device_id_from_public_key_bytes, DeviceIdentity, IdentityError,
+    device_id_base32, device_id_from_public_key, device_id_from_public_key_bytes, DeviceIdentity,
+    IdentityError,
 };
 pub use ownership::{Ownership, OwnershipUpdate, RejectReason};
 pub use platform::{

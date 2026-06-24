@@ -40,6 +40,7 @@ use mouser_core::platform::{
     CaptureDecision as CoreDecision, CaptureMode, InputCapture, InputInjection, InputSink,
     LocalInputEvent,
 };
+use mouser_core::DeviceId;
 use mouser_net::{InteractiveConnection, MotionPlane};
 use mouser_protocol::{from_cbor, to_cbor, Datagram, PointerMotion};
 use tokio_util::sync::CancellationToken;
@@ -67,6 +68,12 @@ struct Shared {
     /// `Action::SetCaptureMode` is forwarded here and applied off the capture
     /// threads by the mode task (see module docs).
     mode_tx: tokio::sync::mpsc::UnboundedSender<CaptureMode>,
+    /// `Action::OwnerChanged` is forwarded here so an embedder (the daemon's IPC
+    /// bridge) can reflect the live owner/epoch in its snapshot. Without this the
+    /// snapshot keeps the owner/epoch it had at connect time and never tracks a
+    /// cross — on either side (it's emitted both when we cross out and when we
+    /// receive a peer's ownership transfer).
+    owner_tx: tokio::sync::mpsc::UnboundedSender<(DeviceId, u64)>,
 }
 
 /// Runtime liveness surfaced to embedders and tests.
@@ -111,7 +118,9 @@ impl Shared {
                 Action::SetCaptureMode(mode) => {
                     let _ = self.mode_tx.send(mode);
                 }
-                Action::OwnerChanged { .. } => {}
+                Action::OwnerChanged { owner, epoch } => {
+                    let _ = self.owner_tx.send((owner, epoch));
+                }
             }
         }
         decision
@@ -159,6 +168,9 @@ pub struct RuntimeHandle {
     cancel: CancellationToken,
     death: DeathState,
     control_lane: Option<ControlLane>,
+    /// Live `(owner, epoch)` updates emitted on every ownership change; claimed once
+    /// by the daemon session so it can keep the IPC snapshot's owner/epoch current.
+    owner_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(DeviceId, u64)>>,
 }
 
 fn apply_inject(
@@ -203,6 +215,7 @@ impl RuntimeHandle {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outgoing>();
         let (side_tx, side_rx) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
         let (mode_tx, mut mode_rx) = tokio::sync::mpsc::unbounded_channel::<CaptureMode>();
+        let (owner_tx, owner_rx) = tokio::sync::mpsc::unbounded_channel::<(DeviceId, u64)>();
         let cancel = CancellationToken::new();
         let death = DeathState::new();
         let shared = Arc::new(Shared {
@@ -211,6 +224,7 @@ impl RuntimeHandle {
             injector,
             capture,
             mode_tx,
+            owner_tx,
         });
         let mut tasks = Vec::new();
 
@@ -397,12 +411,22 @@ impl RuntimeHandle {
             cancel,
             death,
             control_lane: Some(control_lane),
+            owner_rx: Some(owner_rx),
         }
     }
 
     /// Take the daemon side control lane, if it has not already been claimed.
     pub fn take_control_lane(&mut self) -> Option<RuntimeControlLane> {
         self.control_lane.take()
+    }
+
+    /// Take the live `(owner, epoch)` update stream, if not already claimed. The daemon
+    /// session forwards these to the IPC bridge so the UI snapshot reflects the real
+    /// owner/epoch through every cross (see `Action::OwnerChanged`).
+    pub fn take_owner_updates(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<(DeviceId, u64)>> {
+        self.owner_rx.take()
     }
 
     /// Feed one captured local event through the core (the `InputSink` seam used by
@@ -459,6 +483,7 @@ impl RuntimeHandle {
             cancel,
             death: _,
             control_lane: _,
+            owner_rx: _,
         } = self;
         cancel.cancel();
         for task in tasks {

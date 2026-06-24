@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use mouser_core::platform::{Clipboard, InputCapture, InputInjection};
-use mouser_core::DeviceId;
+use mouser_core::{device_id_base32, DeviceId};
 use mouser_net::{BulkEndpoint, DeviceIdentity, InteractiveConnection};
 
 use crate::daemon_store::{format_device_id, DaemonStore};
@@ -71,6 +71,10 @@ pub(super) async fn run_session(
     };
     let mut runtime =
         RuntimeHandle::start(core, Arc::new(conn), adapters.injector, adapters.capture);
+    // Forward live ownership changes to the IPC snapshot so the UI reflects every cross
+    // (this side crossing out, or a peer's ownership transfer landing here). Without it
+    // owner/epoch freeze at their connect-time values.
+    let mut owner_updates = runtime.take_owner_updates();
     let peer_os = context
         .registry
         .find(&peer)
@@ -119,6 +123,11 @@ pub(super) async fn run_session(
     let end = loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break SessionEnd::Shutdown,
+            update = recv_owner_update(&mut owner_updates) => {
+                if let (Some((owner, epoch)), Some(bridge)) = (update, context.bridge) {
+                    bridge.set_owner_epoch(&device_id_base32(&owner), epoch);
+                }
+            }
             _ = wait_for_disconnect(context.bridge) => {
                 crate::diag!(info, "mouserd: disconnect requested over IPC");
                 break SessionEnd::Disconnected;
@@ -197,6 +206,22 @@ async fn wait_for_disconnect(bridge: Option<&IpcBridge>) {
         Some(bridge) => bridge.next_disconnect_request().await,
         None => std::future::pending().await,
     }
+}
+
+/// Await the next `(owner, epoch)` ownership update from the runtime. Pends forever if the
+/// stream was never claimed (no IPC bridge); on channel close it clears the receiver so the
+/// select branch goes quiet instead of spinning on a stream of `None`s.
+async fn recv_owner_update(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<(DeviceId, u64)>>,
+) -> Option<(DeviceId, u64)> {
+    let got = match rx.as_mut() {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    };
+    if got.is_none() {
+        *rx = None;
+    }
+    got
 }
 
 async fn wait_for_connect(bridge: Option<&IpcBridge>) -> Option<ConnectRequest> {
