@@ -28,10 +28,13 @@ struct CaptureQueue {
     ready: Condvar,
 }
 
+// `RawMouseDelta` is a true relative device delta from Raw Input (`WM_INPUT`); unlike the
+// absolute `CursorPoint`, it coalesces by summing (see `enqueue_queued_capture_event`).
 #[derive(Clone, Copy)]
 enum QueuedCaptureEvent {
     Event(LocalInputEvent),
     CursorPoint { x: i32, y: i32 },
+    RawMouseDelta { dx: i32, dy: i32 },
 }
 
 const MAX_CAPTURE_QUEUE: usize = 256;
@@ -63,6 +66,7 @@ fn wait_recover<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuar
 pub(crate) fn clear_capture_state() {
     CAPTURE_MODS.store(0, Ordering::Release);
     CAPTURE_EMERGENCY_PASSTHROUGH.store(false, Ordering::Release);
+    crate::capture_rawinput::set_raw_input_active(false);
     clear_capture_queue();
     reset_last_capture_point();
     let mut state = lock_recover(capture_state());
@@ -77,6 +81,7 @@ pub(crate) fn prepare_capture_state(sink: Arc<dyn InputSink>) -> Result<(), Capt
     }
     CAPTURE_MODS.store(0, Ordering::Release);
     CAPTURE_EMERGENCY_PASSTHROUGH.store(false, Ordering::Release);
+    crate::capture_rawinput::set_raw_input_active(false);
     clear_capture_queue();
     reset_last_capture_point();
     state.displays = active_display_bounds().unwrap_or_default();
@@ -176,7 +181,14 @@ pub(crate) unsafe extern "system" fn mouse_hook(
     }
 
     if message == WM_MOUSEMOVE {
-        enqueue_cursor_capture_point(hook.pt.x, hook.pt.y);
+        // When Raw Input drives motion via relative deltas, the hook only suppresses; the
+        // absolute point would clamp at the edge and stall the peer. Enqueue it only when raw
+        // is inactive (registration failed) or an absolute device is in use (no raw delta).
+        if !crate::capture_rawinput::raw_input_active()
+            || crate::capture_rawinput::raw_device_absolute()
+        {
+            enqueue_cursor_capture_point(hook.pt.x, hook.pt.y);
+        }
         return if emergency_passthrough_active() {
             call_next(code, wparam, lparam)
         } else {
@@ -203,6 +215,12 @@ fn observe_emergency_reclaim(event: LocalInputEvent) -> bool {
 
 fn emergency_passthrough_active() -> bool {
     CAPTURE_EMERGENCY_PASSTHROUGH.load(Ordering::Acquire)
+}
+
+/// Enqueue a true relative device delta from Raw Input (sum-coalesced). The raw-input state
+/// flags themselves live in [`crate::capture_rawinput`].
+pub(crate) fn enqueue_raw_mouse_delta(dx: i32, dy: i32) {
+    enqueue_queued_capture_event(QueuedCaptureEvent::RawMouseDelta { dx, dy });
 }
 
 fn call_next(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -259,40 +277,18 @@ fn mouse_event_from_parts(message: u32, mouse_data: u32, flags: u32) -> Option<L
     }
 
     // WM_MOUSEMOVE is deliberately absent: `mouse_hook` handles it earlier (enqueued as a
-    // coalescing CursorPoint and resolved on the worker thread). It must NOT be resolved
-    // here — `cursor_event_for_virtual_point` mutates LAST_CAPTURE_POINT, which is
-    // single-writer on the worker thread, so doing it on the hook thread would corrupt the
-    // delta baseline.
+    // coalescing CursorPoint and resolved on the worker thread). Resolving it here would let
+    // the hook thread mutate the single-writer LAST_CAPTURE_POINT and corrupt the baseline.
+    let btn = |button, down| Some(LocalInputEvent::Button { button, down });
     match message {
-        WM_LBUTTONDOWN => Some(LocalInputEvent::Button {
-            button: 0,
-            down: true,
-        }),
-        WM_LBUTTONUP => Some(LocalInputEvent::Button {
-            button: 0,
-            down: false,
-        }),
-        WM_RBUTTONDOWN => Some(LocalInputEvent::Button {
-            button: 1,
-            down: true,
-        }),
-        WM_RBUTTONUP => Some(LocalInputEvent::Button {
-            button: 1,
-            down: false,
-        }),
-        WM_MBUTTONDOWN => Some(LocalInputEvent::Button {
-            button: 2,
-            down: true,
-        }),
-        WM_MBUTTONUP => Some(LocalInputEvent::Button {
-            button: 2,
-            down: false,
-        }),
+        WM_LBUTTONDOWN => btn(0, true),
+        WM_LBUTTONUP => btn(0, false),
+        WM_RBUTTONDOWN => btn(1, true),
+        WM_RBUTTONUP => btn(1, false),
+        WM_MBUTTONDOWN => btn(2, true),
+        WM_MBUTTONUP => btn(2, false),
         WM_XBUTTONDOWN | WM_XBUTTONUP => {
-            x_button(mouse_data).map(|button| LocalInputEvent::Button {
-                button,
-                down: message == WM_XBUTTONDOWN,
-            })
+            x_button(mouse_data).and_then(|button| btn(button, message == WM_XBUTTONDOWN))
         }
         WM_MOUSEWHEEL => Some(LocalInputEvent::Scroll {
             dx: 0,
@@ -340,16 +336,16 @@ pub(crate) fn virtual_point_to_event(
     }
 }
 
-/// Delta of the last dispatched capture cursor point, used to carry true motion
-/// to the peer. Coalescing keeps only the latest absolute point in the queue, so
-/// computing the delta here at dispatch time yields the full accumulated motion
-/// since the previous dispatch (not just the final coalesced segment).
+/// Last dispatched cursor point; the delta carries motion to the peer. Coalescing keeps
+/// only the latest absolute point, so computing the delta at dispatch time yields the full
+/// accumulated motion since the previous dispatch.
 ///
-/// NOTE: this is a successive-absolute delta. While the OS cursor is pinned at a
-/// screen edge during suppression the absolute point clamps, so the delta decays
-/// to 0 — same limitation macOS had before switching to CGEvent HID deltas. A
-/// true edge-pinned Windows-source fix needs Raw Input (WM_INPUT); tracked as a
-/// follow-up. Still strictly better than the previous hardcoded dx:0,dy:0.
+/// This is a successive-absolute delta: while the OS cursor is pinned at a screen edge
+/// during suppression the absolute point clamps and the delta decays to 0. The edge-pinned
+/// ActiveForward source therefore no longer relies on it — it uses Raw Input (`WM_INPUT`)
+/// relative deltas (see [`crate::capture_rawinput`]), which keep flowing regardless of where
+/// the OS thinks the cursor is. This absolute path remains for PassiveEdge cursor sensing,
+/// the absolute-device fallback (tablets/RDP/touch), and when raw registration fails.
 static LAST_CAPTURE_POINT: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 fn cursor_event_for_virtual_point(x: i32, y: i32) -> LocalInputEvent {
@@ -370,6 +366,19 @@ fn reset_last_capture_point() {
     *lock_recover(&LAST_CAPTURE_POINT) = None;
 }
 
+/// Build a `CursorMoved` from a true relative device delta (`WM_INPUT`): position is the
+/// current OS cursor point (pinned near the entry edge by `ClipCursor` during suppression),
+/// delta is the real device motion. Deliberately does NOT touch [`LAST_CAPTURE_POINT`] —
+/// that baseline belongs to the absolute path and mixing the two would corrupt its delta.
+fn raw_delta_event(dx: i32, dy: i32) -> LocalInputEvent {
+    let displays = lock_recover(capture_state()).displays.clone();
+    let (x, y) = match crate::inject::cursor_position() {
+        Ok(point) => (point.x, point.y),
+        Err(_) => (0, 0),
+    };
+    virtual_point_to_event(&displays, x, y, dx, dy)
+}
+
 fn dispatch_capture_event(event: LocalInputEvent) {
     let sink = lock_recover(capture_state()).sink.clone();
     if let Some(sink) = sink {
@@ -382,6 +391,9 @@ fn process_queued_capture_event(event: QueuedCaptureEvent) {
         QueuedCaptureEvent::Event(event) => dispatch_capture_event(event),
         QueuedCaptureEvent::CursorPoint { x, y } => {
             dispatch_capture_event(cursor_event_for_virtual_point(x, y))
+        }
+        QueuedCaptureEvent::RawMouseDelta { dx, dy } => {
+            dispatch_capture_event(raw_delta_event(dx, dy))
         }
     }
 }
@@ -398,7 +410,20 @@ fn enqueue_queued_capture_event(event: QueuedCaptureEvent) {
     let queue = capture_queue();
     let mut pending = lock_recover(&queue.pending);
 
-    if queued_capture_event_is_cursor(&event) {
+    // Raw deltas are incremental: a trailing one is extended by SUMMING (dropping it would
+    // lose motion). Absolute points carry full position, so a trailing one is replaced.
+    if let QueuedCaptureEvent::RawMouseDelta { dx, dy } = event {
+        if let Some(QueuedCaptureEvent::RawMouseDelta {
+            dx: last_dx,
+            dy: last_dy,
+        }) = pending.back_mut()
+        {
+            *last_dx = last_dx.saturating_add(dx);
+            *last_dy = last_dy.saturating_add(dy);
+            queue.ready.notify_one();
+            return;
+        }
+    } else if queued_capture_event_is_cursor(&event) {
         if let Some(last) = pending.back_mut() {
             if queued_capture_event_is_cursor(last) {
                 *last = event;
@@ -416,19 +441,26 @@ fn enqueue_queued_capture_event(event: QueuedCaptureEvent) {
 }
 
 fn drop_one_for_overflow(pending: &mut VecDeque<QueuedCaptureEvent>) {
-    if let Some(idx) = pending.iter().position(queued_capture_event_is_cursor) {
+    if let Some(idx) = pending.iter().position(queued_capture_event_is_motion) {
         let _ = pending.remove(idx);
     } else {
         let _ = pending.pop_front();
     }
 }
 
+/// Replace-coalesce predicate (absolute cursor points only; raw deltas sum-coalesce).
 fn queued_capture_event_is_cursor(event: &QueuedCaptureEvent) -> bool {
     matches!(
         event,
         QueuedCaptureEvent::CursorPoint { .. }
             | QueuedCaptureEvent::Event(LocalInputEvent::CursorMoved { .. })
     )
+}
+
+/// Overflow-eviction predicate: any motion event is droppable before a button/key transition.
+fn queued_capture_event_is_motion(event: &QueuedCaptureEvent) -> bool {
+    queued_capture_event_is_cursor(event)
+        || matches!(event, QueuedCaptureEvent::RawMouseDelta { .. })
 }
 
 fn clear_capture_queue() {

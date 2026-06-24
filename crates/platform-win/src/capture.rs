@@ -7,11 +7,11 @@ use std::time::Duration;
 use mouser_core::platform::{
     CaptureMode, InputCapture, InputSink, LocalInputEvent, PlatformError, PlatformResult,
 };
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
-    PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_QUIT,
+    ClipCursor, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_QUIT,
 };
 
 use crate::adapter::active_display_bounds;
@@ -19,7 +19,13 @@ use crate::capture_hooks::{
     capture_worker, clear_capture_state, keyboard_hook, mouse_hook, prepare_capture_state,
     stop_capture_worker, virtual_point_to_event,
 };
+use crate::capture_rawinput::{self, set_raw_input_active};
 use crate::inject;
+
+/// Inset (px) from the active display edge for the `ClipCursor` pin. Keeping the cursor a
+/// couple of pixels off the wall lets the physical device keep producing relative deltas
+/// (a device pressed against the edge reports `lLastX/lLastY == 0`).
+const CLIP_INSET: i32 = 2;
 
 const PASSIVE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const LEFT_CTRL_BIT: u16 = 1 << 0;
@@ -264,13 +270,68 @@ fn run_capture_thread(tx: std::sync::mpsc::Sender<Result<u32, String>>) {
         }
     };
 
+    // Switch the motion source to Raw Input (WM_INPUT) relative deltas so motion keeps
+    // flowing while the OS cursor is pinned at the screen edge by hook suppression. On any
+    // failure we leave raw inactive and the hook's absolute-delta path handles motion (no
+    // regression). `raw_sink` is kept for teardown.
+    let raw_sink = setup_raw_input();
+
     let _ = tx.send(Ok(thread_id));
     message_loop();
 
+    teardown_raw_input(raw_sink);
     let _ = unsafe { UnhookWindowsHookEx(mouse_hook) };
     let _ = unsafe { UnhookWindowsHookEx(keyboard_hook) };
     stop_capture_worker(worker_stop, worker);
     clear_capture_state();
+}
+
+/// Register a Raw Input mouse sink and pin the cursor just inside the active display edge.
+/// Returns the sink window on success (raw active); `None` leaves the absolute fallback.
+fn setup_raw_input() -> Option<HWND> {
+    let Some(hwnd) = capture_rawinput::create_sink_window() else {
+        eprintln!("mouser: raw-input sink window creation failed; using absolute-delta fallback");
+        return None;
+    };
+    if !capture_rawinput::register_raw_mouse(hwnd) {
+        eprintln!("mouser: raw-input mouse registration failed; using absolute-delta fallback");
+        capture_rawinput::destroy_sink_window(hwnd);
+        return None;
+    }
+    set_raw_input_active(true);
+    pin_cursor_to_active_display();
+    Some(hwnd)
+}
+
+/// Release the cursor clip and tear down the Raw Input registration / sink window.
+fn teardown_raw_input(raw_sink: Option<HWND>) {
+    let Some(hwnd) = raw_sink else {
+        return;
+    };
+    // Release the cursor (ClipCursor(None) restores free movement).
+    let _ = unsafe { ClipCursor(None) };
+    capture_rawinput::unregister_raw_mouse();
+    capture_rawinput::destroy_sink_window(hwnd);
+    set_raw_input_active(false);
+}
+
+/// Confine the cursor to a rect inset a couple pixels from the active display edge, so the
+/// physical device keeps producing relative deltas instead of sitting against the wall.
+fn pin_cursor_to_active_display() {
+    let Some(bounds) = active_display_bounds()
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+    else {
+        return;
+    };
+    let rect = RECT {
+        left: bounds.left + CLIP_INSET,
+        top: bounds.top + CLIP_INSET,
+        right: bounds.left + bounds.width - CLIP_INSET,
+        bottom: bounds.top + bounds.height - CLIP_INSET,
+    };
+    let _ = unsafe { ClipCursor(Some(&rect)) };
 }
 
 fn create_message_queue() {
@@ -285,6 +346,8 @@ fn message_loop() {
         if result.0 <= 0 {
             break;
         }
+        // Dispatch so WM_INPUT reaches the Raw Input sink window's wndproc on this thread.
+        let _ = unsafe { DispatchMessageW(&msg) };
     }
 }
 
