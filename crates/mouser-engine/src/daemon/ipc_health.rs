@@ -59,7 +59,10 @@ pub(super) fn build_diagnostics(
 fn connection_error_diagnostic(error: Option<&str>) -> Option<HealthItemDto> {
     let error = error?;
     let lower = error.to_ascii_lowercase();
-    if lower.contains("not trusted") || lower.contains("untrusted peer") {
+    if lower.contains("not trusted")
+        || lower.contains("no longer trusted")
+        || lower.contains("untrusted peer")
+    {
         return Some(health_item(
             "peer_untrusted",
             "Peer is not paired",
