@@ -360,13 +360,23 @@ impl RuntimeHandle {
                                 Ok(()) if mode == CaptureMode::ActiveForward
                                     && !shared.capture.can_suppress() =>
                                 {
-                                    crate::diag!(info,
-                                        "mouserd: capture downgrade: ActiveForward cannot suppress local input; local and remote may both receive events"
+                                    // Fail closed: we can't drop local input, so don't keep
+                                    // forwarding (that would drive BOTH machines). Reclaim
+                                    // local control; the UI prompts to grant Accessibility +
+                                    // Input Monitoring.
+                                    crate::diag!(warn,
+                                        "mouserd: cannot suppress local input (grant Accessibility + Input Monitoring) — reclaiming local control instead of driving both machines"
                                     );
+                                    let actions = lock(&shared.core).on_suppress_unavailable();
+                                    shared.dispatch(actions);
                                 }
                                 Ok(()) => {}
                                 Err(e) => {
-                                    crate::diag!(info, "mouserd: capture set_mode({mode:?}) failed: {e}");
+                                    crate::diag!(warn, "mouserd: capture set_mode({mode:?}) failed: {e}");
+                                    if mode == CaptureMode::ActiveForward {
+                                        let actions = lock(&shared.core).on_suppress_unavailable();
+                                        shared.dispatch(actions);
+                                    }
                                 }
                             }
                         }

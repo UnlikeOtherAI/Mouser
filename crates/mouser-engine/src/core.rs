@@ -55,8 +55,6 @@ pub struct EngineCore {
     /// Virtual peer cursor while we own the peer (absolute, peer display space).
     peer_x: i32,
     peer_y: i32,
-    /// Last local cursor position seen, for delta computation while forwarding.
-    last_local: Option<(i32, i32)>,
     /// Ticks since the last heartbeat from the peer.
     misses: u32,
     /// Our outgoing heartbeat sequence.
@@ -88,7 +86,6 @@ impl EngineCore {
             pending_ack: None,
             peer_x: 0,
             peer_y: 0,
-            last_local: None,
             misses: 0,
             hb_seq: 0,
         }
@@ -177,7 +174,9 @@ impl EngineCore {
         }
         let owns = self.is_owner();
         match event {
-            LocalInputEvent::CursorMoved { x, y, .. } => self.on_cursor(x, y, owns),
+            LocalInputEvent::CursorMoved { x, y, dx, dy, .. } => {
+                self.on_cursor(x, y, dx, dy, owns)
+            }
             other if owns => {
                 // Cursor is on our screen — let our own input drive our desktop.
                 let _ = other;
@@ -227,20 +226,19 @@ impl EngineCore {
         }
     }
 
-    fn on_cursor(&mut self, x: i32, y: i32, owns: bool) -> Vec<Action> {
-        let prev = self.last_local.replace((x, y));
+    fn on_cursor(&mut self, x: i32, y: i32, dx: i32, dy: i32, owns: bool) -> Vec<Action> {
         if owns {
             // On our own screen: cross to the peer when we reach the configured edge.
+            // Absolute position senses the edge.
             if self.crosses_out(x, y) {
                 return self.cross_to_peer(y);
             }
             return vec![Action::Capture(CaptureDecision::PassThrough)];
         }
-        // We own the peer: translate motion into the peer's space and forward it.
-        let (dx, dy) = match prev {
-            Some((px, py)) => (x - px, y - py),
-            None => (0, 0),
-        };
+        // We own the peer: drive it with the TRUE relative device delta (dx, dy) for this
+        // event. Relative motion keeps flowing even when our local cursor is parked at the
+        // screen edge / suppressed — the old absolute-position delta (x - prev_x) froze at
+        // the edge (dx == 0), pinning the peer cursor near the entry point.
         self.peer_x = clamp(
             self.peer_x + dx,
             0,
@@ -351,6 +349,19 @@ impl EngineCore {
             Action::OwnerChanged { owner: me, epoch },
             Action::Capture(CaptureDecision::PassThrough),
         ]
+    }
+
+    /// The platform reported it cannot suppress local input (e.g. macOS Accessibility /
+    /// Input Monitoring not granted, so the event tap is listen-only). We must NOT keep
+    /// driving the peer while local input also reaches our own desktop — that delivers
+    /// input to BOTH machines. Reclaim local control so the cursor stays put on this
+    /// machine; the UI surfaces the missing permission so the user can grant it.
+    pub fn on_suppress_unavailable(&mut self) -> Vec<Action> {
+        if self.role != Role::Source || self.is_owner() {
+            // Not forwarding to the peer right now — nothing to reclaim.
+            return Vec::new();
+        }
+        self.reclaim_local()
     }
 
     /// Advance time one heartbeat interval (~1 s). Emits our heartbeat and, on the

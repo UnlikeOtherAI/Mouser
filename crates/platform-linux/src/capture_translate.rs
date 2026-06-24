@@ -259,7 +259,9 @@ mod tests {
             Some(LocalInputEvent::CursorMoved {
                 display_id: 7,
                 x: 70,
-                y: 50
+                y: 50,
+                dx: 0,
+                dy: 0,
             })
         );
         assert_eq!(
@@ -267,7 +269,9 @@ mod tests {
             Some(LocalInputEvent::CursorMoved {
                 display_id: 7,
                 x: 70,
-                y: 60
+                y: 60,
+                dx: 0,
+                dy: 0,
             })
         );
     }

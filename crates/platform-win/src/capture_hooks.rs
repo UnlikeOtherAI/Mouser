@@ -326,12 +326,16 @@ pub(crate) fn virtual_point_to_event(
                 display_id: bounds.id,
                 x: lx,
                 y: ly,
+                dx: 0,
+                dy: 0,
             }
         }
         None => LocalInputEvent::CursorMoved {
             display_id: 0,
             x,
             y,
+            dx: 0,
+            dy: 0,
         },
     }
 }

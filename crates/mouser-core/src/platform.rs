@@ -30,7 +30,10 @@ pub type PlatformResult<T> = Result<T, PlatformError>;
 /// 3=back,4=forward).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalInputEvent {
-    /// Absolute cursor position in logical pixels on a display.
+    /// Cursor motion. Carries both the **absolute** position (used by a source to sense
+    /// the screen edge) and the **relative** device delta for this event (used to drive a
+    /// controlled peer: relative deltas keep flowing even when the local cursor is parked
+    /// at the edge / suppressed, so the peer cursor can traverse its whole screen).
     CursorMoved {
         /// Target display (Appendix A `display_id`).
         display_id: u32,
@@ -38,6 +41,11 @@ pub enum LocalInputEvent {
         x: i32,
         /// Y in logical pixels, display origin top-left, y-down.
         y: i32,
+        /// Relative X delta for this event (device motion), logical pixels. `0` if the
+        /// platform can't report it.
+        dx: i32,
+        /// Relative Y delta for this event (device motion), logical pixels, y-down.
+        dy: i32,
     },
     /// A pointer button transition.
     Button {

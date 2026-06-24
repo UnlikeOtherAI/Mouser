@@ -55,6 +55,8 @@ fn cursor(x: i32, y: i32) -> LocalInputEvent {
         display_id: 0,
         x,
         y,
+        dx: 0,
+        dy: 0,
     }
 }
 
@@ -176,6 +178,8 @@ fn captured_cursor_resolves_virtual_point_to_display_local_coords() {
             display_id: 7,
             x: 90,
             y: 30,
+            dx: 0,
+            dy: 0,
         }
     );
     clear_capture_state();
@@ -315,6 +319,8 @@ fn raw_mouse_hook_points_are_converted_by_worker() {
             display_id: 3,
             x: 25,
             y: 50,
+            dx: 0,
+            dy: 0,
         }]
     );
     clear_capture_state();
