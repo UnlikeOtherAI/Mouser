@@ -6,6 +6,8 @@
 //! - [`LinuxCapture`] implements `mouser_core::InputCapture` (audit H3) over the
 //!   raw evdev devices (`/dev/input/event*`), grabbing them (`EVIOCGRAB`) when the
 //!   engine asks to suppress local input — the *source* side.
+//! - [`display`] resolves X11 RandR outputs and the real XQueryPointer cursor so
+//!   Linux motion uses the same display-local coordinate model as macOS/Windows.
 //! - [`keymap`] is the Linux HID↔evdev table (audit H11); its host-independent
 //!   surface (`supported_hid_usages`, `hid_usage_to_evdev_code`,
 //!   `evdev_code_to_hid_usage`) lets the cross-platform keymap round-trip parity
@@ -33,12 +35,16 @@ pub mod capture;
 #[cfg(target_os = "linux")]
 mod capture_translate;
 #[cfg(target_os = "linux")]
+pub mod display;
+#[cfg(target_os = "linux")]
 pub mod uinput;
 
 #[cfg(target_os = "linux")]
 pub use adapter::UinputInjector;
 #[cfg(target_os = "linux")]
 pub use capture::LinuxCapture;
+#[cfg(target_os = "linux")]
+pub use display::{active_display_bounds, display_bounds, DisplayBounds};
 #[cfg(target_os = "linux")]
 pub use input_linux::Key;
 #[cfg(target_os = "linux")]

@@ -24,14 +24,13 @@
 //!
 //! Linux-only: it needs `/dev/input/event*` and `input_linux::EvdevHandle`.
 //!
-//! ## Coordinate model (documented limitation)
-//! evdev pointers report **relative** motion (`REL_X`/`REL_Y`); there is no
-//! per-display layout at this layer (cf. the injector's single global pointer
-//! space). The adapter integrates the deltas into a virtual absolute position
-//! clamped to a desktop bound and emits [`LocalInputEvent::CursorMoved`] on
-//! `display_id: 0`. True per-display routing needs the compositor layout
-//! (Wayland/X11) and is out of scope for this adapter (mirrors mac M1 / the
-//! injector).
+//! ## Coordinate model
+//! evdev pointers report **relative** motion (`REL_X`/`REL_Y`), while Mouser's
+//! wire model uses display-local absolute positions. On X11 this adapter resolves
+//! the real cursor with XQueryPointer and maps it through RandR output bounds.
+//! While actively suppressing with `EVIOCGRAB`, Xorg may stop receiving the grabbed
+//! device, so motion integrates from the last real X11 point until pass-through
+//! resumes. Wayland absolute cursor parity needs a compositor-specific backend.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -47,7 +46,7 @@ use mouser_core::platform::{
     PlatformResult,
 };
 
-use crate::capture_translate::{to_local_event, VirtualCursor};
+use crate::capture_translate::{to_local_event, CursorMapper};
 
 /// Directory the kernel exposes evdev device nodes under.
 const INPUT_DIR: &str = "/dev/input";
@@ -63,10 +62,6 @@ fn o_nonblock() -> i32 {
 /// events return immediately).
 const IDLE_POLL: Duration = Duration::from_millis(4);
 
-/// Default virtual-desktop bound the integrated relative motion is clamped into,
-/// in logical pixels, when no explicit bound is supplied.
-const DEFAULT_DESKTOP_W: i32 = 1920;
-const DEFAULT_DESKTOP_H: i32 = 1080;
 const LEFT_CTRL_BIT: u16 = 1 << 0;
 const RIGHT_CTRL_BIT: u16 = 1 << 4;
 const EMERGENCY_RECLAIM_CTRL_MASK: u16 = LEFT_CTRL_BIT | RIGHT_CTRL_BIT;
@@ -117,8 +112,6 @@ struct CaptureRun {
 /// Linux input capture over the raw evdev devices (audit H3).
 pub struct LinuxCapture {
     inner: Arc<Mutex<CaptureRun>>,
-    desktop_w: i32,
-    desktop_h: i32,
 }
 
 impl Default for LinuxCapture {
@@ -134,16 +127,9 @@ impl Drop for LinuxCapture {
 }
 
 impl LinuxCapture {
-    /// A not-yet-started capture handle with the default desktop bound.
+    /// A not-yet-started capture handle.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_desktop_bounds(DEFAULT_DESKTOP_W, DEFAULT_DESKTOP_H)
-    }
-
-    /// A not-yet-started capture handle integrating relative motion against a
-    /// `desktop_w × desktop_h` logical-pixel bound (clamps the virtual cursor).
-    #[must_use]
-    pub fn with_desktop_bounds(desktop_w: i32, desktop_h: i32) -> Self {
         Self {
             inner: Arc::new(Mutex::new(CaptureRun {
                 running: Arc::new(AtomicBool::new(false)),
@@ -151,8 +137,6 @@ impl LinuxCapture {
                 can_suppress: false,
                 mode: CaptureMode::Off,
             })),
-            desktop_w: desktop_w.max(1),
-            desktop_h: desktop_h.max(1),
         }
     }
 }
@@ -337,7 +321,7 @@ fn apply_decision(devices: &mut [CaptureDevice], decision: CaptureDecision) {
 fn drain_device(
     dev: &EvdevHandle<File>,
     sink: &dyn InputSink,
-    cursor: &VirtualCursor,
+    cursor: &CursorMapper,
     reclaim: &mut EmergencyReclaim,
 ) -> (CaptureDecision, bool) {
     let mut decision = CaptureDecision::PassThrough;
@@ -348,10 +332,9 @@ fn drain_device(
     while let Ok(ev) = dev.read_input_event() {
         read_any = true;
         if let Some(local) = to_local_event(ev.kind, ev.code, ev.value, cursor) {
-            if matches!(
-                decision_for(sink, local, reclaim),
-                CaptureDecision::Suppress
-            ) {
+            let event_decision = decision_for(sink, local, reclaim);
+            cursor.set_integrating(matches!(event_decision, CaptureDecision::Suppress));
+            if matches!(event_decision, CaptureDecision::Suppress) {
                 decision = CaptureDecision::Suppress;
             }
         }
@@ -380,7 +363,7 @@ impl LinuxCapture {
         let running = Arc::new(AtomicBool::new(true));
         guard.running = Arc::clone(&running);
 
-        let cursor = VirtualCursor::new(self.desktop_w, self.desktop_h);
+        let cursor = CursorMapper::new();
 
         let handle = std::thread::Builder::new()
             .name("mouser-linux-capture".into())
