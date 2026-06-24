@@ -46,9 +46,13 @@ pub mod dragdrop;
 pub mod inject;
 pub mod keymap;
 pub mod keymap_capture;
+pub mod permission;
 pub mod tray;
 
 pub use adapter::{MacCapture, MacInjector};
+pub use permission::{
+    accessibility_trusted, input_monitoring_trusted, prompt_accessibility, prompt_input_monitoring,
+};
 pub use capture::{install_listen_only_tap, CaptureError};
 pub use clipboard::{ClipboardWriteFailed, MacClipboard};
 pub use display_info::{
