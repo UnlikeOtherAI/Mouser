@@ -1,6 +1,7 @@
 //! Windows named-pipe security for the daemon IPC endpoint.
-
-#![allow(unsafe_code)]
+//!
+//! `unsafe` here is allowed via the `#[allow(unsafe_code)]` on the `mod` declaration in
+//! `lib.rs` (the crate otherwise denies it).
 
 use std::ffi::{c_void, OsStr};
 use std::io;
@@ -144,7 +145,7 @@ struct LocalAcl {
 
 impl LocalAcl {
     fn for_user(user: &UserSid) -> io::Result<Self> {
-        let mut access = EXPLICIT_ACCESS_W {
+        let access = EXPLICIT_ACCESS_W {
             grfAccessPermissions: PIPE_CLIENT_ACCESS,
             grfAccessMode: GRANT_ACCESS,
             grfInheritance: NO_INHERITANCE,
@@ -157,7 +158,7 @@ impl LocalAcl {
             },
         };
         let mut acl = null_mut();
-        let status = unsafe { SetEntriesInAclW(1, &mut access, null_mut(), &mut acl) };
+        let status = unsafe { SetEntriesInAclW(1, &access, null_mut(), &mut acl) };
         if status != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
