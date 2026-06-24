@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { ClipboardProgress } from "./components/clipboard-progress";
 import { SideNav } from "./components/side-nav";
 import { DIAGNOSTICS_NAV_ITEM, NAV_ITEMS } from "./lib/mock-data";
 import {
@@ -12,7 +11,7 @@ import {
 } from "./lib/section-preference";
 import { useApplySettings } from "./lib/use-apply-settings";
 import { useWorkspace } from "./lib/workspace-context";
-import type { ClipboardTransfer, SectionId } from "./lib/types";
+import type { SectionId } from "./lib/types";
 import { GeneralSection } from "./sections/general-section";
 import { DevicesSection } from "./sections/devices-section";
 import { LayoutSection } from "./sections/layout-section";
@@ -20,9 +19,6 @@ import { InputSection } from "./sections/input-section";
 import { ClipboardSection } from "./sections/clipboard-section";
 import { SecuritySection } from "./sections/security-section";
 import { DiagnosticsSection } from "./sections/diagnostics-section";
-
-// No in-flight transfers without the engine; live progress arrives over IPC.
-const CLIPBOARD_TRANSFERS: ClipboardTransfer[] = [];
 
 const SECTION_TITLES: Record<SectionId, string> = {
   general: "General",
@@ -125,7 +121,6 @@ export function App(): React.JSX.Element {
           })}
         </div>
       </main>
-      <ClipboardProgress transfers={CLIPBOARD_TRANSFERS} />
     </div>
   );
 }

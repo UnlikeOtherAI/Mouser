@@ -44,10 +44,19 @@ impl DeathState {
     }
 
     pub(super) async fn wait(&self) {
+        // Register the waiter (via `enable`) BEFORE checking `dead`, then await. `mark`
+        // sets `dead` then calls `notify_waiters()`, which stores no permit — so a `mark`
+        // racing between the check and registration would otherwise be lost, leaving the
+        // session stuck "connected" to a dead peer with no reconnect. `enable` closes that
+        // gap: a `notify_waiters` after `enable` is delivered to this future regardless of
+        // its ordering with the `is_dead` check.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.is_dead() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 

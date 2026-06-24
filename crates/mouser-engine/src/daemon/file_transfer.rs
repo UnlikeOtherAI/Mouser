@@ -14,7 +14,7 @@ use mouser_protocol::{
     TYPE_CLIPBOARD_DATA, TYPE_FILE_ACCEPT, TYPE_FILE_ACK, TYPE_FILE_CHUNK, TYPE_FILE_DONE,
     TYPE_FILE_OFFER, TYPE_FILE_REJECT,
 };
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 
 use crate::daemon_store::DaemonStore;
 use crate::discovery::{self, PeerRegistry};
@@ -22,6 +22,11 @@ use crate::discovery::{self, PeerRegistry};
 use super::clipboard_bulk::{self, ClipboardBulkTx};
 
 const RECV_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Max concurrent inbound transfer streams per bulk connection. Each accepted stream
+/// spawns a task that can open quarantine files and buffer reassembly, so an unbounded
+/// stream count from a (paired) peer would exhaust tasks/handles/memory. Cap it; the
+/// accept loop applies backpressure once the cap is reached.
+const MAX_CONCURRENT_BULK_TRANSFERS: usize = 16;
 const SEND_RECV_TIMEOUT: Duration = Duration::from_secs(30);
 const HASH_BUF: usize = 64 * 1024;
 
@@ -133,13 +138,20 @@ async fn serve_bulk_connection(
 ) -> Result<(), String> {
     std::fs::create_dir_all(&quarantine)
         .map_err(|e| format!("create quarantine {}: {e}", quarantine.display()))?;
+    let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_BULK_TRANSFERS));
     loop {
         match conn.accept_transfer().await {
             Ok(mut stream) => {
+                // Backpressure: block accepting the next stream once the cap is reached,
+                // bounding concurrent receiver tasks (and their files/memory) per peer.
+                let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
+                    return Err("bulk transfer limiter closed".to_string());
+                };
                 let (ty, payload) = stream.recv_msg().await.map_err(|e| e.to_string())?;
                 let dir = quarantine.clone();
                 let clipboard_tx = clipboard_tx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit; // held for the lifetime of this transfer
                     let result = match ty {
                         TYPE_FILE_OFFER => run_receiver_stream(stream, dir, payload).await,
                         TYPE_CLIPBOARD_DATA => {

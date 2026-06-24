@@ -194,7 +194,22 @@ fn authorized(token: &Option<String>, headers: &HeaderMap) -> bool {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|got| got == expected)
+        .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()))
+}
+
+/// Constant-time byte comparison so the bearer-token check can't be brute-forced one byte
+/// at a time via response timing (the token guards the full engine control surface). The
+/// length is allowed to leak (token length is not secret); only the content compare is
+/// timing-flat.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Resolve the bearer token for an HTTP bind: explicit `MOUSER_MCP_TOKEN` wins;

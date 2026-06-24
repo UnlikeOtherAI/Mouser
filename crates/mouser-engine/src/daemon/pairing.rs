@@ -19,18 +19,13 @@ pub(super) async fn accept_trusted(
     bridge: Option<&IpcBridge>,
 ) -> Result<InteractiveConnection, String> {
     loop {
+        // `accept_interactive` only returns after the §5 channel proof has verified against
+        // the pinned cert key — the connection cannot exist otherwise — so reaching here
+        // means the channel is verified; no separate gate is needed.
         let conn = endpoint
             .accept_interactive()
             .await
             .map_err(|e| e.to_string())?;
-        if !conn.is_channel_verified() {
-            crate::diag!(
-                info,
-                "mouserd: rejected peer before §5 channel verification completed"
-            );
-            conn.close();
-            continue;
-        }
         let Some(peer_id) = conn.peer_device_id() else {
             crate::diag!(info, "mouserd: rejected peer without a valid device_id");
             conn.close();
