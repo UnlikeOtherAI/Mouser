@@ -99,10 +99,14 @@ export type EdgeBehavior = "instant" | "delayed" | "locked";
  * snapshot and writes them with `updateSettings`, so buttons and the MCP server
  * drive the same state.
  */
+/** Which edge of this screen the controlled peer sits on (the edge the cursor crosses). */
+export type CrossEdge = "left" | "right" | "top" | "bottom";
+
 export interface EngineSettings {
   // Pointer crossing (Input)
   cross_at_edges: boolean;
   edge_behavior: EdgeBehavior;
+  cross_edge: CrossEdge;
   wrap_around: boolean;
   share_scroll: boolean;
   // Clipboard (§7.7)
@@ -128,6 +132,7 @@ export interface EngineSettings {
 export const DEFAULT_ENGINE_SETTINGS: EngineSettings = {
   cross_at_edges: true,
   edge_behavior: "instant",
+  cross_edge: "right",
   wrap_around: false,
   share_scroll: true,
   shared_clipboard: true,

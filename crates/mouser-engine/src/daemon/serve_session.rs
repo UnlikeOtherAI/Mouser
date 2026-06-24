@@ -54,7 +54,10 @@ pub(super) async fn run_session(
     let session_id = conn.session_id();
     let peer_session_id = conn.peer_session_id();
     let core = if can_control {
-        EngineCore::new_source(my_id, peer, source_layout())
+        // The cross edge (which side the peer sits on) is a user setting, applied per
+        // session.
+        let edge = crate::core::Edge::from_setting(&context.store.load_settings().cross_edge);
+        EngineCore::new_source(my_id, peer, source_layout(edge))
     } else {
         EngineCore::new_target(my_id, peer)
     };
