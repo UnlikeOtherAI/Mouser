@@ -1,6 +1,7 @@
 use mouser_core::platform::{CaptureMode, ScrollUnit as CoreScrollUnit};
 use mouser_core::DeviceId;
 use mouser_protocol::PointerMotion;
+use std::collections::BTreeSet;
 
 /// Heartbeat ticks to wait for a positive ownership ACK before reclaiming.
 pub(super) const OWNERSHIP_ACK_TICKS: u8 = 2;
@@ -124,6 +125,8 @@ pub enum Action {
     SetCaptureMode(CaptureMode),
     /// Ownership/owner changed — for the tray/UI and logging.
     OwnerChanged { owner: DeviceId, epoch: u64 },
+    /// Show the local cursor iff this machine owns input.
+    SetCursorVisible(bool),
 }
 
 /// Per-direction anti-replay state for the current epoch (spec §7.5/§7.6).
@@ -132,6 +135,39 @@ pub(super) struct ReplayGuard {
     epoch: u64,
     last_ctr: Option<u64>,
     last_seq: Option<u32>,
+}
+
+/// Whether a received key event changes the target's held-key state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyTransition {
+    Press,
+    Release,
+    Repeat,
+}
+
+/// Held HID usages for peer-originated key events in the current input epoch.
+#[derive(Clone, Debug, Default)]
+pub(super) struct HeldKeys {
+    keys: BTreeSet<u16>,
+}
+
+impl HeldKeys {
+    pub(super) fn observe(&mut self, usage: u16, down: bool) -> KeyTransition {
+        if down {
+            if self.keys.insert(usage) {
+                KeyTransition::Press
+            } else {
+                KeyTransition::Repeat
+            }
+        } else {
+            self.keys.remove(&usage);
+            KeyTransition::Release
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.keys.clear();
+    }
 }
 
 impl ReplayGuard {

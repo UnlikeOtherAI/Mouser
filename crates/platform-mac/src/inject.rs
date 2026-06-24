@@ -20,7 +20,9 @@
 //! exercised; the warp guarantees observable motion even when injection is
 //! blocked.
 
-use core_graphics::display::CGDisplay;
+use std::cell::RefCell;
+
+use core_graphics::display::{CGDisplay, CGDisplayHideCursor, CGDisplayShowCursor};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
     ScrollEventUnit,
@@ -29,6 +31,11 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 
 use crate::keymap::{hid_usage_to_cgkeycode, mods_to_cgflags};
+
+thread_local! {
+    static HID_EVENT_SOURCE: RefCell<Option<CGEventSource>> = const { RefCell::new(None) };
+    static COMBINED_EVENT_SOURCE: RefCell<Option<CGEventSource>> = const { RefCell::new(None) };
+}
 
 /// Errors from injection calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +50,8 @@ pub enum InjectError {
     UnmappedKey(u16),
     /// A pointer button index that is not defined (§7.5 defines 0..=4).
     UnknownButton(u8),
+    /// Showing or hiding the cursor returned a non-success `CGError`.
+    CursorVisibility(i32),
 }
 
 impl std::fmt::Display for InjectError {
@@ -53,15 +62,37 @@ impl std::fmt::Display for InjectError {
             Self::Warp(code) => write!(f, "CGWarpMouseCursorPosition failed (CGError {code})"),
             Self::UnmappedKey(u) => write!(f, "HID usage {u:#06x} has no CGKeyCode mapping"),
             Self::UnknownButton(b) => write!(f, "pointer button index {b} is not defined (§7.5)"),
+            Self::CursorVisibility(code) => {
+                write!(f, "cursor visibility update failed (CGError {code})")
+            }
         }
     }
 }
 
 impl std::error::Error for InjectError {}
 
-fn event_source() -> Result<CGEventSource, InjectError> {
+fn hid_event_source() -> Result<CGEventSource, InjectError> {
     // HIDSystemState behaves like a real HID device for the window server.
-    CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|()| InjectError::EventSource)
+    HID_EVENT_SOURCE.with(|cell| {
+        if let Some(source) = cell.borrow().as_ref().cloned() {
+            return Ok(source);
+        }
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|()| InjectError::EventSource)?;
+        *cell.borrow_mut() = Some(source.clone());
+        Ok(source)
+    })
+}
+
+fn combined_event_source() -> Option<CGEventSource> {
+    COMBINED_EVENT_SOURCE.with(|cell| {
+        if let Some(source) = cell.borrow().as_ref().cloned() {
+            return Some(source);
+        }
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+        *cell.borrow_mut() = Some(source.clone());
+        Some(source)
+    })
 }
 
 /// Read the current global cursor position via Core Graphics.
@@ -73,7 +104,7 @@ fn event_source() -> Result<CGEventSource, InjectError> {
 pub fn cursor_position() -> Option<CGPoint> {
     // `CGEvent::new` with a freshly created default source mirrors
     // `CGEventCreate(NULL)`; the resulting event's location is the cursor.
-    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    let source = combined_event_source()?;
     let event = CGEvent::new(source).ok()?;
     Some(event.location())
 }
@@ -92,7 +123,7 @@ pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
     let point = CGPoint::new(x, y);
     CGDisplay::warp_mouse_cursor_position(point).map_err(InjectError::Warp)?;
 
-    let source = event_source()?;
+    let source = hid_event_source()?;
     let moved =
         CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
             .map_err(|()| InjectError::EventCreate)?;
@@ -109,7 +140,7 @@ pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
 pub fn move_cursor_rel(dx: i32, dy: i32) -> Result<(), InjectError> {
     let current = cursor_position().unwrap_or_else(|| CGPoint::new(0.0, 0.0));
     let point = CGPoint::new(current.x + f64::from(dx), current.y + f64::from(dy));
-    let source = event_source()?;
+    let source = hid_event_source()?;
     let ev = CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
         .map_err(|()| InjectError::EventCreate)?;
     ev.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
@@ -139,7 +170,7 @@ pub fn button(index: u8, down: bool) -> Result<(), InjectError> {
         (4, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center, 4),
         (other, _) => return Err(InjectError::UnknownButton(other)),
     };
-    let source = event_source()?;
+    let source = hid_event_source()?;
     let ev = CGEvent::new_mouse_event(source, ty, point, cg_button)
         .map_err(|()| InjectError::EventCreate)?;
     ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
@@ -155,7 +186,7 @@ pub fn left_click(x: f64, y: f64) -> Result<(), InjectError> {
     let point = CGPoint::new(x, y);
     let mut events = Vec::with_capacity(2);
     for ty in [CGEventType::LeftMouseDown, CGEventType::LeftMouseUp] {
-        let source = event_source()?;
+        let source = hid_event_source()?;
         let ev = CGEvent::new_mouse_event(source, ty, point, CGMouseButton::Left)
             .map_err(|()| InjectError::EventCreate)?;
         events.push(ev);
@@ -181,7 +212,7 @@ pub fn key_press(key: u16, down: bool, mods: u16, cmd_ctrl_swap: bool) -> Result
         None if !(0x04..=0xE7).contains(&key) => key,
         None => return Err(InjectError::UnmappedKey(key)),
     };
-    let source = event_source()?;
+    let source = hid_event_source()?;
     let ev = CGEvent::new_keyboard_event(source, keycode, down)
         .map_err(|()| InjectError::EventCreate)?;
     let flags = mods_to_cgflags(mods, cmd_ctrl_swap);
@@ -204,9 +235,37 @@ pub fn scroll(dx: i32, dy: i32, pixel: bool) -> Result<(), InjectError> {
     } else {
         ScrollEventUnit::LINE
     };
-    let source = event_source()?;
+    let source = hid_event_source()?;
     let ev = CGEvent::new_scroll_event(source, unit, 2, dy, dx, 0)
         .map_err(|()| InjectError::EventCreate)?;
     ev.post(CGEventTapLocation::HID);
     Ok(())
+}
+
+/// Show or hide the cursor on all active displays.
+///
+/// CoreGraphics hide/show is reference-counted per process, so callers must make
+/// this idempotent at a higher layer. [`crate::injector::MacInjector`] does that
+/// before calling here.
+pub fn set_cursor_visible(visible: bool) -> Result<(), InjectError> {
+    let displays = CGDisplay::active_displays().unwrap_or_else(|_| vec![CGDisplay::main().id]);
+    let mut first_error = None;
+    for display in displays {
+        // SAFETY: `display` comes from CoreGraphics' active display list, or from
+        // `CGMainDisplayID` as a fallback. The call has no Rust aliasing contract.
+        let code = unsafe {
+            if visible {
+                CGDisplayShowCursor(display)
+            } else {
+                CGDisplayHideCursor(display)
+            }
+        };
+        if code != 0 && first_error.is_none() {
+            first_error = Some(code);
+        }
+    }
+    match first_error {
+        Some(code) => Err(InjectError::CursorVisibility(code)),
+        None => Ok(()),
+    }
 }

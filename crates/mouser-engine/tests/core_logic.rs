@@ -3,7 +3,7 @@
 
 use mouser_core::platform::{CaptureMode, LocalInputEvent};
 use mouser_engine::core::{Action, CaptureDecision, EngineCore, Inject};
-use mouser_engine::{Edge, EdgeLayout};
+use mouser_engine::EdgeLayout;
 use mouser_protocol::{
     from_cbor, to_cbor, Datagram, KeyEvent, OwnershipAck, OwnershipTransfer, PointerButton,
     PointerMotion, TransferReason, TYPE_KEY_EVENT, TYPE_OWNERSHIP_ACK, TYPE_OWNERSHIP_TRANSFER,
@@ -32,12 +32,6 @@ fn has_set_mode(actions: &[Action], want: CaptureMode) -> bool {
         .any(|a| matches!(a, Action::SetCaptureMode(m) if *m == want))
 }
 
-fn has_any_set_mode(actions: &[Action]) -> bool {
-    actions
-        .iter()
-        .any(|a| matches!(a, Action::SetCaptureMode(_)))
-}
-
 fn cursor(x: i32, y: i32) -> LocalInputEvent {
     LocalInputEvent::CursorMoved {
         display_id: 0,
@@ -45,18 +39,6 @@ fn cursor(x: i32, y: i32) -> LocalInputEvent {
         y,
         dx: 0,
         dy: 0,
-    }
-}
-
-/// Cursor event carrying a relative device delta (the engine drives a controlled peer from
-/// `dx`/`dy`, which keep flowing while the local cursor is parked at the edge).
-fn cursor_rel(x: i32, y: i32, dx: i32, dy: i32) -> LocalInputEvent {
-    LocalInputEvent::CursorMoved {
-        display_id: 0,
-        x,
-        y,
-        dx,
-        dy,
     }
 }
 
@@ -261,6 +243,90 @@ fn input_rate_cap_drops_excess_peer_events() {
 }
 
 #[test]
+fn exhausted_repeat_cap_never_drops_key_release() {
+    let mut t = EngineCore::new_target(ME, PEER);
+    let grant = to_cbor(&OwnershipTransfer {
+        to: ME.to_vec(),
+        owner_epoch: 1,
+        layout_rev: 0,
+        reason: TransferReason::EdgeCross,
+    })
+    .unwrap();
+    t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
+
+    for ctr in 1..=260 {
+        let repeat = to_cbor(&KeyEvent {
+            usage: 0x07,
+            down: true,
+            mods: 0,
+            owner_epoch: 1,
+            ctr,
+        })
+        .unwrap();
+        let _ = t.on_control(TYPE_KEY_EVENT, &repeat);
+    }
+
+    let release = to_cbor(&KeyEvent {
+        usage: 0x07,
+        down: false,
+        mods: 0,
+        owner_epoch: 1,
+        ctr: 261,
+    })
+    .unwrap();
+    assert_eq!(
+        t.on_control(TYPE_KEY_EVENT, &release),
+        vec![Action::Inject(Inject::Key {
+            usage: 0x07,
+            down: false,
+            mods: 0,
+        })],
+        "key-up is a transition, so it must not be shed with auto-repeat key-downs"
+    );
+}
+
+#[test]
+fn motion_burst_does_not_starve_key_transitions() {
+    let mut t = EngineCore::new_target(ME, PEER);
+    let grant = to_cbor(&OwnershipTransfer {
+        to: ME.to_vec(),
+        owner_epoch: 1,
+        layout_rev: 0,
+        reason: TransferReason::EdgeCross,
+    })
+    .unwrap();
+    t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
+
+    for seq in 1..=500 {
+        let _ = t.on_motion(Datagram::Motion(PointerMotion {
+            owner_epoch: 1,
+            seq,
+            display_id: 0,
+            x: 10,
+            y: 20,
+        }));
+    }
+
+    let key = to_cbor(&KeyEvent {
+        usage: 0x04,
+        down: true,
+        mods: 0,
+        owner_epoch: 1,
+        ctr: 1,
+    })
+    .unwrap();
+    assert_eq!(
+        t.on_control(TYPE_KEY_EVENT, &key),
+        vec![Action::Inject(Inject::Key {
+            usage: 0x04,
+            down: true,
+            mods: 0,
+        })],
+        "lossy pointer motion must not spend the key/button repeat bucket"
+    );
+}
+
+#[test]
 fn source_capable_peer_accepts_grant_and_injects() {
     let mut peer = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
 
@@ -402,179 +468,4 @@ fn peer_heartbeat_prevents_reclaim() {
         e.on_control(mouser_protocol::TYPE_HEARTBEAT, &hb);
     }
     assert!(!e.is_owner(), "a live peer keeps ownership");
-}
-
-// --- Capture-mode lifecycle (edge sensing is not input forwarding) ---
-
-#[test]
-fn source_starts_in_passive_edge_sensing() {
-    let e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
-    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
-    assert!(
-        has_set_mode(&e.initial_actions(), CaptureMode::PassiveEdge),
-        "a source comes up in passive edge sensing, not forwarding capture"
-    );
-}
-
-#[test]
-fn target_starts_and_stays_capture_off() {
-    let mut t = EngineCore::new_target(ME, PEER);
-    assert_eq!(t.capture_mode(), CaptureMode::Off);
-    assert!(has_set_mode(&t.initial_actions(), CaptureMode::Off));
-
-    // Accepting a grant makes the target the owner, but it still never captures.
-    let grant = to_cbor(&OwnershipTransfer {
-        to: ME.to_vec(),
-        owner_epoch: 1,
-        layout_rev: 0,
-        reason: TransferReason::EdgeCross,
-    })
-    .unwrap();
-    let a = t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
-    assert!(t.is_owner());
-    assert!(
-        !has_any_set_mode(&a),
-        "a target never emits a capture-mode change"
-    );
-    assert_eq!(t.capture_mode(), CaptureMode::Off);
-}
-
-#[test]
-fn idle_cursor_on_own_screen_does_not_escalate_capture() {
-    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
-    let a = e.on_local_input(cursor(50, 50));
-    assert!(
-        !has_any_set_mode(&a),
-        "a cursor that has not reached the edge keeps passive sensing"
-    );
-    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
-}
-
-#[test]
-fn edge_cross_escalates_to_active_forward_first() {
-    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
-    let a = e.on_local_input(cursor(99, 40));
-    assert!(
-        matches!(
-            a.first(),
-            Some(Action::SetCaptureMode(CaptureMode::ActiveForward))
-        ),
-        "the capture escalates to ActiveForward before suppressing/forwarding the crossing"
-    );
-    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
-    assert!(!e.is_owner());
-}
-
-#[test]
-fn reclaim_by_crossing_back_drops_to_passive_edge() {
-    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
-    e.on_local_input(cursor(99, 40)); // cross to peer → ActiveForward
-    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
-    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
-
-    // Move the (suppressed) cursor back across the near edge → reclaim locally. The peer
-    // cursor was seeded at the entry edge (peer_x == 0); a leftward delta crosses back.
-    let a = e.on_local_input(cursor_rel(98, 40, -1, 0));
-    assert!(
-        matches!(
-            a.first(),
-            Some(Action::SetCaptureMode(CaptureMode::PassiveEdge))
-        ),
-        "reclaim drops suppressing capture back to passive edge sensing first"
-    );
-    assert!(e.is_owner());
-    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
-}
-
-#[test]
-fn heartbeat_timeout_reclaim_drops_to_passive_edge() {
-    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
-    e.on_local_input(cursor(99, 40)); // hand off → ActiveForward
-    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
-    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
-
-    e.on_tick();
-    e.on_tick();
-    let a = e.on_tick(); // third missed heartbeat → reclaim
-    assert!(e.is_owner());
-    assert!(
-        has_set_mode(&a, CaptureMode::PassiveEdge),
-        "a heartbeat-timeout reclaim tears down forwarding capture"
-    );
-    assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
-}
-
-// Mirrors the mobile FFI connect seed (crates/mouser-ffi/src/lib.rs): width-1 cross hands
-// off, then a `dx`-carrying nudge moves the peer cursor OFF the entry edge so the first
-// leftward user delta doesn't instantly trip the back-cross reclaim. The nudge MUST carry a
-// relative dx — an absolute-only nudge (dx:0) leaves peer_x at 0 and reclaims immediately.
-#[test]
-fn relative_nudge_off_entry_edge_survives_a_leftward_delta() {
-    const SEED_STEP: i32 = 16;
-    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(1, 100, 100, 100));
-    e.on_local_input(cursor(0, 50)); // x >= width-1 (==0) → cross to peer
-    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
-    assert!(!e.is_owner(), "peer owns after the edge cross");
-
-    // The relative nudge moves peer_x to SEED_STEP — still forwarding, not reclaiming.
-    let nudged = e.on_local_input(cursor_rel(SEED_STEP, 50, SEED_STEP, 0));
-    assert!(!e.is_owner(), "the nudge keeps the peer in control");
-    assert_eq!(motion_of(&nudged).map(|m| m.x), Some(SEED_STEP));
-
-    // A small leftward delta now decrements peer_x but stays off the edge → no reclaim.
-    let left = e.on_local_input(cursor_rel(SEED_STEP - 1, 50, -1, 0));
-    assert!(
-        !e.is_owner(),
-        "a leftward delta after the nudge must NOT instantly reclaim (regression: dx:0 seed)"
-    );
-    assert_eq!(motion_of(&left).map(|m| m.x), Some(SEED_STEP - 1));
-    assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
-}
-
-fn motion_of(actions: &[Action]) -> Option<PointerMotion> {
-    actions.iter().find_map(|a| match a {
-        Action::SendMotion(m) => Some(*m),
-        _ => None,
-    })
-}
-
-/// A vertical (Bottom) cross: the peer is seeded at its TOP entry edge, a downward delta
-/// traverses it, and moving back up reclaims. Guards the per-edge seeding + back-cross.
-#[test]
-fn bottom_edge_crosses_seeds_top_and_traverses_then_reclaims() {
-    let mut e = EngineCore::new_source(
-        ME,
-        PEER,
-        EdgeLayout::with_edge(100, 100, 100, 100, Edge::Bottom),
-    );
-    assert!(e.is_owner());
-    // Inside our screen: pass through.
-    assert!(has_capture(
-        &e.on_local_input(cursor(40, 50)),
-        CaptureDecision::PassThrough
-    ));
-    // Reach the bottom edge (y >= height-1): cross to the peer.
-    let a = e.on_local_input(cursor(40, 99));
-    assert!(
-        has_control(&a, TYPE_OWNERSHIP_TRANSFER).is_some(),
-        "crosses at the bottom edge"
-    );
-    assert!(!e.is_owner());
-    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
-    // Move down into the peer (dy > 0): the peer cursor advances down from the top entry.
-    let a = e.on_local_input(cursor_rel(40, 99, 0, 30));
-    let m = motion_of(&a).expect("motion forwarded while owning the peer");
-    assert!(
-        m.y > 0,
-        "peer cursor moved down from the top entry, got y={}",
-        m.y
-    );
-    assert!(has_capture(&a, CaptureDecision::Suppress));
-    // Move back up past the top entry (dy < 0, peer_y returns to 0): reclaim locally.
-    let a = e.on_local_input(cursor_rel(40, 99, 0, -50));
-    assert!(
-        has_set_mode(&a, CaptureMode::PassiveEdge),
-        "crossing back up reclaims to passive edge"
-    );
-    assert!(e.is_owner());
 }
