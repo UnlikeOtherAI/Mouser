@@ -7,8 +7,10 @@
 //!   missing so `can_suppress() == false` is honest.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
@@ -247,6 +249,10 @@ impl MacCapture {
             g.generation
         };
         let (tx, rx) = std::sync::mpsc::channel::<Result<bool, ()>>();
+        // Shared mach-port ref so the callback can re-enable the tap if macOS disables it.
+        // Published once below, after the tap exists.
+        let reenable_port = Arc::new(AtomicUsize::new(0));
+        let cb_port = Arc::clone(&reenable_port);
 
         std::thread::Builder::new()
             .name("mouser-mac-capture".into())
@@ -258,7 +264,7 @@ impl MacCapture {
                         CGEventTapPlacement::HeadInsertEventTap,
                         CGEventTapOptions::ListenOnly,
                         events_of_interest(),
-                        make_callback(Arc::clone(&sink)),
+                        make_callback(Arc::clone(&sink), Arc::clone(&cb_port)),
                     ) {
                         Ok(t) => (Some(t), false),
                         Err(()) => (None, false),
@@ -271,7 +277,7 @@ impl MacCapture {
                         CGEventTapPlacement::HeadInsertEventTap,
                         CGEventTapOptions::Default,
                         events_of_interest(),
-                        make_callback(Arc::clone(&sink)),
+                        make_callback(Arc::clone(&sink), Arc::clone(&cb_port)),
                     ) {
                         Ok(t) => (Some(t), true),
                         Err(()) => match CGEventTap::new(
@@ -279,7 +285,7 @@ impl MacCapture {
                             CGEventTapPlacement::HeadInsertEventTap,
                             CGEventTapOptions::ListenOnly,
                             events_of_interest(),
-                            make_callback(Arc::clone(&sink)),
+                            make_callback(Arc::clone(&sink), Arc::clone(&cb_port)),
                         ) {
                             Ok(t) => (Some(t), false),
                             Err(()) => (None, false),
@@ -296,6 +302,12 @@ impl MacCapture {
                     let _ = tx.send(Err(()));
                     return;
                 };
+                // Publish the port before enabling so a disable event delivered immediately
+                // after enable() is recoverable by the callback.
+                cb_port.store(
+                    tap.mach_port().as_concrete_TypeRef() as usize,
+                    Ordering::Release,
+                );
                 let run_loop = CFRunLoop::get_current();
                 // SAFETY: `kCFRunLoopCommonModes` is a CoreFoundation extern
                 // constant string; reading it is the documented usage.
@@ -402,6 +414,16 @@ fn handle_flags_changed(
     }
 }
 
+// Re-enable a `CGEventTap` by its mach-port ref. macOS disables a tap whose callback
+// stalls (`TapDisabledByTimeout`) or under certain user-input bursts
+// (`TapDisabledByUserInput`); the tap then delivers nothing until re-enabled, so the
+// callback must re-arm it the moment it sees a disable event — otherwise capture goes
+// silent for the rest of the session. `CGEventTapEnable` is in CoreGraphics (already
+// linked); re-declared here because the `core-graphics` crate keeps it private.
+extern "C" {
+    fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
+}
+
 /// Build the tap callback: forward to the sink, honor its [`CaptureDecision`].
 ///
 /// Modifier-key (`FlagsChanged`) transitions are stateful — down vs up is the
@@ -410,12 +432,25 @@ fn handle_flags_changed(
 /// interior mutability).
 fn make_callback(
     sink: Arc<dyn InputSink>,
+    reenable_port: Arc<AtomicUsize>,
 ) -> impl Fn(core_graphics::event::CGEventTapProxy, CGEventType, &CGEvent) -> CallbackResult
        + Send
        + 'static {
     let mod_state = Arc::new(Mutex::new(ModifierState::new()));
     let reclaim = Arc::new(Mutex::new(EmergencyReclaim::new()));
     move |_proxy, etype, event| {
+        // macOS disabled the tap (callback stall or user-input burst). Re-arm it in place,
+        // or the source goes silent until the session ends.
+        if matches!(
+            etype,
+            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+        ) {
+            let port = reenable_port.load(Ordering::Acquire);
+            if port != 0 {
+                unsafe { CGEventTapEnable(port as *const std::ffi::c_void, true) };
+            }
+            return CallbackResult::Keep;
+        }
         if matches!(etype, CGEventType::FlagsChanged) {
             return handle_flags_changed(sink.as_ref(), event, &mod_state, &reclaim);
         }
