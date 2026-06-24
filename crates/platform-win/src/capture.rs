@@ -7,10 +7,10 @@ use std::time::Duration;
 use mouser_core::platform::{
     CaptureMode, InputCapture, InputSink, LocalInputEvent, PlatformError, PlatformResult,
 };
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    ClipCursor, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
     UnhookWindowsHookEx, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_QUIT,
 };
 
@@ -21,11 +21,6 @@ use crate::capture_hooks::{
 };
 use crate::capture_rawinput::{self, set_raw_input_active};
 use crate::inject;
-
-/// Inset (px) from the active display edge for the `ClipCursor` pin. Keeping the cursor a
-/// couple of pixels off the wall lets the physical device keep producing relative deltas
-/// (a device pressed against the edge reports `lLastX/lLastY == 0`).
-const CLIP_INSET: i32 = 2;
 
 const PASSIVE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const LEFT_CTRL_BIT: u16 = 1 << 0;
@@ -277,7 +272,9 @@ fn run_capture_thread(tx: std::sync::mpsc::Sender<Result<u32, String>>) {
     let raw_sink = setup_raw_input();
 
     let _ = tx.send(Ok(thread_id));
-    message_loop();
+    // Run the message pump under catch_unwind so a panic can't skip the teardown below
+    // (which would leak the installed hooks / Raw Input registration on this live process).
+    let _ = catch_unwind(AssertUnwindSafe(message_loop));
 
     teardown_raw_input(raw_sink);
     let _ = unsafe { UnhookWindowsHookEx(mouse_hook) };
@@ -286,8 +283,12 @@ fn run_capture_thread(tx: std::sync::mpsc::Sender<Result<u32, String>>) {
     clear_capture_state();
 }
 
-/// Register a Raw Input mouse sink and pin the cursor just inside the active display edge.
-/// Returns the sink window on success (raw active); `None` leaves the absolute fallback.
+/// Register a Raw Input mouse sink so motion comes from device-level relative deltas
+/// (`WM_INPUT`). Those keep flowing regardless of where the OS clamps the cursor, so NO
+/// cursor pinning (`ClipCursor`) is needed — and we deliberately avoid it: `ClipCursor` is
+/// a system-wide setting that survives this process, so a crash/kill mid-cross would leave
+/// the user's cursor clamped ("unusable mouse"). Returns the sink window on success (raw
+/// active); `None` leaves the absolute-delta fallback.
 fn setup_raw_input() -> Option<HWND> {
     let Some(hwnd) = capture_rawinput::create_sink_window() else {
         eprintln!("mouser: raw-input sink window creation failed; using absolute-delta fallback");
@@ -299,39 +300,18 @@ fn setup_raw_input() -> Option<HWND> {
         return None;
     }
     set_raw_input_active(true);
-    pin_cursor_to_active_display();
     Some(hwnd)
 }
 
-/// Release the cursor clip and tear down the Raw Input registration / sink window.
+/// Tear down the Raw Input registration / sink window (both per-process, so they're also
+/// reclaimed on process exit). No cursor clip to release — see [`setup_raw_input`].
 fn teardown_raw_input(raw_sink: Option<HWND>) {
     let Some(hwnd) = raw_sink else {
         return;
     };
-    // Release the cursor (ClipCursor(None) restores free movement).
-    let _ = unsafe { ClipCursor(None) };
     capture_rawinput::unregister_raw_mouse();
     capture_rawinput::destroy_sink_window(hwnd);
     set_raw_input_active(false);
-}
-
-/// Confine the cursor to a rect inset a couple pixels from the active display edge, so the
-/// physical device keeps producing relative deltas instead of sitting against the wall.
-fn pin_cursor_to_active_display() {
-    let Some(bounds) = active_display_bounds()
-        .unwrap_or_default()
-        .into_iter()
-        .next()
-    else {
-        return;
-    };
-    let rect = RECT {
-        left: bounds.left + CLIP_INSET,
-        top: bounds.top + CLIP_INSET,
-        right: bounds.left + bounds.width - CLIP_INSET,
-        bottom: bounds.top + bounds.height - CLIP_INSET,
-    };
-    let _ = unsafe { ClipCursor(Some(&rect)) };
 }
 
 fn create_message_queue() {
