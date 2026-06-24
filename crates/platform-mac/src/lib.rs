@@ -11,10 +11,11 @@
 //!
 //! It deliberately does **not** set `[lints] workspace = true`: the workspace
 //! forbids `unsafe_code`, but the macOS path is C/Objective-C-API-driven.
-//! The input spike ([`inject`]/[`capture`]) calls `core-graphics`' safe wrappers
-//! (`CGEvent*`, `CGEventTap*`, `CGWarpMouseCursorPosition`, CoreFoundation
-//! run-loop fns) and adds no `unsafe`. The **drag-and-drop spike** ([`dragdrop`])
-//! does use `unsafe`: defining an Objective-C `NSDraggingSource` class
+//! The input spike ([`inject`]/[`capture`]) mostly calls `core-graphics`' safe
+//! wrappers (`CGEvent*`, `CGEventTap*`, `CGWarpMouseCursorPosition`,
+//! CoreFoundation run-loop fns); the cursor-visibility hook uses the crate's
+//! raw CoreGraphics binding directly. The **drag-and-drop spike** ([`dragdrop`])
+//! also uses `unsafe`: defining an Objective-C `NSDraggingSource` class
 //! (`objc2::define_class!`), `msg_send!`, and a handful of AppKit calls that
 //! `objc2` marks `unsafe`. That `unsafe` is confined to [`dragdrop`]; the rest of
 //! the crate stays wrapper-only.
@@ -44,12 +45,13 @@ pub mod clipboard;
 pub mod display_info;
 pub mod dragdrop;
 pub mod inject;
+pub mod injector;
 pub mod keymap;
 pub mod keymap_capture;
 pub mod permission;
 pub mod tray;
 
-pub use adapter::{MacCapture, MacInjector};
+pub use adapter::MacCapture;
 pub use capture::{install_listen_only_tap, CaptureError};
 pub use clipboard::{ClipboardWriteFailed, MacClipboard};
 pub use display_info::{
@@ -62,8 +64,9 @@ pub use dragdrop::{
 };
 pub use inject::{
     button, cursor_position, key_press, left_click, move_cursor, move_cursor_rel, scroll,
-    InjectError,
+    set_cursor_visible, InjectError,
 };
+pub use injector::MacInjector;
 pub use keymap::{
     hid_usage_to_cgkeycode, mods_to_cgflags, mods_to_cgkeycodes, supported_hid_usages,
 };

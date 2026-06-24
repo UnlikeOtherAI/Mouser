@@ -30,8 +30,6 @@
 //! Unix-only: positioned writes use the Unix `FileExt`. The path itself is validated to be
 //! inside the quarantine dir purely by [`crate::path`] before this sink is ever opened.
 
-#![cfg(unix)]
-
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;

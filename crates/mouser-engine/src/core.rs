@@ -29,7 +29,7 @@ use mouser_protocol::{
 };
 
 pub use types::{Action, CaptureDecision, Edge, EdgeLayout, Inject, Role};
-use types::{InputAuth, InputRate, PendingAck, ReplayGuard};
+use types::{HeldKeys, InputAuth, InputRate, PendingAck, ReplayGuard};
 
 /// Heartbeat misses before the source declares the peer gone and reclaims (spec §7;
 /// 1 s tick × 3 = 3 s timeout).
@@ -46,6 +46,8 @@ pub struct EngineCore {
     out_seq: u32,
     /// Incoming anti-replay guard (peer → us).
     guard: ReplayGuard,
+    /// Held peer-originated keys in the current accepted input epoch.
+    held_keys: HeldKeys,
     /// Peer-originated input is allowed only after a trusted current-epoch grant.
     input_auth: InputAuth,
     /// Per-peer input burst/rate cap.
@@ -86,6 +88,7 @@ impl EngineCore {
             out_ctr: 0,
             out_seq: 0,
             guard: ReplayGuard::default(),
+            held_keys: HeldKeys::default(),
             input_auth: InputAuth::new_trusted(),
             input_rate: InputRate::full(),
             pending_ack: None,
@@ -149,7 +152,10 @@ impl EngineCore {
     /// in the core means the "what mode now?" decision lives in exactly one place.
     #[must_use]
     pub fn initial_actions(&self) -> Vec<Action> {
-        vec![Action::SetCaptureMode(self.capture_mode())]
+        vec![
+            Action::SetCursorVisible(self.is_owner()),
+            Action::SetCaptureMode(self.capture_mode()),
+        ]
     }
 
     fn me(&self) -> DeviceId {
@@ -302,6 +308,7 @@ impl EngineCore {
         };
         self.reset_out();
         self.guard = ReplayGuard::default();
+        self.held_keys.clear();
         self.input_auth.revoke_epoch();
         self.pending_ack = Some(PendingAck::new(epoch));
         // Seed the peer cursor at the entry edge: the crossing axis is pinned to the entry
@@ -339,6 +346,7 @@ impl EngineCore {
         vec![
             Action::SetCaptureMode(CaptureMode::ActiveForward),
             Action::SendControl(TYPE_OWNERSHIP_TRANSFER, transfer),
+            Action::SetCursorVisible(false),
             Action::OwnerChanged {
                 owner: self.peer,
                 epoch,
@@ -351,6 +359,7 @@ impl EngineCore {
         let epoch = self.ownership.reclaim();
         self.reset_out();
         self.guard = ReplayGuard::default();
+        self.held_keys.clear();
         self.input_auth.revoke_epoch();
         self.pending_ack = None;
         let me = self.me();
@@ -365,6 +374,7 @@ impl EngineCore {
         vec![
             Action::SetCaptureMode(CaptureMode::PassiveEdge),
             Action::SendControl(TYPE_OWNERSHIP_TRANSFER, transfer),
+            Action::SetCursorVisible(true),
             Action::OwnerChanged { owner: me, epoch },
             Action::Capture(CaptureDecision::PassThrough),
         ]

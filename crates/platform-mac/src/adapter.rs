@@ -1,7 +1,7 @@
 //! macOS adapters implementing the `mouser_core` platform traits (audit H2/H3).
 //!
-//! - [`MacInjector`] wraps [`crate::inject`] and adds display-local to global
-//!   coordinate translation (audit M1).
+//! - [`MacInjector`] wraps [`crate::injector`] and adds display-local to global
+//!   coordinate translation plus cursor visibility.
 //! - [`MacCapture`] installs a background `CGEventTap`, honors
 //!   [`CaptureDecision`], and falls back to listen-only when Accessibility is
 //!   missing so `can_suppress() == false` is honest.
@@ -17,42 +17,13 @@ use core_graphics::event::{
     CallbackResult, EventField,
 };
 use mouser_core::platform::{
-    CaptureDecision, CaptureMode, InputCapture, InputInjection, InputSink, LocalInputEvent,
-    PlatformError, PlatformResult, ScrollUnit,
+    CaptureDecision, CaptureMode, InputCapture, InputSink, LocalInputEvent, PlatformError,
+    PlatformResult,
 };
 
-use crate::display_info::{display_bounds, main_display_bounds};
-use crate::inject;
+pub use crate::injector::MacInjector;
+
 use crate::keymap_capture::{flags_changed_event, to_local_event, ModifierState};
-
-/// macOS input injector. Stateless; every call posts a fresh `CGEvent`.
-///
-/// `cmd_ctrl_swap` is the cluster input preference (Appendix A `input_prefs`);
-/// when set, a remote machine's Ctrl is delivered as ⌘ and vice-versa.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MacInjector {
-    cmd_ctrl_swap: bool,
-}
-
-impl MacInjector {
-    /// Injector with the default (no) Cmd↔Ctrl swap.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            cmd_ctrl_swap: false,
-        }
-    }
-
-    /// Injector with the Cmd↔Ctrl swap preference set.
-    #[must_use]
-    pub fn with_cmd_ctrl_swap(cmd_ctrl_swap: bool) -> Self {
-        Self { cmd_ctrl_swap }
-    }
-}
-
-fn boxed(e: inject::InjectError) -> PlatformError {
-    Box::new(e)
-}
 
 /// Lock a capture mutex on a **runtime** path without ever panicking (audit:
 /// capture panic discipline).
@@ -134,43 +105,6 @@ fn ctrl_bit(usage: u16) -> Option<u16> {
         0xE0 => Some(LEFT_CTRL_BIT),
         0xE4 => Some(RIGHT_CTRL_BIT),
         _ => None,
-    }
-}
-
-impl InputInjection for MacInjector {
-    fn move_cursor(&self, display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
-        // Translate display-local logical pixels to a global CG point via full
-        // display enumeration (audit M1), not just the main display.
-        // The source addresses the target's primary display as id 0 (it can't know the
-        // target's real CG display ids), and an id can go stale across a display
-        // reconfigure — so fall back to the main display rather than erroring. Erroring
-        // here drops the motion AND trips `on_injection_failed`, which latches input off
-        // and makes a controlled peer flap (won't cross after the first cross).
-        let bounds = display_bounds(display_id).unwrap_or_else(main_display_bounds);
-        let (gx, gy) = bounds.local_to_global(x, y);
-        inject::move_cursor(gx, gy).map_err(boxed)
-    }
-
-    fn move_cursor_relative(&self, dx: i32, dy: i32) -> PlatformResult<()> {
-        inject::move_cursor_rel(dx, dy).map_err(boxed)
-    }
-
-    fn button(&self, button: u8, down: bool) -> PlatformResult<()> {
-        inject::button(button, down).map_err(boxed)
-    }
-
-    fn key(&self, usage: u16, down: bool, mods: u16) -> PlatformResult<()> {
-        inject::key_press(usage, down, mods, self.cmd_ctrl_swap).map_err(boxed)
-    }
-
-    fn scroll(&self, dx: i32, dy: i32, unit: ScrollUnit) -> PlatformResult<()> {
-        // `Detent120` is line/notch-based; `LogicalPixel` is pixel-precise.
-        let pixel = matches!(unit, ScrollUnit::LogicalPixel);
-        let (dx, dy) = match unit {
-            ScrollUnit::Detent120 => (dx / 120, dy / 120),
-            ScrollUnit::LogicalPixel => (dx, dy),
-        };
-        inject::scroll(dx, dy, pixel).map_err(boxed)
     }
 }
 

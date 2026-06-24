@@ -96,6 +96,14 @@ pub trait InputInjection: Send + Sync {
 
     /// Scroll by `(dx, dy)` in the given [`crate::platform::ScrollUnit`] (spec §7.5).
     fn scroll(&self, dx: i32, dy: i32, unit: ScrollUnit) -> PlatformResult<()>;
+
+    /// Show or hide the local cursor to match ownership.
+    ///
+    /// The default is a no-op because not every platform needs a global cursor
+    /// visibility hook, and some adapters can only hide inside a focused window.
+    fn set_cursor_visible(&self, _visible: bool) -> PlatformResult<()> {
+        Ok(())
+    }
 }
 
 /// Scroll delta unit (mirrors the wire `ScrollUnit`, spec §7.5 / Appendix C).

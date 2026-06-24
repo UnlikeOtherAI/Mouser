@@ -8,7 +8,7 @@ use mouser_protocol::{
     TYPE_PONG, TYPE_SCROLL,
 };
 
-use super::types::InputRate;
+use super::types::{InputRate, KeyTransition};
 use super::{encode, Action, EngineCore, Inject, ReplayGuard, Role};
 
 impl EngineCore {
@@ -51,6 +51,7 @@ impl EngineCore {
         {
             OwnershipUpdate::Accepted { owner, epoch } => {
                 self.guard = ReplayGuard::default();
+                self.held_keys.clear();
                 self.reset_out();
                 self.misses = 0;
                 self.pending_ack = None;
@@ -67,6 +68,7 @@ impl EngineCore {
                 });
                 let mut actions = vec![
                     Action::SendControl(TYPE_OWNERSHIP_ACK, ack),
+                    Action::SetCursorVisible(owner == self.me()),
                     Action::OwnerChanged { owner, epoch },
                 ];
                 if self.role == Role::Source {
@@ -118,6 +120,13 @@ impl EngineCore {
         {
             return Vec::new();
         }
+        let transition = self.held_keys.observe(k.usage, k.down);
+        if transition == KeyTransition::Repeat && !self.input_rate.allow_one() {
+            return Vec::new();
+        }
+        if transition != KeyTransition::Repeat {
+            let _ = self.input_rate.allow_one();
+        }
         vec![Action::Inject(Inject::Key {
             usage: k.usage,
             down: k.down,
@@ -134,6 +143,7 @@ impl EngineCore {
         {
             return Vec::new();
         }
+        let _ = self.input_rate.allow_one();
         vec![Action::Inject(Inject::Button {
             button: b.button,
             down: b.down,
@@ -146,6 +156,7 @@ impl EngineCore {
         };
         if !self.guard.accept_ctr(s.owner_epoch, s.ctr, self.epoch())
             || !self.authorize_inject(s.owner_epoch)
+            || !self.input_rate.allow_one()
         {
             return Vec::new();
         }
@@ -197,6 +208,7 @@ impl EngineCore {
     pub fn on_injection_failed(&mut self) -> Vec<Action> {
         self.input_auth.set_input_allowed(false);
         self.input_auth.revoke_epoch();
+        self.held_keys.clear();
         self.ownership.mark_input_blocked();
         if !self.is_owner() {
             return Vec::new();
@@ -206,6 +218,7 @@ impl EngineCore {
         };
         self.reset_out();
         self.guard = ReplayGuard::default();
+        self.held_keys.clear();
         let transfer = encode(&OwnershipTransfer {
             to: self.peer.to_vec(),
             owner_epoch: epoch,
@@ -214,6 +227,7 @@ impl EngineCore {
         });
         vec![
             Action::SendControl(TYPE_OWNERSHIP_TRANSFER, transfer),
+            Action::SetCursorVisible(false),
             Action::OwnerChanged {
                 owner: self.peer,
                 epoch,
@@ -221,8 +235,8 @@ impl EngineCore {
         ]
     }
 
-    pub(super) fn authorize_inject(&mut self, owner_epoch: u64) -> bool {
-        self.is_owner() && self.input_auth.allows_epoch(owner_epoch) && self.input_rate.allow_one()
+    pub(super) fn authorize_inject(&self, owner_epoch: u64) -> bool {
+        self.is_owner() && self.input_auth.allows_epoch(owner_epoch)
     }
 }
 

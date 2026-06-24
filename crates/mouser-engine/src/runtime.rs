@@ -113,6 +113,11 @@ impl Shared {
                         self.dispatch(actions);
                     }
                 }
+                Action::SetCursorVisible(visible) => {
+                    if let Err(e) = self.injector.set_cursor_visible(visible) {
+                        crate::diag!(warn, "mouserd: cursor visibility update failed: {e}");
+                    }
+                }
                 Action::Capture(d) => decision = Some(d),
                 // Decoupled: applied by the mode task, never inline (see module docs).
                 Action::SetCaptureMode(mode) => {
@@ -489,8 +494,7 @@ impl RuntimeHandle {
         for task in tasks {
             task.abort();
         }
-        // Tasks are aborted first so no further set_mode can race; then a clean
-        // teardown of any installed hooks/poll thread.
+        let _ = shared.injector.set_cursor_visible(true);
         let _ = shared.capture.stop();
     }
 }
