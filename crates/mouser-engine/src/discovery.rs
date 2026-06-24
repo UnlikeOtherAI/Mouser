@@ -9,7 +9,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use data_encoding::BASE32_NOPAD;
 use mouser_core::{DeviceId, DeviceIdentity};
@@ -24,6 +25,41 @@ const OS_NAME: &str = if cfg!(target_os = "macos") {
 } else {
     "linux"
 };
+
+const LOCAL_IPV4_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct LocalIpv4Cache {
+    cached: Mutex<Option<CachedLocalIpv4>>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedLocalIpv4 {
+    checked_at: Instant,
+    addr: Option<IpAddr>,
+}
+
+impl LocalIpv4Cache {
+    fn get_or_probe(&self, now: Instant, probe: impl FnOnce() -> Option<IpAddr>) -> Option<IpAddr> {
+        let mut guard = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(cached) = guard.as_ref() {
+            if now.saturating_duration_since(cached.checked_at) < LOCAL_IPV4_TTL {
+                return cached.addr;
+            }
+        }
+        let addr = probe();
+        *guard = Some(CachedLocalIpv4 {
+            checked_at: now,
+            addr,
+        });
+        addr
+    }
+}
+
+fn local_ipv4_cache() -> &'static LocalIpv4Cache {
+    static CACHE: OnceLock<LocalIpv4Cache> = OnceLock::new();
+    CACHE.get_or_init(LocalIpv4Cache::default)
+}
 
 /// Build this device's advertisement (§4). `iport` is the bound interactive UDP port;
 /// `bport` is the bound bulk UDP port.
@@ -153,6 +189,10 @@ fn best_dialable_ip(addrs: &[IpAddr]) -> Option<IpAddr> {
 /// LAN. Uses the connect-a-UDP-socket trick — no packets are ever sent. `None` if it
 /// can't be determined (e.g. no network).
 pub fn local_ipv4() -> Option<IpAddr> {
+    local_ipv4_cache().get_or_probe(Instant::now(), probe_local_ipv4)
+}
+
+fn probe_local_ipv4() -> Option<IpAddr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     // TEST-NET-3 (RFC 5737) discard port: selects the default route, transmits nothing.
     sock.connect("203.0.113.1:9").ok()?;
@@ -384,5 +424,34 @@ mod tests {
         let identity = DeviceIdentity::generate();
         let advert = local_advert(&identity, "Peer", 1, 2);
         assert_eq!(peer_device_id(&advert), Some(identity.device_id()));
+    }
+
+    #[test]
+    fn local_ipv4_cache_reuses_value_until_ttl_expires() {
+        use std::cell::Cell;
+
+        let cache = LocalIpv4Cache::default();
+        let start = Instant::now();
+        let calls = Cell::new(0);
+        let first_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let second_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 11));
+
+        let first = cache.get_or_probe(start, || {
+            calls.set(calls.get() + 1);
+            Some(first_ip)
+        });
+        let cached = cache.get_or_probe(start + Duration::from_secs(1), || {
+            calls.set(calls.get() + 1);
+            Some(second_ip)
+        });
+        let refreshed = cache.get_or_probe(start + LOCAL_IPV4_TTL, || {
+            calls.set(calls.get() + 1);
+            Some(second_ip)
+        });
+
+        assert_eq!(first, Some(first_ip));
+        assert_eq!(cached, Some(first_ip));
+        assert_eq!(refreshed, Some(second_ip));
+        assert_eq!(calls.get(), 2);
     }
 }

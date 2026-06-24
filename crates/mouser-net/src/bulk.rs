@@ -24,13 +24,14 @@ use std::net::SocketAddr;
 use ed25519_dalek::{Signature, Verifier};
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream};
 
+use crate::dial::DialErrors;
+use crate::endpoint_bind::bind_dual_stack_server;
 use crate::identity::{
     build_tls_certificate, device_id_from_cert, peer_leaf_cert, verifying_key_from_cert,
 };
 use crate::pin::PinPolicy;
 use crate::transport::{
-    bind_dual_stack_server, build_client_config, build_server_config, ACCEPT_HANDSHAKE_TIMEOUT,
-    DIAL_ATTEMPT_TIMEOUT,
+    build_client_config, build_server_config, ACCEPT_HANDSHAKE_TIMEOUT, DIAL_ATTEMPT_TIMEOUT,
 };
 use crate::NetError;
 use mouser_core::DeviceIdentity;
@@ -119,7 +120,9 @@ impl BulkEndpoint {
     /// plane's [`crate::transport::InteractiveEndpoint::connect_interactive_any`]: addresses
     /// are tried most-reachable-first under [`DIAL_ATTEMPT_TIMEOUT`], so a peer that mDNS
     /// resolved to a family it isn't listening on no longer hangs the bulk dial on the 20s
-    /// idle timeout (which would silently stall clipboard-over-bulk and file sends).
+    /// idle timeout (which would silently stall clipboard-over-bulk and file sends). If
+    /// every candidate fails, returns a combined error led by the first non-timeout
+    /// failure so a trailing dead address cannot bury a cert-pin or identity mismatch.
     pub async fn connect_bulk_any(
         &self,
         identity: &DeviceIdentity,
@@ -127,7 +130,7 @@ impl BulkEndpoint {
         peer_policy: PinPolicy,
         interactive_session_id: u64,
     ) -> Result<BulkConnection, NetError> {
-        let mut last_err = NetError::Connect("no dialable address for peer".to_string());
+        let mut errors = DialErrors::new();
         for &addr in addrs {
             match tokio::time::timeout(
                 DIAL_ATTEMPT_TIMEOUT,
@@ -136,11 +139,11 @@ impl BulkEndpoint {
             .await
             {
                 Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => last_err = e,
-                Err(_) => last_err = NetError::Connect(format!("timed out dialing {addr}")),
+                Ok(Err(e)) => errors.push_error(addr, e),
+                Err(_) => errors.push_timeout(addr),
             }
         }
-        Err(last_err)
+        Err(errors.finish())
     }
 
     /// Accept the next inbound bulk connection and verify its [`BulkHello`] binds to
