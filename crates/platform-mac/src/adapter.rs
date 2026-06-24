@@ -21,7 +21,7 @@ use mouser_core::platform::{
     PlatformError, PlatformResult, ScrollUnit,
 };
 
-use crate::display_info::display_bounds;
+use crate::display_info::{display_bounds, main_display_bounds};
 use crate::inject;
 use crate::keymap_capture::{flags_changed_event, to_local_event, ModifierState};
 
@@ -137,24 +137,16 @@ fn ctrl_bit(usage: u16) -> Option<u16> {
     }
 }
 
-/// Error when a wire `display_id` matches no active display.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownDisplay(pub u32);
-
-impl std::fmt::Display for UnknownDisplay {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no active display with id {}", self.0)
-    }
-}
-
-impl std::error::Error for UnknownDisplay {}
-
 impl InputInjection for MacInjector {
     fn move_cursor(&self, display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
         // Translate display-local logical pixels to a global CG point via full
         // display enumeration (audit M1), not just the main display.
-        let bounds = display_bounds(display_id)
-            .ok_or_else(|| -> PlatformError { Box::new(UnknownDisplay(display_id)) })?;
+        // The source addresses the target's primary display as id 0 (it can't know the
+        // target's real CG display ids), and an id can go stale across a display
+        // reconfigure — so fall back to the main display rather than erroring. Erroring
+        // here drops the motion AND trips `on_injection_failed`, which latches input off
+        // and makes a controlled peer flap (won't cross after the first cross).
+        let bounds = display_bounds(display_id).unwrap_or_else(main_display_bounds);
         let (gx, gy) = bounds.local_to_global(x, y);
         inject::move_cursor(gx, gy).map_err(boxed)
     }
