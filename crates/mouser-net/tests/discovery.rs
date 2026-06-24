@@ -24,6 +24,8 @@ async fn advertise_then_browse_finds_own_service_and_parses_txt() {
         // Populated from the resolved mDNS address records on the receive side; the
         // advertised value is not what's transmitted (the daemon owns A/AAAA records).
         addrs: Vec::new(),
+        dw: 0,
+        dh: 0,
     };
 
     let _advertiser = Advertiser::advertise_loopback(&advert).expect("advertise");
@@ -73,6 +75,8 @@ async fn browse_surfaces_departures_as_removed() {
         caps: String::new(),
         role: "ineligible".to_string(),
         addrs: Vec::new(),
+        dw: 0,
+        dh: 0,
     };
 
     let advertiser = Advertiser::advertise_loopback(&advert).expect("advertise");

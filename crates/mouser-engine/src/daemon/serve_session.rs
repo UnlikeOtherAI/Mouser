@@ -55,9 +55,15 @@ pub(super) async fn run_session(
     let peer_session_id = conn.peer_session_id();
     let core = if can_control {
         // The cross edge (which side the peer sits on) is a user setting, applied per
-        // session.
+        // session. The peer's display size comes from its advertisement so cursor motion
+        // maps across its whole screen (0/unknown → source_layout's 1920×1080 default).
         let edge = crate::core::Edge::from_setting(&context.store.load_settings().cross_edge);
-        EngineCore::new_source(my_id, peer, source_layout(edge))
+        let (peer_w, peer_h) = context
+            .registry
+            .find(&peer)
+            .map(|a| (i32::from(a.dw), i32::from(a.dh)))
+            .unwrap_or((0, 0));
+        EngineCore::new_source(my_id, peer, source_layout(edge, peer_w, peer_h))
     } else {
         EngineCore::new_target(my_id, peer)
     };

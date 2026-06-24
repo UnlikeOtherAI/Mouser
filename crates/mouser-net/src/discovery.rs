@@ -99,6 +99,10 @@ pub struct PeerAdvert {
     pub caps: String,
     /// `role`: coordinator-eligibility role string.
     pub role: String,
+    /// `dw`/`dh`: the peer's primary display size in logical pixels (`0` when unknown). A
+    /// source uses the controlled peer's size to map cursor motion across its whole screen.
+    pub dw: u16,
+    pub dh: u16,
     /// Resolved IP address(es) of the peer (from mDNS A/AAAA records, C2-6). A peer with
     /// no resolved address can't be dialed, so [`PeerAdvert::from_service_info`] returns
     /// `None` for one; the connect helpers pair these with `iport`/`bport` for a
@@ -125,6 +129,8 @@ impl PeerAdvert {
         txt.insert("bport".to_string(), self.bport.to_string());
         txt.insert("caps".to_string(), self.caps.clone());
         txt.insert("role".to_string(), self.role.clone());
+        txt.insert("dw".to_string(), self.dw.to_string());
+        txt.insert("dh".to_string(), self.dh.to_string());
         txt
     }
 
@@ -147,6 +153,8 @@ impl PeerAdvert {
             bport: get("bport").and_then(|s| s.parse().ok()).unwrap_or(0),
             caps: get("caps").unwrap_or_default(),
             role: get("role").unwrap_or_default(),
+            dw: get("dw").and_then(|s| s.parse().ok()).unwrap_or(0),
+            dh: get("dh").and_then(|s| s.parse().ok()).unwrap_or(0),
             addrs,
         })
     }

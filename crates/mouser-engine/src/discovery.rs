@@ -73,6 +73,9 @@ pub fn local_advert(identity: &DeviceIdentity, name: &str, iport: u16, bport: u1
         bport,
         caps: "keyboard,mouse,clipboard,files".to_string(),
         role: "eligible".to_string(),
+        // Filled by the caller from the local display size (0 = unknown).
+        dw: 0,
+        dh: 0,
         addrs: Vec::new(),
     }
 }

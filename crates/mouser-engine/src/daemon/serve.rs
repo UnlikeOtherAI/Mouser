@@ -90,7 +90,13 @@ pub(super) async fn serve(
     let host_ip = discovery::local_ipv4()
         .map(|ip| ip.to_string())
         .unwrap_or_default();
-    let advert = discovery::local_advert(&me, &hostname(), iport, bport);
+    let mut advert = discovery::local_advert(&me, &hostname(), iport, bport);
+    // Advertise our primary display size so a controlling peer can map cursor motion
+    // across our whole screen (instead of a hardcoded guess).
+    if let Some((dw, dh)) = super::local_display_size() {
+        advert.dw = u16::try_from(dw).unwrap_or(0);
+        advert.dh = u16::try_from(dh).unwrap_or(0);
+    }
     let mdns = Discovery::new().map_err(|e| e.to_string())?;
     mdns.advertise(&advert, &host_ip)
         .map_err(|e| e.to_string())?;
