@@ -38,16 +38,26 @@ fn new_daemon(loopback: bool) -> Result<ServiceDaemon, NetError> {
     // interface, and such a dead adapter — frequently holding the *lowest* route metric,
     // so the OS prefers it for multicast egress — silently swallows LAN discovery
     // (observed: a disconnected NIC pinned on 169.254.x made every LAN peer invisible).
-    // Drop those, but only while at least one routable IPv4 interface remains, so a host
-    // that is *only* on APIPA still tries rather than going dark.
+    // We also drop virtual / host-only adapters (VirtualBox, Hyper-V/WSL `vEthernet`,
+    // Docker): advertising their addresses leaks internal topology and makes a peer burn a
+    // dial timeout on each unroutable address before it finds the real LAN one. Both are
+    // pruned only while at least one real LAN interface remains, so a host that is *only*
+    // on APIPA/virtual still tries rather than going dark.
     let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
-    let has_routable = ifaces
-        .iter()
-        .any(|i| !i.is_loopback() && matches!(i.ip(), IpAddr::V4(v4) if !is_unusable_v4(v4)));
-    if has_routable {
+    let has_real_lan = ifaces.iter().any(|i| {
+        !i.is_loopback()
+            && !is_virtual_iface(&i.name, i.ip())
+            && matches!(i.ip(), IpAddr::V4(v4) if !is_unusable_v4(v4))
+    });
+    if has_real_lan {
         for iface in &ifaces {
             if iface.is_loopback() {
                 continue; // loopback is governed by the `loopback` flag below
+            }
+            // Virtual / host-only adapter (either family): drop its advertised address.
+            if is_virtual_iface(&iface.name, iface.ip()) {
+                let _ = daemon.disable_interface(IfKind::Addr(iface.ip()));
+                continue;
             }
             if let IpAddr::V4(v4) = iface.ip() {
                 if is_unusable_v4(v4) {
@@ -72,6 +82,24 @@ fn new_daemon(loopback: bool) -> Result<ServiceDaemon, NetError> {
 /// low-metric adapter from swallowing discovery on a multi-interface host.
 fn is_unusable_v4(addr: Ipv4Addr) -> bool {
     addr.is_link_local() || addr.is_unspecified() || addr.is_loopback()
+}
+
+/// Interface-name substrings (matched case-insensitively) that mark a virtual / host-only
+/// adapter — never a path to a real LAN peer. Hyper-V and WSL present as `vEthernet (...)`;
+/// VirtualBox / VMware / Docker carry their product name.
+const VIRTUAL_IFACE_MARKERS: [&str; 4] = ["vethernet", "virtualbox", "vmware", "docker"];
+
+/// Whether an interface is a virtual / host-only adapter we must NOT advertise. Publishing
+/// these (a) leaks internal topology to peers and (b) makes a dialing peer burn a timeout
+/// on each unroutable address before it finds the real LAN one. Matched by name marker, or
+/// — for an adapter renamed generically (e.g. Windows "Ethernet 3") that the markers miss —
+/// by VirtualBox's default host-only range `192.168.56.0/24`.
+fn is_virtual_iface(name: &str, ip: IpAddr) -> bool {
+    let lname = name.to_ascii_lowercase();
+    if VIRTUAL_IFACE_MARKERS.iter().any(|m| lname.contains(m)) {
+        return true;
+    }
+    matches!(ip, IpAddr::V4(v4) if v4.octets()[..3] == [192, 168, 56])
 }
 
 /// The Mouser DNS-SD service type (§4).
@@ -457,6 +485,39 @@ impl Drop for Browser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_and_host_only_interfaces_are_not_advertisable() {
+        // Hyper-V / WSL virtual switches present as `vEthernet (...)` (name marker).
+        assert!(is_virtual_iface(
+            "vEthernet (WSL (Hyper-V firewall))",
+            IpAddr::V4(Ipv4Addr::new(172, 17, 112, 1))
+        ));
+        assert!(is_virtual_iface(
+            "vEthernet (Default Switch)",
+            IpAddr::V4(Ipv4Addr::new(172, 22, 160, 1))
+        ));
+        // VirtualBox / VMware / Docker by product name (case-insensitive).
+        assert!(is_virtual_iface(
+            "VirtualBox Host-Only Ethernet Adapter",
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        ));
+        // A generically-renamed VirtualBox host-only adapter (Windows "Ethernet 3") is
+        // caught by the 192.168.56.0/24 range backstop the name match misses.
+        assert!(is_virtual_iface(
+            "Ethernet 3",
+            IpAddr::V4(Ipv4Addr::new(192, 168, 56, 1))
+        ));
+        // Real LAN interfaces stay advertisable.
+        assert!(!is_virtual_iface(
+            "Ethernet 2",
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 203))
+        ));
+        assert!(!is_virtual_iface(
+            "Wi-Fi",
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))
+        ));
+    }
 
     #[test]
     fn unusable_v4_excludes_apipa_and_specials() {
