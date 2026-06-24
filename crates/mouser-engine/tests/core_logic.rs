@@ -74,6 +74,39 @@ fn source_passes_through_until_edge_then_grants_to_peer() {
 }
 
 #[test]
+fn predictive_edge_cross_fires_when_clamped_just_inside_the_wall() {
+    // The macOS source "wouldn't let the cursor out": the OS clamps the on-screen cursor ~1px
+    // inside the display, so the absolute x never reaches width-1 (=99) even while the device
+    // keeps emitting motion into the wall. The predictive test (x + dx) must still cross,
+    // driven by the device delta — the OLD absolute test (x >= 99) would NOT fire here.
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    assert!(e.is_owner());
+
+    let a = e.on_local_input(cursor_rel(98, 40, 6, 0));
+    let transfer = has_control(&a, TYPE_OWNERSHIP_TRANSFER)
+        .expect("predictive cross fires from the device delta even though x is clamped inside");
+    let t: OwnershipTransfer = from_cbor(&transfer).expect("decode");
+    assert_eq!(t.to, PEER.to_vec());
+    assert_eq!(t.reason, TransferReason::EdgeCross);
+    assert!(!e.is_owner());
+    assert_eq!(e.owner(), PEER);
+}
+
+#[test]
+fn cursor_resting_clamped_inside_the_wall_does_not_cross() {
+    // The flip side: a cursor resting at the clamped edge (x=98, no device motion) must NOT
+    // cross — only motion whose predicted position reaches the bound does. Guards against a
+    // loop-cross while the cursor merely rests against the wall.
+    let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
+    let a = e.on_local_input(cursor_rel(98, 40, 0, 0));
+    assert!(
+        has_control(&a, TYPE_OWNERSHIP_TRANSFER).is_none(),
+        "resting one pixel inside the wall with no delta must not cross"
+    );
+    assert!(e.is_owner());
+}
+
+#[test]
 fn source_forwards_input_with_incrementing_counters_while_peer_owns() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40)); // cross → peer owns, counters reset
