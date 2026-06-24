@@ -132,8 +132,11 @@ fn capture_control_path_survives_poison() {
 }
 
 #[test]
-fn unknown_display_id_is_an_error() {
-    let inj = MacInjector::new();
-    let err = inj.move_cursor(u32::MAX, 0, 0).unwrap_err();
-    assert!(err.downcast_ref::<UnknownDisplay>().is_some());
+fn unknown_display_id_falls_back_to_main() {
+    // An unknown/0 display id has no bounds, so `move_cursor` falls back to the main
+    // display instead of erroring. Erroring would drop a controlled peer's motion AND
+    // trip `on_injection_failed`, which latches input off -> the controlled peer flaps
+    // and won't cross. (The source addresses the target's primary display as id 0.)
+    assert!(crate::display_info::display_bounds(u32::MAX).is_none());
+    assert!(crate::display_info::main_display_bounds().w > 0.0);
 }
