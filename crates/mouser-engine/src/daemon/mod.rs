@@ -220,7 +220,11 @@ fn local_display_size() -> Option<(i32, i32)> {
 
 #[cfg(target_os = "linux")]
 fn local_display_size() -> Option<(i32, i32)> {
-    None
+    platform_linux::active_display_bounds()
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|display| (display.width, display.height))
 }
 
 /// Best-effort host display name for the advertisement (advisory only, §4).
