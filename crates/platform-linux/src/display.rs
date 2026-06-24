@@ -212,12 +212,16 @@ pub(crate) fn global_point_to_event(displays: &[DisplayBounds], x: i32, y: i32) 
                 display_id: bounds.id,
                 x,
                 y,
+                dx: 0,
+                dy: 0,
             }
         }
         None => LocalInputEvent::CursorMoved {
             display_id: 0,
             x,
             y,
+            dx: 0,
+            dy: 0,
         },
     }
 }
@@ -301,7 +305,9 @@ mod tests {
             LocalInputEvent::CursorMoved {
                 display_id: 7,
                 x: 100,
-                y: 50
+                y: 50,
+                dx: 0,
+                dy: 0,
             }
         );
     }

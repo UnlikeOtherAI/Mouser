@@ -43,6 +43,20 @@ fn cursor(x: i32, y: i32) -> LocalInputEvent {
         display_id: 0,
         x,
         y,
+        dx: 0,
+        dy: 0,
+    }
+}
+
+/// Cursor event carrying a relative device delta (the engine drives a controlled peer from
+/// `dx`/`dy`, which keep flowing while the local cursor is parked at the edge).
+fn cursor_rel(x: i32, y: i32, dx: i32, dy: i32) -> LocalInputEvent {
+    LocalInputEvent::CursorMoved {
+        display_id: 0,
+        x,
+        y,
+        dx,
+        dy,
     }
 }
 
@@ -458,8 +472,9 @@ fn reclaim_by_crossing_back_drops_to_passive_edge() {
     e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
     assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
 
-    // Move the (suppressed) cursor back across the near edge → reclaim locally.
-    let a = e.on_local_input(cursor(98, 40));
+    // Move the (suppressed) cursor back across the near edge → reclaim locally. The peer
+    // cursor was seeded at the entry edge (peer_x == 0); a leftward delta crosses back.
+    let a = e.on_local_input(cursor_rel(98, 40, -1, 0));
     assert!(
         matches!(
             a.first(),

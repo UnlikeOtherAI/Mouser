@@ -299,11 +299,15 @@ impl MobileClient {
             display_id: 0,
             x: 0,
             y: center,
+            dx: 0,
+            dy: 0,
         });
         runtime.feed_local(LocalInputEvent::CursorMoved {
             display_id: 0,
             x: SEED_STEP,
             y: center,
+            dx: 0,
+            dy: 0,
         });
 
         *guard = Some(Session {
@@ -318,7 +322,10 @@ impl MobileClient {
     /// successive samples; the engine forwards their *motion* and the peer clamps the
     /// absolute result to its real display.
     pub fn send_pointer_moved(&self, display_id: u32, x: i32, y: i32) {
-        self.feed(LocalInputEvent::CursorMoved { display_id, x, y });
+        self.feed(LocalInputEvent::CursorMoved { display_id, x, y,
+    dx: 0,
+    dy: 0,
+});
     }
 
     /// Report a pointer button transition (`down` presses). Button index per §7.5

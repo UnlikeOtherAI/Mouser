@@ -150,7 +150,7 @@ pub fn flags_changed_event(keycode: CGKeyCode, state: &mut ModifierState) -> Opt
 /// hot-plug, or the far seam) falls back to the **main** display so motion still
 /// resolves to a real monitor instead of a bogus `display_id:0`.
 #[must_use]
-pub fn cursor_moved_for_global(gx: f64, gy: f64) -> LocalInputEvent {
+pub fn cursor_moved_for_global(gx: f64, gy: f64, dx: i32, dy: i32) -> LocalInputEvent {
     let bounds =
         display_for_global_point(gx, gy).or_else(|| active_display_bounds().into_iter().next());
     match bounds {
@@ -160,6 +160,8 @@ pub fn cursor_moved_for_global(gx: f64, gy: f64) -> LocalInputEvent {
                 display_id: b.id,
                 x: lx as i32,
                 y: ly as i32,
+                dx,
+                dy,
             }
         }
         // No active displays at all (headless): report the raw point on id 0.
@@ -167,6 +169,8 @@ pub fn cursor_moved_for_global(gx: f64, gy: f64) -> LocalInputEvent {
             display_id: 0,
             x: gx as i32,
             y: gy as i32,
+            dx,
+            dy,
         },
     }
 }
@@ -187,7 +191,11 @@ pub fn to_local_event(etype: CGEventType, event: &CGEvent) -> Option<LocalInputE
         | CGEventType::RightMouseDragged
         | CGEventType::OtherMouseDragged => {
             let p = event.location();
-            Some(cursor_moved_for_global(p.x, p.y))
+            // Relative device deltas (logical px) — valid even when the cursor is parked at
+            // a screen edge or suppressed, so a controlled peer's cursor can traverse fully.
+            let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32;
+            let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32;
+            Some(cursor_moved_for_global(p.x, p.y, dx, dy))
         }
         CGEventType::LeftMouseDown => Some(LocalInputEvent::Button {
             button: 0,
@@ -321,8 +329,11 @@ mod tests {
         // A point one quarter into the display, in GLOBAL coordinates.
         let gx = main.x + main.w / 4.0;
         let gy = main.y + main.h / 4.0;
-        let ev = cursor_moved_for_global(gx, gy);
-        let LocalInputEvent::CursorMoved { display_id, x, y } = ev else {
+        let ev = cursor_moved_for_global(gx, gy, 0, 0);
+        let LocalInputEvent::CursorMoved {
+            display_id, x, y, ..
+        } = ev
+        else {
             panic!("expected CursorMoved, got {ev:?}");
         };
         // Resolves to the main display (containing point), not a bogus 0...

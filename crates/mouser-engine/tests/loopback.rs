@@ -178,6 +178,8 @@ async fn source_drives_target_over_quic() {
         display_id: 0,
         x: 99,
         y: 40,
+        dx: 0,
+        dy: 0,
     });
     assert!(!source_rt.is_owner(), "source handed input to the target");
 
@@ -296,6 +298,8 @@ async fn source_capture_escalates_only_on_edge_cross() {
         display_id: 0,
         x: 50,
         y: 50,
+        dx: 0,
+        dy: 0,
     });
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert!(
@@ -309,6 +313,8 @@ async fn source_capture_escalates_only_on_edge_cross() {
         display_id: 0,
         x: 99,
         y: 40,
+        dx: 0,
+        dy: 0,
     });
     await_mode(&spy, CaptureMode::ActiveForward).await;
 
