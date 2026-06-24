@@ -42,6 +42,19 @@ fn cursor(x: i32, y: i32) -> LocalInputEvent {
     }
 }
 
+/// A cursor sample carrying an explicit device delta (`dx`,`dy`) — used by the predictive
+/// edge-crossing tests where the absolute position is clamped just inside the wall but the
+/// device keeps emitting motion into it.
+fn cursor_rel(x: i32, y: i32, dx: i32, dy: i32) -> LocalInputEvent {
+    LocalInputEvent::CursorMoved {
+        display_id: 0,
+        x,
+        y,
+        dx,
+        dy,
+    }
+}
+
 fn ownership_ack(epoch: u64, accepted: bool) -> Vec<u8> {
     to_cbor(&OwnershipAck {
         owner_epoch: epoch,
@@ -501,4 +514,81 @@ fn peer_heartbeat_prevents_reclaim() {
         e.on_control(mouser_protocol::TYPE_HEARTBEAT, &hb);
     }
     assert!(!e.is_owner(), "a live peer keeps ownership");
+}
+
+#[test]
+fn flood_never_drops_any_key_release() {
+    // Stress the stuck-key guarantee under a flood far exceeding the 240-token burst:
+    // 600 DISTINCT HID usages (so each down is a fresh Press, never an auto-Repeat), each
+    // a press+release pair, with a motion datagram interleaved before every key. Asserts —
+    // individually, inside the loop — that EVERY key-up injects regardless of bucket state.
+    // A single dropped release fails deterministically with the offending usage. Presses
+    // and motion may be shed once the bucket empties; only releases are guaranteed. This is
+    // the regression guard for "no stuck keys under load": it passes only with the
+    // transition-protection (motion exempt + transitions never shed) and would FAIL on a
+    // uniform-bucket implementation that charges and drops key-ups.
+    let mut t = EngineCore::new_target(ME, PEER);
+    let grant = to_cbor(&OwnershipTransfer {
+        to: ME.to_vec(),
+        owner_epoch: 1,
+        layout_rev: 0,
+        reason: TransferReason::EdgeCross,
+    })
+    .unwrap();
+    t.on_control(TYPE_OWNERSHIP_TRANSFER, &grant);
+
+    let mut presses_injected = 0usize;
+
+    for usage in 0x04u16..0x04 + 600 {
+        // Derive seq/ctr from `usage` (no manual loop counter): ctr stays strictly
+        // increasing for anti-replay, seq increments once per iteration.
+        let i = u64::from(usage - 0x04);
+
+        // Motion between every key pair must never spend the key/repeat bucket.
+        let _ = t.on_motion(Datagram::Motion(PointerMotion {
+            owner_epoch: 1,
+            seq: (i + 1) as u32,
+            display_id: 0,
+            x: 1,
+            y: 1,
+        }));
+
+        let down = to_cbor(&KeyEvent {
+            usage,
+            down: true,
+            mods: 0,
+            owner_epoch: 1,
+            ctr: i * 2 + 1,
+        })
+        .unwrap();
+        if t.on_control(TYPE_KEY_EVENT, &down)
+            .iter()
+            .any(|a| matches!(a, Action::Inject(Inject::Key { down: true, .. })))
+        {
+            presses_injected += 1;
+        }
+
+        let up = to_cbor(&KeyEvent {
+            usage,
+            down: false,
+            mods: 0,
+            owner_epoch: 1,
+            ctr: i * 2 + 2,
+        })
+        .unwrap();
+        assert_eq!(
+            t.on_control(TYPE_KEY_EVENT, &up),
+            vec![Action::Inject(Inject::Key {
+                usage,
+                down: false,
+                mods: 0,
+            })],
+            "key-up for usage {usage:#x} must ALWAYS inject, even far past the 240-token rate bucket"
+        );
+    }
+
+    assert!(
+        presses_injected <= 600,
+        "presses may be shed once the bucket empties — only releases are guaranteed"
+    );
 }
