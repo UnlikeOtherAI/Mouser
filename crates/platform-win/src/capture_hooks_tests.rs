@@ -135,14 +135,14 @@ fn both_ctrl_chord_is_exposed_as_emergency_reclaim() {
 #[test]
 fn captured_mouse_buttons_and_wheel_map_to_core_events() {
     assert_eq!(
-        mouse_event_from_parts(WM_LBUTTONDOWN, 0, 0, 0, 0),
+        mouse_event_from_parts(WM_LBUTTONDOWN, 0, 0),
         Some(LocalInputEvent::Button {
             button: 0,
             down: true,
         })
     );
     assert_eq!(
-        mouse_event_from_parts(WM_XBUTTONUP, 0, 0, u32::from(XBUTTON2) << 16, 0),
+        mouse_event_from_parts(WM_XBUTTONUP, u32::from(XBUTTON2) << 16, 0),
         Some(LocalInputEvent::Button {
             button: 4,
             down: false,
@@ -151,11 +151,11 @@ fn captured_mouse_buttons_and_wheel_map_to_core_events() {
 
     let negative_wheel = u32::from((-120_i16) as u16) << 16;
     assert_eq!(
-        mouse_event_from_parts(WM_MOUSEWHEEL, 0, 0, negative_wheel, 0),
+        mouse_event_from_parts(WM_MOUSEWHEEL, negative_wheel, 0),
         Some(LocalInputEvent::Scroll { dx: 0, dy: -120 })
     );
     assert_eq!(
-        mouse_event_from_parts(WM_MOUSEWHEEL, 0, 0, negative_wheel, LLMHF_INJECTED),
+        mouse_event_from_parts(WM_MOUSEWHEEL, negative_wheel, LLMHF_INJECTED),
         None
     );
 }

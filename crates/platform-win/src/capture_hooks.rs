@@ -183,9 +183,7 @@ pub(crate) unsafe extern "system" fn mouse_hook(
             LRESULT(1)
         };
     }
-    if let Some(event) =
-        mouse_event_from_parts(message, hook.pt.x, hook.pt.y, hook.mouseData, hook.flags)
-    {
+    if let Some(event) = mouse_event_from_parts(message, hook.mouseData, hook.flags) {
         enqueue_capture_event(event);
         return if emergency_passthrough_active() {
             call_next(code, wparam, lparam)
@@ -255,19 +253,17 @@ fn modifier_bit(usage: u16) -> Option<u16> {
     }
 }
 
-fn mouse_event_from_parts(
-    message: u32,
-    x: i32,
-    y: i32,
-    mouse_data: u32,
-    flags: u32,
-) -> Option<LocalInputEvent> {
+fn mouse_event_from_parts(message: u32, mouse_data: u32, flags: u32) -> Option<LocalInputEvent> {
     if flags & LLMHF_INJECTED != 0 {
         return None;
     }
 
+    // WM_MOUSEMOVE is deliberately absent: `mouse_hook` handles it earlier (enqueued as a
+    // coalescing CursorPoint and resolved on the worker thread). It must NOT be resolved
+    // here — `cursor_event_for_virtual_point` mutates LAST_CAPTURE_POINT, which is
+    // single-writer on the worker thread, so doing it on the hook thread would corrupt the
+    // delta baseline.
     match message {
-        WM_MOUSEMOVE => Some(cursor_event_for_virtual_point(x, y)),
         WM_LBUTTONDOWN => Some(LocalInputEvent::Button {
             button: 0,
             down: true,

@@ -247,6 +247,14 @@ impl MobileClient {
         if guard.is_some() {
             return Err(MobileError::AlreadyConnected);
         }
+        // Fresh session: the engine below is rebuilt with a zeroed peer cursor, so the
+        // delta accumulator must start clean too. Without this, the first pointer sample
+        // of a reconnect would diff against the *previous* session's last point, emitting
+        // a huge bogus delta that clamps to the edge and trips the back-cross reclaim.
+        *self
+            .last_pointer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
         let addr = resolve(&host, port)?;
         let identity = &self.identity;
@@ -298,6 +306,9 @@ impl MobileClient {
         // Hand ownership to the peer: x >= width-1 (==0) crosses immediately. Then nudge
         // the virtual peer cursor off the entry edge so a later leftward delta doesn't
         // trip the back-cross reclaim (`Edge::Right` reclaims at peer_x <= 0 && dx < 0).
+        // The engine drives the peer from `dx` once the peer owns input, so the nudge MUST
+        // carry `dx: SEED_STEP` — an absolute-only second event (dx:0) leaves peer_x at 0
+        // and the first leftward phone drag would instantly reclaim.
         let center = VIRTUAL_SPAN / 2;
         runtime.feed_local(LocalInputEvent::CursorMoved {
             display_id: 0,
@@ -310,7 +321,7 @@ impl MobileClient {
             display_id: 0,
             x: SEED_STEP,
             y: center,
-            dx: 0,
+            dx: SEED_STEP,
             dy: 0,
         });
 
@@ -335,7 +346,9 @@ impl MobileClient {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let delta = match *last {
-                Some((px, py)) => (x - px, y - py),
+                // saturating: x/y are untrusted FFI inputs; a pathological jump must clamp,
+                // not overflow-panic (debug) or wrap (release). The engine clamps again.
+                Some((px, py)) => (x.saturating_sub(px), y.saturating_sub(py)),
                 None => (0, 0),
             };
             *last = Some((x, y));
