@@ -52,6 +52,12 @@ platform-mac = { path = "../../../crates/platform-mac" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 platform-win = { path = "../../../crates/platform-win" }
+# Debug-only AppReveal in-app MCP server — Windows parity with the macOS Swift shim,
+# but a pure-Rust crate (no FFI). It is started only under `cfg(debug_assertions)` in
+# src/appreveal.rs, so a release build never runs it (the server also requires an
+# explicit start + a per-session token). Not published to crates.io → pinned git
+# dependency; the `tauri` feature derives window/device metadata from the AppHandle.
+appreveal-tauri = { git = "https://github.com/UnlikeOtherAI/AppReveal", tag = "v0.10.0", features = ["tauri"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 platform-linux = { path = "../../../crates/platform-linux" }

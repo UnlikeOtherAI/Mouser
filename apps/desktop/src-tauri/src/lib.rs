@@ -534,10 +534,11 @@ pub fn run() {
         .setup(|app| {
             install_tray(app)?;
             let _ = apply_tray_icon_visibility(app.handle(), true);
-            // Debug macOS builds only: start AppReveal, the in-app MCP server, so the
-            // live window + its WKWebView are inspectable over `_appreveal._tcp` (parity
-            // with the iOS/Android apps). No-op on release / non-macOS — see [`appreveal`].
-            appreveal::start();
+            // Debug builds only: start AppReveal, the in-app MCP server, so the live
+            // window + its webview are inspectable/drivable by an external agent —
+            // macOS via the Swift shim, Windows via the `appreveal-tauri` Rust crate
+            // (loopback + token). No-op on release / unsupported targets — see [`appreveal`].
+            appreveal::start(app.handle());
             // The app IS the engine: it runs the engine IN-PROCESS (no separate `mouserd`
             // child), so the user never starts a daemon by hand. `start` builds the host's
             // per-OS adapters, opens the daemon store, and spawns `run_engine` on the Tauri

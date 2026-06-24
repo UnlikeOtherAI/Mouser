@@ -54,6 +54,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "appreveal-tauri"
+version = "0.10.0"
+source = "git+https://github.com/UnlikeOtherAI/AppReveal?tag=v0.10.0#191cbec6a3a4fedc14636304ed00efd7122da5cf"
+dependencies = [
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "tauri",
+]
+
+[[package]]
 name = "askama"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2637,6 +2648,7 @@ dependencies = [
 name = "mouser-desktop"
 version = "0.0.0"
 dependencies = [
+ "appreveal-tauri",
  "mouser-core",
  "mouser-engine",
  "mouser-ipc",
