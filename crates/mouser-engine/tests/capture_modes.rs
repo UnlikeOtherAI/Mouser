@@ -297,6 +297,26 @@ fn left_edge_reclaim_must_move_inside_before_crossing_out_again() {
 }
 
 #[test]
+fn left_edge_local_opposite_edge_forces_reclaim() {
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 100, 100, 100, Edge::Left),
+    );
+    e.on_local_input(cursor_rel(1, 40, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    assert!(!e.is_owner());
+
+    let reclaim = e.on_local_input(cursor_rel(99, 40, 3, 0));
+    assert!(
+        has_set_mode(&reclaim, CaptureMode::PassiveEdge),
+        "pushing the visible Mac cursor to the far local edge is an escape hatch"
+    );
+    assert!(has_capture(&reclaim, CaptureDecision::PassThrough));
+    assert!(e.is_owner());
+}
+
+#[test]
 fn heartbeat_timeout_reclaim_drops_to_passive_edge() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40));

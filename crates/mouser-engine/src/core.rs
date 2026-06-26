@@ -269,6 +269,9 @@ impl EngineCore {
         // event. Relative motion keeps flowing even when our local cursor is parked at the
         // screen edge / suppressed — the old absolute-position delta (x - prev_x) froze at
         // the edge (dx == 0), pinning the peer cursor near the entry point.
+        if self.local_escape_back(x, y, dx, dy) {
+            return self.reclaim_local();
+        }
         // `saturating_add`: dx/dy originate at untrusted capture/FFI boundaries, so a
         // pathological delta must clamp rather than overflow-panic (debug) or wrap (release).
         self.peer_x = clamp(
@@ -337,6 +340,17 @@ impl EngineCore {
             Edge::Left => x > EDGE_REARM_MARGIN,
             Edge::Bottom => y < max_y.saturating_sub(EDGE_REARM_MARGIN),
             Edge::Top => y > EDGE_REARM_MARGIN,
+        }
+    }
+
+    fn local_escape_back(&self, x: i32, y: i32, dx: i32, dy: i32) -> bool {
+        let max_x = self.layout.width.saturating_sub(1).max(0);
+        let max_y = self.layout.height.saturating_sub(1).max(0);
+        match self.layout.edge {
+            Edge::Right => x <= EDGE_REARM_MARGIN && dx < 0,
+            Edge::Left => x >= max_x.saturating_sub(EDGE_REARM_MARGIN) && dx > 0,
+            Edge::Bottom => y <= EDGE_REARM_MARGIN && dy < 0,
+            Edge::Top => y >= max_y.saturating_sub(EDGE_REARM_MARGIN) && dy > 0,
         }
     }
 
