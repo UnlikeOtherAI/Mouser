@@ -304,28 +304,55 @@ fn left_edge_reclaim_must_move_inside_before_crossing_out_again() {
 }
 
 #[test]
-fn crossing_back_snaps_local_cursor_to_the_boundary_edge() {
-    // Returning from a left-edge peer must warp our own cursor to the local left edge (x=0),
-    // carrying the current y, so it re-enters at the shared boundary and tracks inward —
-    // rather than reappearing wherever it drifted to while we drove the peer.
+fn cross_seed_preserves_fractional_height_across_unequal_displays() {
+    // The 1440↔2160 case: crossing 97% down the Mac must seed ~97% down the 4K Windows
+    // screen, not raw-pixel y=1400 (which would be 65% down — a visible mid-screen jump).
     let mut e = EngineCore::new_source(
         ME,
         PEER,
         EdgeLayout::with_edge(2560, 1440, 3840, 2160, Edge::Left),
     );
+    // Cross the left edge at y=1400 (1400/1439 ≈ 97.3% down).
+    e.on_local_input(cursor_rel(1, 1400, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    // The seed is observable on the first forwarded motion after the ack (zero delta).
+    let m = motion_of(&e.on_local_input(cursor_rel(1, 1400, 0, 0))).expect("seed motion");
+    // 97.3% of 2159 ≈ 2101, NOT the raw 1400 (which is only 65% down the 4K peer).
+    assert!(
+        (2090..=2110).contains(&m.y),
+        "seed y {} must preserve the ~97% fraction on the taller peer, not carry raw px",
+        m.y
+    );
+    // Entry edge is the right edge of the peer (Left layout): x pinned to peer_width-1.
+    assert_eq!(m.x, 3839);
+}
+
+#[test]
+fn crossing_back_snaps_local_cursor_to_the_boundary_edge() {
+    // Returning from a left-edge peer must warp our own cursor to the local left edge (x=0) at
+    // the height matching the peer cursor's *fraction* — so it re-enters level with where it
+    // left the peer screen and tracks inward, not wherever our cursor drifted to.
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(2560, 1440, 3840, 2160, Edge::Left),
+    );
+    // Cross at y=700 (≈48.6% down a 1440-tall screen). The peer seed lands at the same
+    // fraction of 2160, and the cross-back maps it back — round-tripping to y≈700.
     e.on_local_input(cursor_rel(1, 700, -6, 0));
     e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
     assert!(!e.is_owner());
 
-    // Move into the peer (arms reclaim), then cross back at a drifted local position (1300).
+    // Move into the peer (arms reclaim), then cross back. Vertical drift in the local cursor
+    // (720) is ignored; the warp y comes from the peer fraction, not the drifted position.
     e.on_local_input(cursor_rel(1, 700, -40, 0));
     let reclaim = e.on_local_input(cursor_rel(1300, 720, 60, 0));
     assert!(has_set_mode(&reclaim, CaptureMode::PassiveEdge));
     assert!(e.is_owner());
     assert_eq!(
         warp_of(&reclaim),
-        Some((0, 720)),
-        "the local cursor snaps to the left boundary at the current y"
+        Some((0, 700)),
+        "the local cursor snaps to x=0 at the fraction-preserved height (round-trips to ~700)"
     );
 }
 

@@ -313,7 +313,7 @@ impl EngineCore {
             // pointer). Snap it back to the shared boundary so the return is continuous —
             // the cursor re-enters where the peer screen meets ours, then tracks inward —
             // instead of reappearing wherever it happened to drift to.
-            let warp = self.entry_edge_warp(x, y);
+            let warp = self.entry_edge_warp();
             let mut actions = self.reclaim_local();
             actions.push(warp);
             return actions;
@@ -379,18 +379,21 @@ impl EngineCore {
         }
     }
 
-    /// Warp our local cursor to the shared boundary on `layout.edge`, carrying the off-axis
-    /// position so the return lands where the pointer currently sits on the other axis. For a
-    /// left edge that is `x = 0` at the current `y`; the cursor then tracks inward (rightward)
-    /// onto our screen, the way crossing between two physical monitors feels.
-    fn entry_edge_warp(&self, x: i32, y: i32) -> Action {
+    /// Warp our local cursor to the shared boundary on `layout.edge`, placing the off-axis
+    /// position at the *same fraction* the peer cursor held — so the return lands level with
+    /// where it left the peer screen, then tracks inward. For a left edge that is `x = 0` at
+    /// the y matching `peer_y`'s fraction. Using the peer fraction (not the drifted local
+    /// position) keeps the crossing continuous across displays of different size.
+    fn entry_edge_warp(&self) -> Action {
         let max_x = self.layout.width.saturating_sub(1).max(0);
         let max_y = self.layout.height.saturating_sub(1).max(0);
+        let local_y = map_axis_fraction(self.peer_y, self.layout.peer_height, self.layout.height);
+        let local_x = map_axis_fraction(self.peer_x, self.layout.peer_width, self.layout.width);
         let (wx, wy) = match self.layout.edge {
-            Edge::Left => (0, clamp(y, 0, max_y)),
-            Edge::Right => (max_x, clamp(y, 0, max_y)),
-            Edge::Top => (clamp(x, 0, max_x), 0),
-            Edge::Bottom => (clamp(x, 0, max_x), max_y),
+            Edge::Left => (0, local_y),
+            Edge::Right => (max_x, local_y),
+            Edge::Top => (local_x, 0),
+            Edge::Bottom => (local_x, max_y),
         };
         Action::Inject(Inject::WarpCursor {
             display_id: 0,
@@ -457,27 +460,28 @@ impl EngineCore {
         self.input_auth.revoke_epoch();
         self.pending_ack = Some(PendingAck::new(epoch));
         // Seed the peer cursor at the entry edge: the crossing axis is pinned to the entry
-        // side, the other axis carries over the local position so the cursor appears where
-        // it left. (Horizontal edges cross on x → carry y; vertical edges cross on y →
-        // carry x.)
+        // side, the other axis carries over the local position *as a preserved fraction* so
+        // the cursor enters at the same relative height/width even when the displays differ
+        // in size. (Horizontal edges cross on x → carry y; vertical edges cross on y → carry
+        // x.) See `map_axis_fraction` — a raw-pixel carry jumps mid-screen across 1440↔2160.
         let max_x = self.layout.peer_width.saturating_sub(1).max(0);
         let max_y = self.layout.peer_height.saturating_sub(1).max(0);
         match self.layout.edge {
             Edge::Right => {
                 self.peer_x = 0;
-                self.peer_y = clamp(y, 0, max_y);
+                self.peer_y = map_axis_fraction(y, self.layout.height, self.layout.peer_height);
             }
             Edge::Left => {
                 self.peer_x = max_x;
-                self.peer_y = clamp(y, 0, max_y);
+                self.peer_y = map_axis_fraction(y, self.layout.height, self.layout.peer_height);
             }
             Edge::Bottom => {
                 self.peer_y = 0;
-                self.peer_x = clamp(x, 0, max_x);
+                self.peer_x = map_axis_fraction(x, self.layout.width, self.layout.peer_width);
             }
             Edge::Top => {
                 self.peer_y = max_y;
-                self.peer_x = clamp(x, 0, max_x);
+                self.peer_x = map_axis_fraction(x, self.layout.width, self.layout.peer_width);
             }
         }
         self.reclaim_armed = false;
@@ -593,4 +597,17 @@ fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
 
 fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
     v.max(lo).min(hi.max(lo))
+}
+
+/// Map a position on a source axis of length `src_len` to a destination axis of length
+/// `dst_len`, preserving the *fractional* position so `pos/(src_len-1) == result/(dst_len-1)`
+/// (the Mouse-Ether handoff rule). Without this, carrying a raw pixel across displays of
+/// different size warps the cursor: a crossing 97% down a 1440-tall screen would land at
+/// `y=1400` on a 2160-tall screen — only 65% down, a visible mid-screen jump. Done in i64 to
+/// avoid overflow on 4K-scale products; both endpoints map exactly (0→0, max→max).
+fn map_axis_fraction(pos: i32, src_len: i32, dst_len: i32) -> i32 {
+    let src_max = src_len.saturating_sub(1).max(1);
+    let dst_max = dst_len.saturating_sub(1).max(0);
+    let p = i64::from(pos.clamp(0, src_max));
+    ((p * i64::from(dst_max) + i64::from(src_max) / 2) / i64::from(src_max)) as i32
 }
