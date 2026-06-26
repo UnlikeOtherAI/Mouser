@@ -242,6 +242,61 @@ fn immediate_bounce_at_left_entry_edge_does_not_reclaim() {
 }
 
 #[test]
+fn left_edge_reclaim_must_move_inside_before_crossing_out_again() {
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 100, 100, 100, Edge::Left),
+    );
+    e.on_local_input(cursor_rel(1, 40, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    assert!(!e.is_owner());
+
+    let away = e.on_local_input(cursor_rel(1, 40, -10, 0));
+    assert_eq!(motion_of(&away).map(|m| m.x), Some(89));
+
+    let reclaim = e.on_local_input(cursor_rel(1, 40, 20, 0));
+    assert!(
+        has_set_mode(&reclaim, CaptureMode::PassiveEdge),
+        "returning across the Windows right edge reclaims Mac ownership"
+    );
+    assert!(e.is_owner());
+
+    let immediate_recross = e.on_local_input(cursor_rel(1, 40, -20, 0));
+    assert!(
+        has_control(&immediate_recross, TYPE_OWNERSHIP_TRANSFER).is_none(),
+        "a restored Mac cursor still at the left edge must not immediately hand off again"
+    );
+    assert!(has_capture(
+        &immediate_recross,
+        CaptureDecision::PassThrough
+    ));
+    assert!(e.is_owner());
+
+    let moved_inside = e.on_local_input(cursor_rel(12, 40, -200, 0));
+    assert!(
+        has_control(&moved_inside, TYPE_OWNERSHIP_TRANSFER).is_none(),
+        "the event that moves back inside may re-arm crossing, but must not also cross"
+    );
+    assert!(has_capture(&moved_inside, CaptureDecision::PassThrough));
+    assert!(e.is_owner());
+
+    let huge_delta_from_inside = e.on_local_input(cursor_rel(50, 40, -200, 0));
+    assert!(
+        has_control(&huge_delta_from_inside, TYPE_OWNERSHIP_TRANSFER).is_none(),
+        "a synthetic warp-sized delta from the middle of the Mac screen must not cross"
+    );
+    assert!(e.is_owner());
+
+    let recross = e.on_local_input(cursor_rel(1, 40, -20, 0));
+    assert!(
+        has_control(&recross, TYPE_OWNERSHIP_TRANSFER).is_some(),
+        "after the local cursor moves back inside the Mac screen, the left edge can cross again"
+    );
+    assert!(!e.is_owner());
+}
+
+#[test]
 fn heartbeat_timeout_reclaim_drops_to_passive_edge() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
     e.on_local_input(cursor(99, 40));

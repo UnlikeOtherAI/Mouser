@@ -34,6 +34,10 @@ use types::{HeldKeys, InputAuth, InputRate, PendingAck, ReplayGuard};
 /// Heartbeat misses before the source declares the peer gone and reclaims (spec §7;
 /// 1 s tick × 3 = 3 s timeout).
 const HEARTBEAT_MISS_LIMIT: u32 = 3;
+/// Distance from the source edge before a reclaimed local cursor may cross out again.
+/// This prevents a restore/warp at the shared edge from immediately handing ownership
+/// back to the peer before the user has re-entered the local screen.
+const EDGE_REARM_MARGIN: i32 = 8;
 
 /// The pure engine state machine.
 pub struct EngineCore {
@@ -61,6 +65,9 @@ pub struct EngineCore {
     /// the edge where we seeded it. This filters handoff artifacts such as local cursor
     /// parking/warping or first-sample bounce at the entry edge.
     reclaim_armed: bool,
+    /// After reclaiming local ownership, outbound crossing is disabled until the
+    /// local cursor has moved back inside this display.
+    cross_out_armed: bool,
     /// Ticks since the last heartbeat from the peer.
     misses: u32,
     /// Our outgoing heartbeat sequence.
@@ -99,6 +106,7 @@ impl EngineCore {
             peer_x: 0,
             peer_y: 0,
             reclaim_armed: true,
+            cross_out_armed: true,
             misses: 0,
             hb_seq: 0,
             suppress_blocked: false,
@@ -247,7 +255,12 @@ impl EngineCore {
             // edge (predictive — see `crosses_out`; the clamped absolute position alone never
             // reaches the wall). Don't cross if we already learned this session that we can't
             // suppress local input (would cross-and-reclaim in a loop while resting on the edge).
-            if !self.suppress_blocked && self.crosses_out(x, y, dx, dy) {
+            let was_cross_out_armed = self.cross_out_armed;
+            if !was_cross_out_armed && self.local_left_cross_edge(x, y) {
+                self.cross_out_armed = true;
+                return vec![Action::Capture(CaptureDecision::PassThrough)];
+            }
+            if was_cross_out_armed && !self.suppress_blocked && self.crosses_out(x, y, dx, dy) {
                 return self.cross_to_peer(x, y);
             }
             return vec![Action::Capture(CaptureDecision::PassThrough)];
@@ -302,11 +315,28 @@ impl EngineCore {
     /// grant-once / `suppress_blocked` guards in `on_cursor` handle an exactly-pinned cursor
     /// as before.)
     fn crosses_out(&self, x: i32, y: i32, dx: i32, dy: i32) -> bool {
+        let max_x = self.layout.width.saturating_sub(1).max(0);
+        let max_y = self.layout.height.saturating_sub(1).max(0);
         match self.layout.edge {
-            Edge::Right => x.saturating_add(dx) >= self.layout.width.saturating_sub(1),
-            Edge::Left => x.saturating_add(dx) <= 0,
-            Edge::Bottom => y.saturating_add(dy) >= self.layout.height.saturating_sub(1),
-            Edge::Top => y.saturating_add(dy) <= 0,
+            Edge::Right => {
+                x >= max_x.saturating_sub(EDGE_REARM_MARGIN) && x.saturating_add(dx) >= max_x
+            }
+            Edge::Left => x <= EDGE_REARM_MARGIN && x.saturating_add(dx) <= 0,
+            Edge::Bottom => {
+                y >= max_y.saturating_sub(EDGE_REARM_MARGIN) && y.saturating_add(dy) >= max_y
+            }
+            Edge::Top => y <= EDGE_REARM_MARGIN && y.saturating_add(dy) <= 0,
+        }
+    }
+
+    fn local_left_cross_edge(&self, x: i32, y: i32) -> bool {
+        let max_x = self.layout.width.saturating_sub(1).max(0);
+        let max_y = self.layout.height.saturating_sub(1).max(0);
+        match self.layout.edge {
+            Edge::Right => x < max_x.saturating_sub(EDGE_REARM_MARGIN),
+            Edge::Left => x > EDGE_REARM_MARGIN,
+            Edge::Bottom => y < max_y.saturating_sub(EDGE_REARM_MARGIN),
+            Edge::Top => y > EDGE_REARM_MARGIN,
         }
     }
 
@@ -394,6 +424,7 @@ impl EngineCore {
         self.input_auth.revoke_epoch();
         self.pending_ack = None;
         self.reclaim_armed = true;
+        self.cross_out_armed = false;
         let me = self.me();
         let transfer = encode(&OwnershipTransfer {
             to: me.to_vec(),

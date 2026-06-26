@@ -58,8 +58,14 @@ impl EngineCore {
                 if owner == self.me() {
                     self.input_auth.authorize_epoch(epoch);
                     self.input_rate = InputRate::full();
+                    if self.role == Role::Source {
+                        self.cross_out_armed = false;
+                    }
                 } else {
                     self.input_auth.revoke_epoch();
+                    if self.role == Role::Source {
+                        self.reclaim_armed = false;
+                    }
                 }
                 let ack = encode(&OwnershipAck {
                     owner_epoch: epoch,
