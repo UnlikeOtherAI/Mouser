@@ -95,6 +95,22 @@ fn combined_event_source() -> Option<CGEventSource> {
     })
 }
 
+/// Sentinel written into `kCGEventSourceUserData` on every event we inject, so our own
+/// capture tap can recognise and drop its synthetic input. This makes the inject→capture
+/// recapture loop (which posted moves on the source re-enter as bogus peer deltas) impossible
+/// **by construction**, rather than relying on the fragile "the source must only ever warp,
+/// never post" invariant. Value is ASCII "MOUSER"; any nonzero constant works as long as
+/// inject and capture agree. (Apple's per-event `kCGEventSourceUserData` field is settable and
+/// persists through `post`, so no `CGEventSourceSetUserData` binding is required.)
+pub(crate) const SYNTHETIC_EVENT_TAG: i64 = 0x4D_4F_55_53_45_52;
+
+/// Tag an event as ours and post it to the HID tap. All injection paths funnel through here so
+/// nothing we emit is ever mistaken for genuine local input by our capture filter.
+fn post_synthetic(ev: &CGEvent) {
+    ev.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SYNTHETIC_EVENT_TAG);
+    ev.post(CGEventTapLocation::HID);
+}
+
 /// Read the current global cursor position via Core Graphics.
 ///
 /// Uses `CGEventGetLocation(CGEventCreate(NULL))` — a NULL-source event carries
@@ -127,7 +143,7 @@ pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
     let moved =
         CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
             .map_err(|()| InjectError::EventCreate)?;
-    moved.post(CGEventTapLocation::HID);
+    post_synthetic(&moved);
     Ok(())
 }
 
@@ -155,7 +171,7 @@ pub fn move_cursor_rel(dx: i32, dy: i32) -> Result<(), InjectError> {
         .map_err(|()| InjectError::EventCreate)?;
     ev.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
     ev.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
-    ev.post(CGEventTapLocation::HID);
+    post_synthetic(&ev);
     Ok(())
 }
 
@@ -184,7 +200,7 @@ pub fn button(index: u8, down: bool) -> Result<(), InjectError> {
     let ev = CGEvent::new_mouse_event(source, ty, point, cg_button)
         .map_err(|()| InjectError::EventCreate)?;
     ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
-    ev.post(CGEventTapLocation::HID);
+    post_synthetic(&ev);
     Ok(())
 }
 
@@ -202,7 +218,7 @@ pub fn left_click(x: f64, y: f64) -> Result<(), InjectError> {
         events.push(ev);
     }
     for ev in events {
-        ev.post(CGEventTapLocation::HID);
+        post_synthetic(&ev);
     }
     Ok(())
 }
@@ -229,7 +245,7 @@ pub fn key_press(key: u16, down: bool, mods: u16, cmd_ctrl_swap: bool) -> Result
     if flags != CGEventFlags::CGEventFlagNull {
         ev.set_flags(flags);
     }
-    ev.post(CGEventTapLocation::HID);
+    post_synthetic(&ev);
     Ok(())
 }
 
@@ -248,7 +264,7 @@ pub fn scroll(dx: i32, dy: i32, pixel: bool) -> Result<(), InjectError> {
     let source = hid_event_source()?;
     let ev = CGEvent::new_scroll_event(source, unit, 2, dy, dx, 0)
         .map_err(|()| InjectError::EventCreate)?;
-    ev.post(CGEventTapLocation::HID);
+    post_synthetic(&ev);
     Ok(())
 }
 

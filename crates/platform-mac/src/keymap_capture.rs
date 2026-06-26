@@ -185,6 +185,16 @@ pub fn cursor_moved_for_global(gx: f64, gy: f64, dx: i32, dy: i32) -> LocalInput
 /// callback via [`flags_changed_event`] (see [`crate::adapter`]).
 #[must_use]
 pub fn to_local_event(etype: CGEventType, event: &CGEvent) -> Option<LocalInputEvent> {
+    // Drop our own injected events: they carry SYNTHETIC_EVENT_TAG in kCGEventSourceUserData.
+    // Modelling them as "not local input" (None) means they are never forwarded as a bogus
+    // peer delta nor mistaken for the user grabbing the mouse back, while the tap callback
+    // still passes them through so they take effect. Makes the inject→capture recapture loop
+    // impossible by construction, independent of any "the source only ever warps" discipline.
+    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+        == crate::inject::SYNTHETIC_EVENT_TAG
+    {
+        return None;
+    }
     match etype {
         CGEventType::MouseMoved
         | CGEventType::LeftMouseDragged
