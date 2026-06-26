@@ -22,6 +22,8 @@ Thumbs.db
 .idea
 .vscode/*
 !.vscode/extensions.json
+.claude/settings.local.json
+.claude/*.lock
 
 # Xcode / iOS (project is generated from project.yml via xcodegen)
 *.xcodeproj

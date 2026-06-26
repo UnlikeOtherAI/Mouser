@@ -3,7 +3,7 @@
 
 use mouser_core::platform::{CaptureMode, LocalInputEvent};
 use mouser_engine::core::{Action, CaptureDecision, EngineCore, Inject};
-use mouser_engine::EdgeLayout;
+use mouser_engine::{Edge, EdgeLayout};
 use mouser_protocol::{
     from_cbor, to_cbor, Datagram, KeyEvent, OwnershipAck, OwnershipTransfer, PointerButton,
     PointerMotion, TransferReason, TYPE_KEY_EVENT, TYPE_OWNERSHIP_ACK, TYPE_OWNERSHIP_TRANSFER,
@@ -64,6 +64,13 @@ fn ownership_ack(epoch: u64, accepted: bool) -> Vec<u8> {
     .unwrap_or_default()
 }
 
+fn motion_of(actions: &[Action]) -> Option<PointerMotion> {
+    actions.iter().find_map(|a| match a {
+        Action::SendMotion(m) => Some(*m),
+        _ => None,
+    })
+}
+
 #[test]
 fn source_passes_through_until_edge_then_grants_to_peer() {
     let mut e = EngineCore::new_source(ME, PEER, EdgeLayout::side_by_side(100, 100, 100, 100));
@@ -84,6 +91,50 @@ fn source_passes_through_until_edge_then_grants_to_peer() {
     assert!(has_capture(&a, CaptureDecision::Suppress));
     assert!(!e.is_owner());
     assert_eq!(e.owner(), PEER);
+}
+
+#[test]
+fn left_edge_source_target_handoff_injects_seed_at_peer_right_edge() {
+    let mut source = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 900, 1440, 900, Edge::Left),
+    );
+    let mut target = EngineCore::new_target(PEER, ME);
+
+    let wrong_edge = source.on_local_input(cursor_rel(98, 400, 6, 0));
+    assert!(
+        has_control(&wrong_edge, TYPE_OWNERSHIP_TRANSFER).is_none(),
+        "a left-edge layout must not hand off at the source right edge"
+    );
+    assert!(source.is_owner());
+
+    let handoff = source.on_local_input(cursor_rel(1, 400, -6, 0));
+    let transfer = has_control(&handoff, TYPE_OWNERSHIP_TRANSFER).expect("handoff transfer sent");
+    let decoded: OwnershipTransfer = from_cbor(&transfer).expect("decode transfer");
+    assert_eq!(decoded.to, PEER.to_vec());
+    assert_eq!(decoded.owner_epoch, 1);
+    assert_eq!(decoded.reason, TransferReason::EdgeCross);
+
+    let accepted = target.on_control(TYPE_OWNERSHIP_TRANSFER, &transfer);
+    let ack = has_control(&accepted, TYPE_OWNERSHIP_ACK).expect("target accepts handoff");
+    assert!(target.is_owner());
+    assert_eq!(target.epoch(), 1);
+
+    let seeded = source.on_control(TYPE_OWNERSHIP_ACK, &ack);
+    let motion = motion_of(&seeded).expect("ACK emits initial pointer seed");
+    assert_eq!(motion.x, 1439);
+    assert_eq!(motion.y, 400);
+    assert_eq!(motion.display_id, 0);
+
+    assert_eq!(
+        target.on_motion(Datagram::Motion(motion)),
+        vec![Action::Inject(Inject::MoveCursor {
+            display_id: 0,
+            x: 1439,
+            y: 400,
+        })]
+    );
 }
 
 #[test]

@@ -187,7 +187,15 @@ fn reclaim_by_crossing_back_drops_to_passive_edge() {
     e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
     assert_eq!(e.capture_mode(), CaptureMode::ActiveForward);
 
-    let a = e.on_local_input(cursor_rel(98, 40, -1, 0));
+    let a = e.on_local_input(cursor_rel(98, 40, 5, 0));
+    assert!(
+        !has_set_mode(&a, CaptureMode::PassiveEdge),
+        "moving into the peer arms reclaim but keeps forwarding"
+    );
+    assert!(has_capture(&a, CaptureDecision::Suppress));
+    assert!(!e.is_owner());
+
+    let a = e.on_local_input(cursor_rel(98, 40, -6, 0));
     assert!(
         matches!(
             a.first(),
@@ -197,6 +205,40 @@ fn reclaim_by_crossing_back_drops_to_passive_edge() {
     );
     assert!(e.is_owner());
     assert_eq!(e.capture_mode(), CaptureMode::PassiveEdge);
+}
+
+#[test]
+fn immediate_bounce_at_left_entry_edge_does_not_reclaim() {
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 100, 100, 100, Edge::Left),
+    );
+    e.on_local_input(cursor_rel(1, 40, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    assert!(!e.is_owner());
+
+    let bounced = e.on_local_input(cursor_rel(1, 40, 8, 0));
+    let m = motion_of(&bounced).expect("entry-edge bounce is forwarded, not reclaimed");
+    assert_eq!(m.x, 99);
+    assert!(
+        !has_set_mode(&bounced, CaptureMode::PassiveEdge),
+        "a delta back toward the source while still pinned at the entry edge is ignored"
+    );
+    assert!(has_capture(&bounced, CaptureDecision::Suppress));
+    assert!(!e.is_owner());
+
+    let away = e.on_local_input(cursor_rel(1, 40, -2, 0));
+    let m = motion_of(&away).expect("moving into the peer arms reclaim");
+    assert_eq!(m.x, 97);
+    assert!(!e.is_owner());
+
+    let reclaim = e.on_local_input(cursor_rel(1, 40, 3, 0));
+    assert!(
+        has_set_mode(&reclaim, CaptureMode::PassiveEdge),
+        "once the peer cursor left the entry edge, returning to it reclaims"
+    );
+    assert!(e.is_owner());
 }
 
 #[test]
@@ -272,6 +314,65 @@ fn bottom_edge_crosses_seeds_top_and_traverses_then_reclaims() {
     assert!(
         has_set_mode(&a, CaptureMode::PassiveEdge),
         "crossing back up reclaims to passive edge"
+    );
+    assert!(e.is_owner());
+}
+
+#[test]
+fn left_edge_crosses_seeds_right_and_traverses_then_reclaims() {
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 100, 100, 100, Edge::Left),
+    );
+    assert!(e.is_owner());
+    assert!(has_capture(
+        &e.on_local_input(cursor(40, 50)),
+        CaptureDecision::PassThrough
+    ));
+
+    let a = e.on_local_input(cursor_rel(1, 40, -6, 0));
+    assert!(
+        matches!(
+            a.first(),
+            Some(Action::SetCaptureMode(CaptureMode::ActiveForward))
+        ),
+        "left-edge crossing escalates to ActiveForward before suppressing/forwarding"
+    );
+    assert!(
+        has_control(&a, TYPE_OWNERSHIP_TRANSFER).is_some(),
+        "predictive cross fires at the left edge"
+    );
+    assert!(has_capture(&a, CaptureDecision::Suppress));
+    assert!(!e.is_owner());
+
+    let a = e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    let m = motion_of(&a).expect("ACK seeds peer motion");
+    assert_eq!(m.x, 99, "left-edge entry starts at peer right edge");
+    assert_eq!(m.y, 40);
+
+    let a = e.on_local_input(cursor_rel(1, 40, -10, 0));
+    let m = motion_of(&a).expect("motion forwarded while owning the peer");
+    assert_eq!(m.x, 89);
+    assert_eq!(m.y, 40);
+    assert!(has_capture(&a, CaptureDecision::Suppress));
+    assert!(!e.is_owner());
+
+    let a = e.on_local_input(cursor_rel(1, 40, 5, 0));
+    let m = motion_of(&a).expect("motion forwarded before returning to the edge");
+    assert_eq!(m.x, 94);
+    assert_eq!(m.y, 40);
+    assert!(
+        !has_set_mode(&a, CaptureMode::PassiveEdge),
+        "moving right before reaching the peer entry edge should not reclaim"
+    );
+    assert!(has_capture(&a, CaptureDecision::Suppress));
+    assert!(!e.is_owner());
+
+    let a = e.on_local_input(cursor_rel(1, 40, 10, 0));
+    assert!(
+        has_set_mode(&a, CaptureMode::PassiveEdge),
+        "crossing back right at the peer entry edge reclaims to passive edge"
     );
     assert!(e.is_owner());
 }

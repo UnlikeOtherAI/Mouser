@@ -33,6 +33,8 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const BUNDLE_ID: &str = "ai.unlikeother.mouser";
 /// How long to let an action settle before reading back the resulting snapshot.
 const SETTLE: Duration = Duration::from_millis(1200);
+/// How long to wait for a daemon-triggered snapshot rebuild.
+const SNAPSHOT_REFRESH: Duration = Duration::from_millis(800);
 /// Tail size for the engine log.
 const LOG_TAIL_BYTES: usize = 128 * 1024;
 
@@ -339,6 +341,7 @@ fn tool_specs() -> Value {
                 "type": "object",
                 "properties": {
                     "cross_at_edges": { "type": "boolean", "description": "Cross to an adjacent device at a shared edge" },
+                    "cross_edge": { "type": "string", "enum": ["left", "right", "top", "bottom"], "description": "Which edge reaches the peer; applies when the next source connection starts" },
                     "edge_behavior": { "type": "string", "enum": ["instant", "delayed", "locked"] },
                     "wrap_around": { "type": "boolean" },
                     "share_scroll": { "type": "boolean" },
@@ -351,8 +354,13 @@ fn tool_specs() -> Value {
                     "prefer_native_apple": { "type": "boolean" },
                     "require_approval": { "type": "boolean", "description": "Require SAS approval for new devices" },
                     "encrypted_only": { "type": "boolean" },
-                    "release_on_lock": { "type": "boolean" }
-                }
+                    "release_on_lock": { "type": "boolean" },
+                    "show_tray_icon": { "type": "boolean" },
+                    "launch_at_login": { "type": "boolean" },
+                    "theme": { "type": "string", "enum": ["system", "light", "dark"] },
+                    "auto_update": { "type": "boolean" }
+                },
+                "additionalProperties": false
             })
         }
     ])
@@ -379,7 +387,7 @@ async fn handle_tools_call(id: Value, request: &Value) -> Value {
 async fn run_tool(name: &str, args: &Value) -> Result<String, String> {
     match name {
         "snapshot" => snapshot_text().await,
-        "engine_log" => read_engine_log(),
+        "engine_log" => read_engine_log().await,
         "connect" => {
             let peer_id = arg_peer_id(args)?;
             send_then_snapshot(Command::Connect { peer_id }).await
@@ -445,11 +453,12 @@ async fn get_settings_text() -> Result<String, String> {
 /// Partial-update settings: read the current values, shallow-merge the provided
 /// fields, push the full result via `UpdateSettings`, and return the new settings.
 async fn set_settings(args: &Value) -> Result<String, String> {
+    let patch = validate_settings_patch(args)?;
     let mut client = Client::connect().await.map_err(daemon_err)?;
     let snapshot = client.fetch_snapshot().await.map_err(estr)?;
 
     let mut merged = serde_json::to_value(&snapshot.settings).map_err(estr)?;
-    if let (Some(obj), Some(patch)) = (merged.as_object_mut(), args.as_object()) {
+    if let Some(obj) = merged.as_object_mut() {
         for (key, value) in patch {
             obj.insert(key.clone(), value.clone());
         }
@@ -470,8 +479,83 @@ async fn set_settings(args: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(&snapshot.settings).map_err(estr)
 }
 
-/// Read the tail of the daemon log the desktop captures (the daemon's stderr).
-fn read_engine_log() -> Result<String, String> {
+fn validate_settings_patch(args: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    let Some(patch) = args.as_object() else {
+        return Err("settings update must be a JSON object".to_string());
+    };
+    for key in patch.keys() {
+        if !is_settings_key(key) {
+            return Err(format!("unknown setting {key:?}"));
+        }
+    }
+    validate_string_enum(patch, "edge_behavior", &["instant", "delayed", "locked"])?;
+    validate_string_enum(patch, "cross_edge", &["left", "right", "top", "bottom"])?;
+    validate_string_enum(
+        patch,
+        "clipboard_direction",
+        &["bidirectional", "send_only", "receive_only"],
+    )?;
+    validate_string_enum(patch, "theme", &["system", "light", "dark"])?;
+    Ok(patch)
+}
+
+fn is_settings_key(key: &str) -> bool {
+    matches!(
+        key,
+        "cross_at_edges"
+            | "edge_behavior"
+            | "cross_edge"
+            | "wrap_around"
+            | "share_scroll"
+            | "shared_clipboard"
+            | "clipboard_direction"
+            | "sync_text"
+            | "sync_images"
+            | "sync_files"
+            | "max_auto_sync_bytes"
+            | "prefer_native_apple"
+            | "require_approval"
+            | "encrypted_only"
+            | "release_on_lock"
+            | "show_tray_icon"
+            | "launch_at_login"
+            | "theme"
+            | "auto_update"
+    )
+}
+
+fn validate_string_enum(
+    patch: &serde_json::Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(value) = patch.get(key) {
+        let Some(edge) = value.as_str() else {
+            return Err(format!("invalid {key}: expected a string"));
+        };
+        if !allowed.contains(&edge) {
+            return Err(format!(
+                "invalid {key} {edge:?}; expected one of {}",
+                allowed.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read the live in-process engine diagnostics, falling back to the legacy log file.
+async fn read_engine_log() -> Result<String, String> {
+    if let Ok(mut client) = Client::connect().await {
+        if let Ok(snapshot) = refreshed_snapshot(&mut client).await {
+            if !snapshot.engine_log.trim().is_empty() {
+                return Ok(format!(
+                    "live engine diagnostics:\n\n{}",
+                    snapshot.engine_log
+                ));
+            }
+        }
+    }
+
     let Some(path) = engine_log_path() else {
         return Err("could not resolve the engine log directory on this OS".to_string());
     };
@@ -487,6 +571,24 @@ fn read_engine_log() -> Result<String, String> {
             path.display()
         )),
         Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Drain the on-connect snapshot, ask the daemon owner to rebuild live-derived fields,
+/// then read the refreshed snapshot. If the daemon predates `RefreshSnapshot`, return
+/// the on-connect snapshot so callers can still fall back gracefully.
+async fn refreshed_snapshot(client: &mut Client) -> Result<Snapshot, String> {
+    let initial = client.next_snapshot().await.map_err(estr)?;
+    if client
+        .send_command(&Command::RefreshSnapshot)
+        .await
+        .is_err()
+    {
+        return Ok(initial);
+    }
+    match tokio::time::timeout(SNAPSHOT_REFRESH, client.next_snapshot()).await {
+        Ok(Ok(snapshot)) => Ok(snapshot),
+        _ => Ok(initial),
     }
 }
 
@@ -559,4 +661,40 @@ fn estr<E: std::fmt::Display>(e: E) -> String {
 /// Friendlier message when the daemon socket isn't reachable.
 fn daemon_err<E: std::fmt::Display>(e: E) -> String {
     format!("mouserd is not reachable over IPC ({e}). Is the Mouser app (or `mouserd`) running?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_patch_accepts_valid_cross_edge() {
+        assert!(validate_settings_patch(&json!({ "cross_edge": "left" })).is_ok());
+        assert!(validate_settings_patch(&json!({ "cross_edge": "bottom" })).is_ok());
+    }
+
+    #[test]
+    fn settings_patch_rejects_invalid_cross_edge() {
+        let err = validate_settings_patch(&json!({ "cross_edge": "diagonal" }))
+            .expect_err("invalid edge rejected");
+        assert!(err.contains("invalid cross_edge"));
+    }
+
+    #[test]
+    fn settings_patch_rejects_unknown_keys() {
+        let err = validate_settings_patch(&json!({ "not_a_setting": true }))
+            .expect_err("unknown setting rejected");
+        assert!(err.contains("unknown setting"));
+    }
+
+    #[test]
+    fn settings_patch_accepts_general_settings() {
+        assert!(validate_settings_patch(&json!({
+            "show_tray_icon": true,
+            "launch_at_login": false,
+            "theme": "dark",
+            "auto_update": true
+        }))
+        .is_ok());
+    }
 }

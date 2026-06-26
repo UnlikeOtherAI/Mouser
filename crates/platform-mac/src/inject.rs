@@ -121,7 +121,7 @@ pub fn cursor_position() -> Option<CGPoint> {
 /// [`crate::adapter::MacInjector::move_cursor`] does (audit M1).
 pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
     let point = CGPoint::new(x, y);
-    CGDisplay::warp_mouse_cursor_position(point).map_err(InjectError::Warp)?;
+    warp_cursor(x, y)?;
 
     let source = hid_event_source()?;
     let moved =
@@ -129,6 +129,16 @@ pub fn move_cursor(x: f64, y: f64) -> Result<(), InjectError> {
             .map_err(|()| InjectError::EventCreate)?;
     moved.post(CGEventTapLocation::HID);
     Ok(())
+}
+
+/// Move the cursor to a global display point without posting a mouse-moved event.
+///
+/// Used only for local cursor parking/restoration during remote ownership. Posting a
+/// synthetic move there can be captured by Mouser itself and forwarded as a bogus peer
+/// delta, so the parking path must be warp-only.
+pub fn warp_cursor(x: f64, y: f64) -> Result<(), InjectError> {
+    let point = CGPoint::new(x, y);
+    CGDisplay::warp_mouse_cursor_position(point).map_err(InjectError::Warp)
 }
 
 /// Apply a **relative** cursor delta in points (spec §7.6 tag 0x02), used when

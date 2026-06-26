@@ -310,6 +310,7 @@ fn build_snapshot(shared: &Shared) -> Snapshot {
         pairing: lock(&shared.pairing).clone(),
         settings: lock(&shared.settings).clone(),
         diagnostics,
+        engine_log: crate::diagnostics::tail(16 * 1024),
     }
 }
 
@@ -410,6 +411,9 @@ async fn command_loop(
                 // reset did not take, rather than a false success — and it can be retried.
                 Err(e) => crate::diag!(info, "mouserd: reset failed, store left unchanged: {e}"),
             },
+            Some(Command::RefreshSnapshot) => {
+                publisher.publish(build_snapshot(&shared));
+            }
             // GetSnapshot is answered by the server; nothing reaches here.
             Some(Command::GetSnapshot) => {}
             None => return, // server dropped

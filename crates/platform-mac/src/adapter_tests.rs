@@ -132,6 +132,101 @@ fn capture_control_path_survives_poison() {
 }
 
 #[test]
+fn take_current_invalidates_in_flight_starts() {
+    let cap = MacCapture::new();
+    let before = lock_recover(&cap.inner).generation;
+    let _ = cap.take_current();
+    assert_ne!(
+        lock_recover(&cap.inner).generation,
+        before,
+        "detaching capture must invalidate stale start threads"
+    );
+}
+
+#[test]
+fn stale_passive_start_does_not_publish_over_newer_generation() {
+    let cap = MacCapture::new();
+    let sink: Arc<dyn InputSink> = Arc::new(RecordingSink::new(CaptureDecision::PassThrough));
+    let stale_generation = {
+        let mut g = lock_recover(&cap.inner);
+        let stale = bump_generation(&mut g);
+        bump_generation(&mut g);
+        stale
+    };
+
+    cap.start_passive_poll(sink, stale_generation)
+        .expect("stale passive start is ignored without failing");
+    let g = lock_recover(&cap.inner);
+    assert_eq!(g.mode, CaptureMode::Off);
+    assert!(
+        g.passive_stop.is_none() && g.passive_handle.is_none(),
+        "stale passive start must not publish worker state"
+    );
+}
+
+#[test]
+fn off_invalidates_pending_start() {
+    let cap = MacCapture::new();
+    let sink: Arc<dyn InputSink> = Arc::new(RecordingSink::new(CaptureDecision::PassThrough));
+    let pending_generation = {
+        let mut g = lock_recover(&cap.inner);
+        let generation = bump_generation(&mut g);
+        g.pending_mode = Some(CaptureMode::PassiveEdge);
+        generation
+    };
+
+    cap.set_mode(CaptureMode::Off, &sink)
+        .expect("off transition clears pending start");
+    let g = lock_recover(&cap.inner);
+    assert_ne!(
+        g.generation, pending_generation,
+        "Off must invalidate an in-flight start instead of treating Off as a no-op"
+    );
+    assert_eq!(g.mode, CaptureMode::Off);
+    assert_eq!(g.pending_mode, None);
+}
+
+#[test]
+fn start_failure_clears_matching_pending_mode() {
+    let cap = MacCapture::new();
+    let pending_generation = {
+        let mut g = lock_recover(&cap.inner);
+        let generation = bump_generation(&mut g);
+        g.pending_mode = Some(CaptureMode::ActiveForward);
+        g.mode = CaptureMode::Off;
+        g.can_suppress = true;
+        generation
+    };
+
+    clear_pending_start(&mut lock_recover(&cap.inner), pending_generation);
+    let g = lock_recover(&cap.inner);
+    assert_eq!(g.pending_mode, None);
+    assert_eq!(g.mode, CaptureMode::Off);
+    assert!(!g.can_suppress);
+}
+
+#[test]
+fn stop_detached_does_not_join_current_passive_thread() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker_stop = Arc::clone(&stop);
+
+    let handle = std::thread::spawn(move || {
+        let own_handle = handle_rx.recv().expect("own thread handle");
+        stop_detached(None, Some(worker_stop), Some(own_handle));
+        done_tx.send(()).expect("done signal");
+    });
+    handle_tx.send(handle).expect("send own handle");
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+        "current-thread stop must not block trying to join itself"
+    );
+    assert!(stop.load(Ordering::Acquire));
+}
+
+#[test]
 fn unknown_display_id_falls_back_to_main() {
     // An unknown/0 display id has no bounds, so `move_cursor` falls back to the main
     // display instead of erroring. Erroring would drop a controlled peer's motion AND

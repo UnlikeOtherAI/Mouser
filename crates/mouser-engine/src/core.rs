@@ -57,6 +57,10 @@ pub struct EngineCore {
     /// Virtual peer cursor while we own the peer (absolute, peer display space).
     peer_x: i32,
     peer_y: i32,
+    /// A back-cross can reclaim only after the peer cursor has first moved away from
+    /// the edge where we seeded it. This filters handoff artifacts such as local cursor
+    /// parking/warping or first-sample bounce at the entry edge.
+    reclaim_armed: bool,
     /// Ticks since the last heartbeat from the peer.
     misses: u32,
     /// Our outgoing heartbeat sequence.
@@ -94,6 +98,7 @@ impl EngineCore {
             pending_ack: None,
             peer_x: 0,
             peer_y: 0,
+            reclaim_armed: true,
             misses: 0,
             hb_seq: 0,
             suppress_blocked: false,
@@ -263,8 +268,13 @@ impl EngineCore {
             0,
             self.layout.peer_height.saturating_sub(1).max(0),
         );
-        // Crossing back: the peer cursor hit the near edge moving toward us.
-        if self.crosses_back(dx, dy) {
+        if !self.reclaim_armed && self.peer_left_entry_edge() {
+            self.reclaim_armed = true;
+        }
+        // Crossing back: the peer cursor hit the near edge moving toward us. The
+        // reclaim is disarmed immediately after handoff so a first-sample bounce at
+        // the seeded entry edge cannot instantly return ownership.
+        if self.reclaim_armed && self.crosses_back(dx, dy) {
             return self.reclaim_local();
         }
         let seq = self.next_seq();
@@ -311,6 +321,17 @@ impl EngineCore {
         }
     }
 
+    fn peer_left_entry_edge(&self) -> bool {
+        let max_x = self.layout.peer_width.saturating_sub(1).max(0);
+        let max_y = self.layout.peer_height.saturating_sub(1).max(0);
+        match self.layout.edge {
+            Edge::Right => self.peer_x > 0,
+            Edge::Left => self.peer_x < max_x,
+            Edge::Bottom => self.peer_y > 0,
+            Edge::Top => self.peer_y < max_y,
+        }
+    }
+
     fn cross_to_peer(&mut self, x: i32, y: i32) -> Vec<Action> {
         let Some(epoch) = self.ownership.grant_to(self.peer) else {
             return vec![Action::Capture(CaptureDecision::PassThrough)];
@@ -344,6 +365,7 @@ impl EngineCore {
                 self.peer_x = clamp(x, 0, max_x);
             }
         }
+        self.reclaim_armed = false;
         let transfer = encode(&OwnershipTransfer {
             to: self.peer.to_vec(),
             owner_epoch: epoch,
@@ -371,6 +393,7 @@ impl EngineCore {
         self.held_keys.clear();
         self.input_auth.revoke_epoch();
         self.pending_ack = None;
+        self.reclaim_armed = true;
         let me = self.me();
         let transfer = encode(&OwnershipTransfer {
             to: me.to_vec(),

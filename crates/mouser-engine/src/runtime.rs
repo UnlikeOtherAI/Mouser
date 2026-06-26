@@ -114,8 +114,13 @@ impl Shared {
                     }
                 }
                 Action::SetCursorVisible(visible) => {
-                    if let Err(e) = self.injector.set_cursor_visible(visible) {
-                        crate::diag!(warn, "mouserd: cursor visibility update failed: {e}");
+                    match self.injector.set_cursor_visible(visible) {
+                        Ok(()) => {
+                            crate::diag!(info, "mouserd: cursor visible={visible}");
+                        }
+                        Err(e) => {
+                            crate::diag!(warn, "mouserd: cursor visibility update failed: {e}");
+                        }
                     }
                 }
                 Action::Capture(d) => decision = Some(d),
@@ -389,7 +394,17 @@ impl RuntimeHandle {
                                     let actions = lock(&shared.core).on_suppress_unavailable();
                                     shared.dispatch(actions);
                                 }
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    let capture_diagnostics = shared.capture.diagnostics();
+                                    crate::diag!(
+                                        info,
+                                        "mouserd: capture set_mode({mode:?}) ok current={:?} can_suppress={}{}{}",
+                                        shared.capture.current_mode(),
+                                        shared.capture.can_suppress(),
+                                        if capture_diagnostics.is_empty() { "" } else { " " },
+                                        capture_diagnostics
+                                    );
+                                }
                                 Err(e) => {
                                     crate::diag!(warn, "mouserd: capture set_mode({mode:?}) failed: {e}");
                                     if mode == CaptureMode::ActiveForward {

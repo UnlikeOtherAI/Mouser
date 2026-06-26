@@ -7,8 +7,10 @@
 //!   missing so `can_suppress() == false` is honest.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -23,7 +25,11 @@ use mouser_core::platform::{
 
 pub use crate::injector::MacInjector;
 
-use crate::keymap_capture::{flags_changed_event, to_local_event, ModifierState};
+use crate::keymap_capture::{
+    cursor_moved_for_global, flags_changed_event, to_local_event, ModifierState,
+};
+
+const PASSIVE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 /// Lock a capture mutex on a **runtime** path without ever panicking (audit:
 /// capture panic discipline).
@@ -113,10 +119,17 @@ struct CaptureRun {
     /// The thread's run loop, so [`MacCapture::stop`] can stop it. `CFRunLoop`
     /// is `Send + Sync` (CoreFoundation run-loop fns are thread-safe).
     run_loop: Option<CFRunLoop>,
+    /// Stop flag and thread handle for passive cursor polling.
+    passive_stop: Option<Arc<AtomicBool>>,
+    passive_handle: Option<JoinHandle<()>>,
     /// Whether the installed tap can actually suppress (default tap created).
     can_suppress: bool,
     /// The capture mode the adapter is currently in.
     mode: CaptureMode,
+    /// A mode transition has claimed `generation` but has not published its OS
+    /// resources yet. This keeps `set_mode(Off)` from treating an in-flight start
+    /// as an idle Off no-op.
+    pending_mode: Option<CaptureMode>,
     /// Bumped each time a new tap thread is started. A run-loop thread only
     /// claims/clears the shared state if its captured generation is still current,
     /// so a superseded thread's teardown epilogue can never clobber the run loop a
@@ -149,8 +162,11 @@ impl MacCapture {
         Self {
             inner: Arc::new(Mutex::new(CaptureRun {
                 run_loop: None,
+                passive_stop: None,
+                passive_handle: None,
                 can_suppress: false,
                 mode: CaptureMode::Off,
+                pending_mode: None,
                 generation: 0,
             })),
         }
@@ -165,22 +181,17 @@ impl MacCapture {
         sink: Arc<dyn InputSink>,
         listen_only: bool,
         mode: CaptureMode,
+        my_gen: u64,
+        required: bool,
     ) -> PlatformResult<()> {
         let inner = Arc::clone(&self.inner);
-        // Claim a fresh generation. Any earlier run-loop thread now holds a stale
-        // generation and will neither claim nor clear the shared state.
-        let my_gen = {
-            let mut g = lock_recover(&inner);
-            g.generation = g.generation.wrapping_add(1);
-            g.generation
-        };
         let (tx, rx) = std::sync::mpsc::channel::<Result<bool, ()>>();
         // Shared mach-port ref so the callback can re-enable the tap if macOS disables it.
         // Published once below, after the tap exists.
         let reenable_port = Arc::new(AtomicUsize::new(0));
         let cb_port = Arc::clone(&reenable_port);
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("mouser-mac-capture".into())
             .spawn(move || {
                 let (tap, can_suppress) = if listen_only {
@@ -228,6 +239,10 @@ impl MacCapture {
                     let _ = tx.send(Err(()));
                     return;
                 };
+                if lock_recover(&inner).generation != my_gen {
+                    let _ = tx.send(Ok(can_suppress));
+                    return;
+                }
                 // Publish the port before enabling so a disable event delivered immediately
                 // after enable() is recoverable by the callback.
                 cb_port.store(
@@ -240,16 +255,23 @@ impl MacCapture {
                 run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
                 tap.enable();
 
-                {
+                let stale = {
                     let mut g = lock_recover(&inner);
                     // Only claim the shared state if a newer tap hasn't superseded us.
                     if g.generation == my_gen {
                         g.run_loop = Some(run_loop.clone());
                         g.can_suppress = can_suppress;
                         g.mode = mode;
+                        g.pending_mode = None;
+                        false
+                    } else {
+                        true
                     }
-                }
+                };
                 let _ = tx.send(Ok(can_suppress));
+                if stale {
+                    return;
+                }
 
                 // Blocks until `stop()` calls `CFRunLoop::stop`.
                 CFRunLoop::run_current();
@@ -262,13 +284,151 @@ impl MacCapture {
                     g.can_suppress = false;
                 }
                 drop(tap);
-            })
-            .map_err(|e| -> PlatformError { Box::new(e) })?;
+            });
+        if let Err(e) = spawn_result {
+            if required {
+                let mut g = lock_recover(&self.inner);
+                clear_pending_start(&mut g, my_gen);
+                return Err(Box::new(e) as PlatformError);
+            }
+            return Ok(());
+        }
 
         match rx.recv() {
             Ok(Ok(_)) => Ok(()),
-            _ => Err(Box::new(CaptureStartFailed)),
+            _ if required => {
+                let mut g = lock_recover(&self.inner);
+                if g.generation == my_gen {
+                    g.pending_mode = None;
+                    g.mode = CaptureMode::Off;
+                    g.can_suppress = false;
+                }
+                Err(Box::new(CaptureStartFailed))
+            }
+            _ => Ok(()),
         }
+    }
+
+    /// Passive edge sensing uses cursor polling plus an optional listen-only tap.
+    ///
+    /// Polling is the no-hook fallback and catches observable absolute cursor
+    /// changes. The listen-only tap, when macOS permits it, supplies true device
+    /// deltas while the pointer is clamped at an edge, so a continued push through
+    /// the left/right/top/bottom edge can still trigger the predictive crossing
+    /// logic.
+    fn start_passive_edge(&self, sink: Arc<dyn InputSink>, my_gen: u64) -> PlatformResult<()> {
+        self.start_passive_poll(Arc::clone(&sink), my_gen)?;
+        let _ = self.start_tap(sink, true, CaptureMode::PassiveEdge, my_gen, false);
+        Ok(())
+    }
+
+    fn start_passive_poll(&self, sink: Arc<dyn InputSink>, my_gen: u64) -> PlatformResult<()> {
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut g = lock_recover(&self.inner);
+            if g.generation != my_gen {
+                return Ok(());
+            }
+            g.passive_stop = Some(Arc::clone(&stop));
+        }
+        let worker_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("mouser-mac-passive-edge".into())
+            .spawn(move || passive_poll_thread(sink, worker_stop))
+            .map_err(|e| {
+                let mut g = lock_recover(&self.inner);
+                if g.generation == my_gen {
+                    g.passive_stop = None;
+                    g.passive_handle = None;
+                }
+                clear_pending_start(&mut g, my_gen);
+                Box::new(e) as PlatformError
+            })?;
+
+        let mut g = lock_recover(&self.inner);
+        if g.generation == my_gen {
+            g.passive_stop = Some(stop);
+            g.passive_handle = Some(handle);
+            g.can_suppress = false;
+            g.mode = CaptureMode::PassiveEdge;
+            g.pending_mode = None;
+            return Ok(());
+        }
+        drop(g);
+        stop_detached(None, Some(stop), Some(handle));
+        Ok(())
+    }
+
+    fn take_current(
+        &self,
+    ) -> (
+        Option<CFRunLoop>,
+        Option<Arc<AtomicBool>>,
+        Option<JoinHandle<()>>,
+    ) {
+        let mut g = lock_recover(&self.inner);
+        bump_generation(&mut g);
+        g.mode = CaptureMode::Off;
+        g.pending_mode = None;
+        g.can_suppress = false;
+        (
+            g.run_loop.take(),
+            g.passive_stop.take(),
+            g.passive_handle.take(),
+        )
+    }
+}
+
+fn bump_generation(g: &mut CaptureRun) -> u64 {
+    g.generation = g.generation.wrapping_add(1);
+    g.generation
+}
+
+fn clear_pending_start(g: &mut CaptureRun, generation: u64) {
+    if g.generation == generation {
+        g.pending_mode = None;
+        g.mode = CaptureMode::Off;
+        g.can_suppress = false;
+    }
+}
+
+fn stop_detached(
+    run_loop: Option<CFRunLoop>,
+    passive_stop: Option<Arc<AtomicBool>>,
+    passive_handle: Option<JoinHandle<()>>,
+) {
+    if let Some(rl) = run_loop {
+        rl.stop();
+    }
+    if let Some(stop) = passive_stop {
+        stop.store(true, Ordering::Release);
+    }
+    if let Some(handle) = passive_handle {
+        if handle.thread().id() == thread::current().id() {
+            return;
+        }
+        let _ = handle.join();
+    }
+}
+
+fn passive_poll_thread(sink: Arc<dyn InputSink>, stop: Arc<AtomicBool>) {
+    let mut last: Option<(f64, f64)> = None;
+    while !stop.load(Ordering::Acquire) {
+        if let Some(point) = crate::inject::cursor_position() {
+            let pos = (point.x, point.y);
+            if last != Some(pos) {
+                let (dx, dy) = match last {
+                    Some((px, py)) => {
+                        ((point.x - px).round() as i32, (point.y - py).round() as i32)
+                    }
+                    None => (0, 0),
+                };
+                last = Some(pos);
+                let event = cursor_moved_for_global(point.x, point.y, dx, dy);
+                let _ = catch_unwind(AssertUnwindSafe(|| sink.on_event(event)));
+            }
+        }
+        std::thread::sleep(PASSIVE_POLL_INTERVAL);
     }
 }
 
@@ -394,37 +554,46 @@ impl InputCapture for MacCapture {
         // (so a same-mode no-op and the stop bookkeeping can't interleave), then stop
         // the old run loop and start the new tap outside the lock. A mode change swaps
         // ListenOnly↔Default; on a start failure we are left stopped (mode Off).
-        let old_run_loop = {
+        let (old, my_gen) = {
             let mut g = lock_recover(&self.inner);
-            if g.mode == mode {
+            if g.mode == mode && g.pending_mode.is_none() {
                 return Ok(()); // already in the requested mode
             }
+            if g.pending_mode == Some(mode) {
+                return Ok(()); // already starting the requested mode
+            }
+            let my_gen = bump_generation(&mut g);
             g.mode = CaptureMode::Off;
+            g.pending_mode = if mode == CaptureMode::Off {
+                None
+            } else {
+                Some(mode)
+            };
             g.can_suppress = false;
-            g.run_loop.take()
+            (
+                (
+                    g.run_loop.take(),
+                    g.passive_stop.take(),
+                    g.passive_handle.take(),
+                ),
+                my_gen,
+            )
         };
-        if let Some(rl) = old_run_loop {
-            rl.stop();
-        }
+        stop_detached(old.0, old.1, old.2);
         match mode {
             CaptureMode::Off => Ok(()),
-            // PassiveEdge: a listen-only tap senses the edge without ever suppressing.
-            CaptureMode::PassiveEdge => self.start_tap(Arc::clone(sink), true, mode),
+            // PassiveEdge: poll plus optional listen-only tap for edge-clamped deltas.
+            CaptureMode::PassiveEdge => self.start_passive_edge(Arc::clone(sink), my_gen),
             // ActiveForward: a default (suppress-capable) tap while driving the peer.
-            CaptureMode::ActiveForward => self.start_tap(Arc::clone(sink), false, mode),
+            CaptureMode::ActiveForward => {
+                self.start_tap(Arc::clone(sink), false, mode, my_gen, true)
+            }
         }
     }
 
     fn stop(&self) -> PlatformResult<()> {
-        let run_loop = {
-            let mut g = lock_recover(&self.inner);
-            g.mode = CaptureMode::Off;
-            g.can_suppress = false;
-            g.run_loop.take()
-        };
-        if let Some(rl) = run_loop {
-            rl.stop();
-        }
+        let current = self.take_current();
+        stop_detached(current.0, current.1, current.2);
         Ok(())
     }
 
@@ -434,6 +603,17 @@ impl InputCapture for MacCapture {
 
     fn current_mode(&self) -> CaptureMode {
         lock_recover(&self.inner).mode
+    }
+
+    fn diagnostics(&self) -> String {
+        let g = lock_recover(&self.inner);
+        format!(
+            "mac_capture: pending={:?} passive_poll={} tap={} can_suppress={}",
+            g.pending_mode,
+            g.passive_handle.is_some(),
+            g.run_loop.is_some(),
+            g.can_suppress
+        )
     }
 }
 

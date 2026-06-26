@@ -15,6 +15,59 @@ fn display_bounds_clamp_local_coords() {
 }
 
 #[test]
+fn monitor_order_promotes_primary_to_display_zero() {
+    let mut monitors = vec![
+        MonitorRect {
+            rect: RECT {
+                left: -1920,
+                top: 0,
+                right: 0,
+                bottom: 1080,
+            },
+            primary: false,
+        },
+        MonitorRect {
+            rect: RECT {
+                left: 0,
+                top: -1200,
+                right: 1920,
+                bottom: 0,
+            },
+            primary: false,
+        },
+        MonitorRect {
+            rect: RECT {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+            primary: true,
+        },
+        MonitorRect {
+            rect: RECT {
+                left: 2560,
+                top: 0,
+                right: 4480,
+                bottom: 1080,
+            },
+            primary: false,
+        },
+    ];
+
+    order_monitors(&mut monitors);
+
+    let order: Vec<(bool, i32)> = monitors
+        .iter()
+        .map(|monitor| (monitor.primary, monitor.rect.left))
+        .collect();
+    assert_eq!(
+        order,
+        vec![(true, 0), (false, 0), (false, -1920), (false, 2560)]
+    );
+}
+
+#[test]
 fn button_indices_match_wire_catalog() {
     assert_eq!(button_of(0), Ok(Button::Left));
     assert_eq!(button_of(4), Ok(Button::Forward));

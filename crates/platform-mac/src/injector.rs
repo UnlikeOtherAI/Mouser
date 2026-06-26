@@ -5,8 +5,7 @@
 //! scroll unit conversion, Cmd/Ctrl preference handling, and balanced cursor
 //! visibility.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mouser_core::platform::{InputInjection, PlatformError, PlatformResult, ScrollUnit};
 
@@ -20,7 +19,13 @@ use crate::inject;
 #[derive(Debug, Clone)]
 pub struct MacInjector {
     cmd_ctrl_swap: bool,
-    cursor_visible: Arc<AtomicBool>,
+    cursor_visibility: Arc<Mutex<CursorVisibility>>,
+}
+
+#[derive(Debug, Default)]
+struct CursorVisibility {
+    hidden: bool,
+    saved_position: Option<(f64, f64)>,
 }
 
 impl Default for MacInjector {
@@ -35,7 +40,7 @@ impl MacInjector {
     pub fn new() -> Self {
         Self {
             cmd_ctrl_swap: false,
-            cursor_visible: Arc::new(AtomicBool::new(true)),
+            cursor_visibility: Arc::new(Mutex::new(CursorVisibility::default())),
         }
     }
 
@@ -44,13 +49,25 @@ impl MacInjector {
     pub fn with_cmd_ctrl_swap(cmd_ctrl_swap: bool) -> Self {
         Self {
             cmd_ctrl_swap,
-            cursor_visible: Arc::new(AtomicBool::new(true)),
+            cursor_visibility: Arc::new(Mutex::new(CursorVisibility::default())),
         }
     }
 }
 
 fn boxed(e: inject::InjectError) -> PlatformError {
     Box::new(e)
+}
+
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn park_point() -> (f64, f64) {
+    let bounds = main_display_bounds();
+    (
+        bounds.x + (bounds.w - 1.0).max(0.0),
+        bounds.y + (bounds.h - 1.0).max(0.0),
+    )
 }
 
 impl InputInjection for MacInjector {
@@ -87,15 +104,28 @@ impl InputInjection for MacInjector {
     }
 
     fn set_cursor_visible(&self, visible: bool) -> PlatformResult<()> {
-        let previous = self.cursor_visible.swap(visible, Ordering::AcqRel);
-        if previous == visible {
+        let mut state = lock_recover(&self.cursor_visibility);
+        if visible {
+            if !state.hidden {
+                return Ok(());
+            }
+            if let Some((x, y)) = state.saved_position {
+                let _ = inject::warp_cursor(x, y);
+            }
+            inject::set_cursor_visible(true).map_err(boxed)?;
+            state.hidden = false;
+            state.saved_position = None;
             return Ok(());
         }
-        if let Err(e) = inject::set_cursor_visible(visible) {
-            let _ = inject::set_cursor_visible(previous);
-            self.cursor_visible.store(previous, Ordering::Release);
-            return Err(boxed(e));
+
+        if state.hidden {
+            return Ok(());
         }
+        state.saved_position = inject::cursor_position().map(|p| (p.x, p.y));
+        inject::set_cursor_visible(false).map_err(boxed)?;
+        let (x, y) = park_point();
+        let _ = inject::warp_cursor(x, y);
+        state.hidden = true;
         Ok(())
     }
 }

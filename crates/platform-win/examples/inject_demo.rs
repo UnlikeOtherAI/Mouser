@@ -9,10 +9,10 @@
 //!
 //! ACCEPTANCE TEST (run on a Windows box — see `docs/windows-build.md`):
 //!   1. Open Notepad and click into it so it has focus.
-//!   2. `cargo run -p platform-win --example inject_demo`
+//!   2. `cargo run -p platform-win --example win_inject_demo`
 //!   3. Expect the cursor to trace a square AND "hi" to appear in Notepad.
 //!
-//! Run: `cargo run -p platform-win --example inject_demo`
+//! Run: `cargo run -p platform-win --example win_inject_demo`
 
 #[cfg(target_os = "windows")]
 fn main() {
@@ -97,5 +97,5 @@ fn main() {
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
-    eprintln!("inject_demo is Windows-only; nothing to do on this host.");
+    eprintln!("win_inject_demo is Windows-only; nothing to do on this host.");
 }

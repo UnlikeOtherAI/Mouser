@@ -41,8 +41,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    GetCursorPos, GetSystemMetrics, SetCursorPos, ShowCursor, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
 
 use crate::keymap::hid_usage_to_scancode;
@@ -230,6 +230,24 @@ pub fn set_cursor_pos(x: i32, y: i32) -> Result<(), InjectError> {
     // out-pointer or buffer; it is sound for any value (the OS clamps to the
     // virtual desktop).
     unsafe { SetCursorPos(x, y) }.map_err(InjectError::Win32)
+}
+
+/// Reassert that this process wants the Windows cursor visible.
+///
+/// Some remote-control stacks show a client-side cursor in the remote viewer while the
+/// physical console cursor is still hidden. `ShowCursor(TRUE)` is not a persistent
+/// system cursor mutation like `SetSystemCursor`; it only adjusts the caller's display
+/// counter. Callers must therefore invoke this sparingly and only when the target is
+/// supposed to own visible input.
+pub fn force_cursor_visible() {
+    // SAFETY: `ShowCursor` takes a boolean and returns the resulting display counter.
+    // Stop as soon as the counter reaches the visible range. The bound prevents a bad
+    // inherited hidden counter from causing an unbounded loop.
+    for _ in 0..8 {
+        if unsafe { ShowCursor(true) } >= 0 {
+            break;
+        }
+    }
 }
 
 /// Move the cursor by a relative delta in physical pixels.

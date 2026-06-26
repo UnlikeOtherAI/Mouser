@@ -38,3 +38,7 @@ windows = { version = "0.62", features = [
 [[example]]
 name = "win_inject_demo"
 path = "examples/inject_demo.rs"
+
+[[example]]
+name = "win_injector_display_demo"
+path = "examples/injector_display_demo.rs"

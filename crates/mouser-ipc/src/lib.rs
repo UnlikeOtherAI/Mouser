@@ -62,6 +62,7 @@ mod loopback_tests {
             pairing: None,
             settings: SettingsDto::default(),
             diagnostics: Vec::new(),
+            engine_log: String::new(),
         }
     }
 
@@ -172,5 +173,32 @@ mod loopback_tests {
             .expect("snapshot decode");
 
         assert_eq!(received, updated);
+    }
+
+    /// Snapshot refresh requests are forwarded to the daemon owner, not answered from
+    /// the server's cached watch value.
+    #[tokio::test]
+    async fn refresh_snapshot_command_is_forwarded_to_daemon() {
+        let socket = temp_socket_path("refresh");
+        let mut server = Server::bind_at(&socket, sample_snapshot())
+            .await
+            .expect("bind server");
+        let mut client = Client::connect_at(&socket).await.expect("connect client");
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.next_snapshot())
+            .await
+            .expect("initial snapshot")
+            .expect("initial decode");
+
+        client
+            .send_command(&Command::RefreshSnapshot)
+            .await
+            .expect("send refresh");
+        let command = tokio::time::timeout(Duration::from_secs(2), server.recv_command())
+            .await
+            .expect("refresh command did not arrive in time")
+            .expect("server still receiving");
+
+        assert_eq!(command, Command::RefreshSnapshot);
     }
 }

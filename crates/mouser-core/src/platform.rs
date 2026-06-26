@@ -233,6 +233,14 @@ pub trait InputCapture: Send + Sync {
     /// the engine/tests to assert that idle/connected operation never escalates to
     /// [`CaptureMode::ActiveForward`].
     fn current_mode(&self) -> CaptureMode;
+
+    /// Optional adapter-specific capture diagnostics for live troubleshooting.
+    ///
+    /// Implementations should keep this short and side-effect-free; the engine includes
+    /// non-empty values in capture transition logs.
+    fn diagnostics(&self) -> String {
+        String::new()
+    }
 }
 
 /// Read and write the system clipboard (spec §7.7).

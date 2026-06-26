@@ -4,6 +4,7 @@
 //! from the capture module so the historical `adapter::WinCapture` path remains
 //! available while capture stays in its own focused source file.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use mouser_core::platform::{
@@ -32,6 +33,9 @@ pub struct WinInjector {
     /// or `None` when the cursor is shown. `None` is the "visible" state, so a fresh
     /// (or double-shown) injector starts visible.
     saved_cursor: Mutex<Option<(i32, i32)>>,
+    /// Whether this visible ownership period has already asserted the Win32 cursor
+    /// display counter. Reset when ownership leaves this Windows machine.
+    cursor_show_asserted: AtomicBool,
 }
 
 impl WinInjector {
@@ -39,6 +43,12 @@ impl WinInjector {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn assert_cursor_visible_once(&self) {
+        if !self.cursor_show_asserted.swap(true, Ordering::AcqRel) {
+            inject::force_cursor_visible();
+        }
     }
 }
 
@@ -130,26 +140,53 @@ impl DisplayBounds {
     }
 }
 
-/// Enumerate active monitors in deterministic top-left order.
+/// Bounds plus primary-display metadata from Windows monitor enumeration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MonitorRect {
+    rect: RECT,
+    primary: bool,
+}
+
+impl MonitorRect {
+    fn sort_key(self) -> (bool, i32, i32, i32, i32) {
+        (
+            !self.primary,
+            self.rect.top,
+            self.rect.left,
+            self.rect.right,
+            self.rect.bottom,
+        )
+    }
+}
+
+fn order_monitors(monitors: &mut [MonitorRect]) {
+    monitors.sort_by_key(|m| m.sort_key());
+}
+
+/// Enumerate active monitors with the Windows primary display as id 0.
+///
+/// The wire protocol currently sends target pointer motion with `display_id = 0`;
+/// on Windows that must mean the user's primary display, not whichever monitor is
+/// top-left in the virtual desktop.
 pub fn active_display_bounds() -> PlatformResult<Vec<DisplayBounds>> {
-    let mut rects: Vec<RECT> = Vec::new();
+    let mut monitors: Vec<MonitorRect> = Vec::new();
     let ok = unsafe {
         EnumDisplayMonitors(
             None,
             None,
             Some(enum_monitor),
-            LPARAM((&mut rects as *mut Vec<RECT>) as isize),
+            LPARAM((&mut monitors as *mut Vec<MonitorRect>) as isize),
         )
     };
     if !ok.as_bool() {
         return Err(Box::new(windows::core::Error::from_thread()));
     }
 
-    rects.sort_by_key(|r| (r.top, r.left, r.right, r.bottom));
-    let mut displays = Vec::with_capacity(rects.len());
-    for rect in rects {
+    order_monitors(&mut monitors);
+    let mut displays = Vec::with_capacity(monitors.len());
+    for monitor in monitors {
         let id = displays.len() as u32;
-        if let Some(bounds) = DisplayBounds::from_rect(id, rect) {
+        if let Some(bounds) = DisplayBounds::from_rect(id, monitor.rect) {
             displays.push(bounds);
         }
     }
@@ -170,13 +207,18 @@ unsafe extern "system" fn enum_monitor(
     _rect: *mut RECT,
     data: LPARAM,
 ) -> windows::core::BOOL {
-    let rects = unsafe { &mut *(data.0 as *mut Vec<RECT>) };
+    const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
+
+    let monitors = unsafe { &mut *(data.0 as *mut Vec<MonitorRect>) };
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        rects.push(info.rcMonitor);
+        monitors.push(MonitorRect {
+            rect: info.rcMonitor,
+            primary: (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+        });
     }
     true.into()
 }
@@ -242,12 +284,14 @@ fn modifier_usages(mods: u16) -> Vec<u16> {
 
 impl InputInjection for WinInjector {
     fn move_cursor(&self, display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
+        self.assert_cursor_visible_once();
         let bounds = display_bounds(display_id)?;
         let (vx, vy) = bounds.local_to_virtual(x, y);
         inject::move_cursor(vx, vy).map_err(boxed)
     }
 
     fn move_cursor_relative(&self, dx: i32, dy: i32) -> PlatformResult<()> {
+        self.assert_cursor_visible_once();
         inject::move_cursor_relative(dx, dy).map_err(boxed)
     }
 
@@ -297,6 +341,10 @@ impl InputInjection for WinInjector {
     /// Idempotent: a double-hide keeps the *original* saved position (it does not
     /// re-save the parked corner), and a double-show is a no-op.
     fn set_cursor_visible(&self, visible: bool) -> PlatformResult<()> {
+        if visible {
+            self.assert_cursor_visible_once();
+        }
+
         // Read the live position *before* taking the lock decision only when hiding;
         // `next_cursor_state` ignores `live_pos` on every other branch, so an error
         // reading it there must not fail the call.
@@ -329,6 +377,9 @@ impl InputInjection for WinInjector {
         // leaves us in the (truthful) visible state rather than claiming a save we
         // never parked.
         *saved = next;
+        if !visible {
+            self.cursor_show_asserted.store(false, Ordering::Release);
+        }
         Ok(())
     }
 }

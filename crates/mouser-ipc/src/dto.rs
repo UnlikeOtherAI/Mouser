@@ -116,6 +116,9 @@ pub struct Snapshot {
     /// with an optional one-click fix, instead of a silent "no devices found".
     #[serde(default)]
     pub diagnostics: Vec<HealthItemDto>,
+    /// Bounded tail of the in-process engine diagnostics log. Empty when unavailable.
+    #[serde(default)]
+    pub engine_log: String,
 }
 
 /// Severity of a [`HealthItemDto`].
@@ -354,6 +357,11 @@ pub enum Command {
     /// settings (the device's own identity seed is kept). The engine wipes the on-disk
     /// store and republishes a fresh snapshot so the UI + MCP reflect the cleared state.
     ResetData,
+    /// Ask the daemon bridge to rebuild and publish a new [`Snapshot`] from live state.
+    /// Unlike [`Command::GetSnapshot`], this is handled by the daemon owner of the
+    /// snapshot data, so derived fields such as the in-process diagnostics log are
+    /// refreshed before clients read them.
+    RefreshSnapshot,
     /// Ask the daemon to reply with the current [`Snapshot`] immediately.
     GetSnapshot,
 }
