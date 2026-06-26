@@ -59,6 +59,15 @@ impl InputInjection for MacInjector {
         inject::move_cursor_rel(dx, dy).map_err(boxed)
     }
 
+    fn warp_cursor(&self, display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
+        // Warp-only (no posted MouseMoved): a synthetic move during the cross-back handoff
+        // is recaptured by our own tap and forwarded as a bogus peer delta, flip-flopping
+        // ownership at the edge. `inject::move_cursor` posts an event; this must not.
+        let bounds = display_bounds(display_id).unwrap_or_else(main_display_bounds);
+        let (gx, gy) = bounds.local_to_global(x, y);
+        inject::warp_cursor(gx, gy).map_err(boxed)
+    }
+
     fn button(&self, button: u8, down: bool) -> PlatformResult<()> {
         inject::button(button, down).map_err(boxed)
     }

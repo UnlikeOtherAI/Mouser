@@ -392,7 +392,7 @@ impl EngineCore {
             Edge::Top => (clamp(x, 0, max_x), 0),
             Edge::Bottom => (clamp(x, 0, max_x), max_y),
         };
-        Action::Inject(Inject::MoveCursor {
+        Action::Inject(Inject::WarpCursor {
             display_id: 0,
             x: wx,
             y: wy,

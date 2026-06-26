@@ -80,7 +80,7 @@ fn motion_of(actions: &[Action]) -> Option<PointerMotion> {
 
 fn warp_of(actions: &[Action]) -> Option<(i32, i32)> {
     actions.iter().find_map(|a| match a {
-        Action::Inject(Inject::MoveCursor { x, y, .. }) => Some((*x, *y)),
+        Action::Inject(Inject::WarpCursor { x, y, .. }) => Some((*x, *y)),
         _ => None,
     })
 }

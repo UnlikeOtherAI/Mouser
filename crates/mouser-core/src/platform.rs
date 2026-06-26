@@ -87,6 +87,17 @@ pub trait InputInjection: Send + Sync {
     /// only when the foreground app has grabbed pointer-lock.
     fn move_cursor_relative(&self, dx: i32, dy: i32) -> PlatformResult<()>;
 
+    /// Reposition our **own** cursor without emitting a synthetic motion event.
+    ///
+    /// Used to snap the local pointer to the shared edge on a cross-back. It must be
+    /// event-free: a posted move during an ownership handoff is recaptured and forwarded
+    /// as a bogus peer delta, which flip-flops ownership at the boundary. The default
+    /// delegates to [`Self::move_cursor`] for platforms whose move is already warp-only
+    /// (e.g. Windows `SetCursorPos`); adapters whose move posts an event (macOS) override.
+    fn warp_cursor(&self, display_id: u32, x: i32, y: i32) -> PlatformResult<()> {
+        self.move_cursor(display_id, x, y)
+    }
+
     /// Press or release a pointer button (`down = true` presses). Button index §7.5.
     fn button(&self, button: u8, down: bool) -> PlatformResult<()>;
 

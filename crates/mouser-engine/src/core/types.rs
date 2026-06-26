@@ -87,6 +87,12 @@ pub enum Inject {
         x: i32,
         y: i32,
     },
+    /// Reposition our own cursor without a synthetic motion event (cross-back edge snap).
+    WarpCursor {
+        display_id: u32,
+        x: i32,
+        y: i32,
+    },
     Button {
         button: u8,
         down: bool,

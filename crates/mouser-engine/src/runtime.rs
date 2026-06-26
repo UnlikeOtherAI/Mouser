@@ -189,6 +189,7 @@ fn apply_inject(
 ) -> mouser_core::platform::PlatformResult<()> {
     match inject {
         Inject::MoveCursor { display_id, x, y } => injector.move_cursor(display_id, x, y),
+        Inject::WarpCursor { display_id, x, y } => injector.warp_cursor(display_id, x, y),
         Inject::Button { button, down } => injector.button(button, down),
         Inject::Key { usage, down, mods } => injector.key(usage, down, mods),
         Inject::Scroll { dx, dy, unit } => injector.scroll(dx, dy, unit),
