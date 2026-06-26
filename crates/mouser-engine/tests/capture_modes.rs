@@ -1,7 +1,7 @@
 //! Capture-mode and cursor-visibility lifecycle tests.
 
 use mouser_core::platform::{CaptureMode, LocalInputEvent};
-use mouser_engine::core::{Action, CaptureDecision, EngineCore};
+use mouser_engine::core::{Action, CaptureDecision, EngineCore, Inject};
 use mouser_engine::{Edge, EdgeLayout};
 use mouser_protocol::{
     to_cbor, OwnershipAck, OwnershipTransfer, PointerMotion, TransferReason, TYPE_OWNERSHIP_ACK,
@@ -74,6 +74,13 @@ fn ownership_ack(epoch: u64, accepted: bool) -> Vec<u8> {
 fn motion_of(actions: &[Action]) -> Option<PointerMotion> {
     actions.iter().find_map(|a| match a {
         Action::SendMotion(m) => Some(*m),
+        _ => None,
+    })
+}
+
+fn warp_of(actions: &[Action]) -> Option<(i32, i32)> {
+    actions.iter().find_map(|a| match a {
+        Action::Inject(Inject::MoveCursor { x, y, .. }) => Some((*x, *y)),
         _ => None,
     })
 }
@@ -294,6 +301,51 @@ fn left_edge_reclaim_must_move_inside_before_crossing_out_again() {
         "after the local cursor moves back inside the Mac screen, the left edge can cross again"
     );
     assert!(!e.is_owner());
+}
+
+#[test]
+fn crossing_back_snaps_local_cursor_to_the_boundary_edge() {
+    // Returning from a left-edge peer must warp our own cursor to the local left edge (x=0),
+    // carrying the current y, so it re-enters at the shared boundary and tracks inward —
+    // rather than reappearing wherever it drifted to while we drove the peer.
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(2560, 1440, 3840, 2160, Edge::Left),
+    );
+    e.on_local_input(cursor_rel(1, 700, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    assert!(!e.is_owner());
+
+    // Move into the peer (arms reclaim), then cross back at a drifted local position (1300).
+    e.on_local_input(cursor_rel(1, 700, -40, 0));
+    let reclaim = e.on_local_input(cursor_rel(1300, 720, 60, 0));
+    assert!(has_set_mode(&reclaim, CaptureMode::PassiveEdge));
+    assert!(e.is_owner());
+    assert_eq!(
+        warp_of(&reclaim),
+        Some((0, 720)),
+        "the local cursor snaps to the left boundary at the current y"
+    );
+}
+
+#[test]
+fn escape_reclaims_do_not_snap_the_cursor() {
+    // The emergency escape (and other non-boundary reclaims) leave the cursor where it is —
+    // snapping to the entry edge would fight the very push that triggered the escape.
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 100, 10_000, 100, Edge::Left),
+    );
+    e.on_local_input(cursor_rel(1, 40, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    let mut reclaim = Vec::new();
+    for _ in 0..3 {
+        reclaim = e.on_local_input(cursor_rel(1, 40, 40, 0));
+    }
+    assert!(has_set_mode(&reclaim, CaptureMode::PassiveEdge), "escape reclaimed");
+    assert_eq!(warp_of(&reclaim), None, "escape reclaim must not warp the cursor");
 }
 
 #[test]

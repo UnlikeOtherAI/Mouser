@@ -308,7 +308,15 @@ impl EngineCore {
         // reclaim is disarmed immediately after handoff so a first-sample bounce at
         // the seeded entry edge cannot instantly return ownership.
         if self.reclaim_armed && self.crosses_back(dx, dy) {
-            return self.reclaim_local();
+            // Our own visible cursor drifted across this screen while we drove the peer
+            // (suppression stops apps seeing the motion, but the OS still moves the
+            // pointer). Snap it back to the shared boundary so the return is continuous —
+            // the cursor re-enters where the peer screen meets ours, then tracks inward —
+            // instead of reappearing wherever it happened to drift to.
+            let warp = self.entry_edge_warp(x, y);
+            let mut actions = self.reclaim_local();
+            actions.push(warp);
+            return actions;
         }
         let seq = self.next_seq();
         let motion = PointerMotion {
@@ -369,6 +377,26 @@ impl EngineCore {
             Edge::Bottom => y <= EDGE_REARM_MARGIN && dy < 0,
             Edge::Top => y >= max_y.saturating_sub(EDGE_REARM_MARGIN) && dy > 0,
         }
+    }
+
+    /// Warp our local cursor to the shared boundary on `layout.edge`, carrying the off-axis
+    /// position so the return lands where the pointer currently sits on the other axis. For a
+    /// left edge that is `x = 0` at the current `y`; the cursor then tracks inward (rightward)
+    /// onto our screen, the way crossing between two physical monitors feels.
+    fn entry_edge_warp(&self, x: i32, y: i32) -> Action {
+        let max_x = self.layout.width.saturating_sub(1).max(0);
+        let max_y = self.layout.height.saturating_sub(1).max(0);
+        let (wx, wy) = match self.layout.edge {
+            Edge::Left => (0, clamp(y, 0, max_y)),
+            Edge::Right => (max_x, clamp(y, 0, max_y)),
+            Edge::Top => (clamp(x, 0, max_x), 0),
+            Edge::Bottom => (clamp(x, 0, max_x), max_y),
+        };
+        Action::Inject(Inject::MoveCursor {
+            display_id: 0,
+            x: wx,
+            y: wy,
+        })
     }
 
     /// Signed component of this event's true device delta pointing back toward our own
