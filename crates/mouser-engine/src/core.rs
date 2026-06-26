@@ -77,6 +77,14 @@ pub struct EngineCore {
     /// loop while it rests on the edge). Cleared by a fresh session — the user grants the
     /// permission and reconnects.
     suppress_blocked: bool,
+    /// Net home-ward device travel (true deltas, in pixels) accumulated while we own the
+    /// peer. Geometry- and absolute-position-independent emergency escape: a sustained
+    /// push of one local screen-width toward home reclaims even when `crosses_back` can't
+    /// fire (advertised `peer_width` too large, so `peer_x` never reaches its edge) and
+    /// `local_escape_back` can't fire (the OS froze the suppressed local cursor at the
+    /// entry edge). Reset on every cross; clamped at 0 so wandering inside the peer cancels
+    /// out and only a deliberate continuous home-ward swipe accumulates to the threshold.
+    escape_travel: i32,
 }
 
 impl EngineCore {
@@ -110,6 +118,7 @@ impl EngineCore {
             misses: 0,
             hb_seq: 0,
             suppress_blocked: false,
+            escape_travel: 0,
         }
     }
 
@@ -272,6 +281,14 @@ impl EngineCore {
         if self.local_escape_back(x, y, dx, dy) {
             return self.reclaim_local();
         }
+        // Emergency escape, independent of peer geometry and the (possibly frozen) local
+        // absolute position: accumulate net home-ward true-device travel and reclaim once a
+        // full local screen-width of deliberate push has been demanded. Clamp at 0 so motion
+        // into the peer cancels progress rather than driving it negative.
+        self.escape_travel = (self.escape_travel + self.homeward_delta(dx, dy)).max(0);
+        if self.escape_travel >= self.escape_threshold() {
+            return self.reclaim_local();
+        }
         // `saturating_add`: dx/dy originate at untrusted capture/FFI boundaries, so a
         // pathological delta must clamp rather than overflow-panic (debug) or wrap (release).
         self.peer_x = clamp(
@@ -354,6 +371,32 @@ impl EngineCore {
         }
     }
 
+    /// Signed component of this event's true device delta pointing back toward our own
+    /// screen (the direction that returns ownership across `layout.edge`). Mirrors the axis
+    /// and sign `crosses_back` tests, but on the raw delta rather than the clamped peer
+    /// cursor, so it stays meaningful even when `peer_x`/`peer_y` is pinned at a bound.
+    fn homeward_delta(&self, dx: i32, dy: i32) -> i32 {
+        match self.layout.edge {
+            Edge::Left => dx,
+            Edge::Right => -dx,
+            Edge::Bottom => -dy,
+            Edge::Top => dy,
+        }
+    }
+
+    /// Home-ward travel that forces an emergency reclaim: one local screen-width (horizontal
+    /// edges) or screen-height (vertical edges). `.max(1)` keeps a zero/unknown layout from
+    /// arming the escape on the first sample.
+    fn escape_threshold(&self) -> i32 {
+        // Floor so a degenerate/unknown tiny layout can't arm the escape on a few stray
+        // pixels; on any real display `width`/`height` (≫ the floor) is what applies.
+        const ESCAPE_MIN_TRAVEL: i32 = 64;
+        match self.layout.edge {
+            Edge::Left | Edge::Right => self.layout.width.max(ESCAPE_MIN_TRAVEL),
+            Edge::Top | Edge::Bottom => self.layout.height.max(ESCAPE_MIN_TRAVEL),
+        }
+    }
+
     /// Has the peer cursor returned to the near edge (back toward us)?
     fn crosses_back(&self, dx: i32, dy: i32) -> bool {
         match self.layout.edge {
@@ -410,6 +453,7 @@ impl EngineCore {
             }
         }
         self.reclaim_armed = false;
+        self.escape_travel = 0;
         let transfer = encode(&OwnershipTransfer {
             to: self.peer.to_vec(),
             owner_epoch: epoch,

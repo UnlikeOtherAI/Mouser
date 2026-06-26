@@ -297,6 +297,69 @@ fn left_edge_reclaim_must_move_inside_before_crossing_out_again() {
 }
 
 #[test]
+fn sustained_homeward_push_reclaims_when_geometry_traps_the_cursor() {
+    // The trap the user hit ("furthest I can go is right side of win"): the peer advertised a
+    // width far larger than its real injectable range, so the seeded `peer_x` pins at the far
+    // edge and `crosses_back` can never arm; meanwhile the suppressed local cursor is frozen at
+    // the entry edge (x stays at 1), so `local_escape_back` can never fire either. A deliberate,
+    // sustained home-ward push must still reclaim — purely from accumulated device deltas.
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 100, 10_000, 100, Edge::Left),
+    );
+    e.on_local_input(cursor_rel(1, 40, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    assert!(!e.is_owner(), "peer owns after the edge cross");
+
+    // Home-ward for a left edge is +dx. The local x is frozen at the entry edge throughout.
+    for _ in 0..2 {
+        let push = e.on_local_input(cursor_rel(1, 40, 40, 0));
+        assert!(
+            !has_set_mode(&push, CaptureMode::PassiveEdge),
+            "a partial home-ward push must not reclaim yet"
+        );
+        assert!(!e.is_owner());
+    }
+    let reclaim = e.on_local_input(cursor_rel(1, 40, 40, 0));
+    assert!(
+        has_set_mode(&reclaim, CaptureMode::PassiveEdge),
+        "a full local-width of home-ward travel is an emergency escape independent of geometry"
+    );
+    assert!(has_capture(&reclaim, CaptureDecision::PassThrough));
+    assert!(e.is_owner());
+}
+
+#[test]
+fn wandering_inside_the_peer_does_not_trip_the_escape() {
+    // Normal use deep inside the peer (back-and-forth motion) must not slowly accumulate into a
+    // spurious reclaim: the home-ward accumulator clamps at 0, so only net home-ward travel counts.
+    let mut e = EngineCore::new_source(
+        ME,
+        PEER,
+        EdgeLayout::with_edge(100, 100, 10_000, 100, Edge::Left),
+    );
+    e.on_local_input(cursor_rel(1, 40, -6, 0));
+    e.on_control(TYPE_OWNERSHIP_ACK, &ownership_ack(1, true));
+    assert!(!e.is_owner());
+
+    // Move deep into the peer first so oscillation happens far from either edge (otherwise a
+    // home-ward swing would legitimately re-cross via `crosses_back`).
+    e.on_local_input(cursor_rel(1, 40, -5_000, 0));
+
+    // Alternate home-ward (+40) and into-peer (-40) far past the threshold in total distance.
+    for _ in 0..20 {
+        e.on_local_input(cursor_rel(1, 40, 40, 0));
+        let back = e.on_local_input(cursor_rel(1, 40, -40, 0));
+        assert!(
+            !has_set_mode(&back, CaptureMode::PassiveEdge),
+            "balanced back-and-forth motion must never reclaim"
+        );
+    }
+    assert!(!e.is_owner());
+}
+
+#[test]
 fn left_edge_local_opposite_edge_forces_reclaim() {
     let mut e = EngineCore::new_source(
         ME,
