@@ -19,6 +19,7 @@ pub use crate::capture::{
     emergency_reclaim_chord_from_mods, is_emergency_reclaim_event, CaptureAlreadyRunning,
     CaptureStartFailed, WinCapture,
 };
+use crate::cursor_overlay;
 use crate::inject::{self, Button, ScrollUnit as WinScrollUnit};
 
 /// Windows input injector backed by `SendInput`.
@@ -287,12 +288,21 @@ impl InputInjection for WinInjector {
         self.assert_cursor_visible_once();
         let bounds = display_bounds(display_id)?;
         let (vx, vy) = bounds.local_to_virtual(x, y);
-        inject::move_cursor(vx, vy).map_err(boxed)
+        inject::move_cursor(vx, vy).map_err(boxed)?;
+        match inject::cursor_position() {
+            Ok(pos) => cursor_overlay::show_at(pos.x, pos.y),
+            Err(_) => cursor_overlay::show_at(vx, vy),
+        }
+        Ok(())
     }
 
     fn move_cursor_relative(&self, dx: i32, dy: i32) -> PlatformResult<()> {
         self.assert_cursor_visible_once();
-        inject::move_cursor_relative(dx, dy).map_err(boxed)
+        inject::move_cursor_relative(dx, dy).map_err(boxed)?;
+        if let Ok(pos) = inject::cursor_position() {
+            cursor_overlay::show_at(pos.x, pos.y);
+        }
+        Ok(())
     }
 
     fn button(&self, button: u8, down: bool) -> PlatformResult<()> {
@@ -341,6 +351,11 @@ impl InputInjection for WinInjector {
     /// Idempotent: a double-hide keeps the *original* saved position (it does not
     /// re-save the parked corner), and a double-show is a no-op.
     fn set_cursor_visible(&self, visible: bool) -> PlatformResult<()> {
+        // The overlay is only a remote-injection visual aid. Clear any stale overlay
+        // before native cursor work so disconnect cleanup or a failed park cannot
+        // leave the software cursor stuck on the physical console.
+        cursor_overlay::hide();
+
         if visible {
             self.assert_cursor_visible_once();
         }
